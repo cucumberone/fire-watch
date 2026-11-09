@@ -1,0 +1,75 @@
+# alert-fold.lua — the ordering + dedup guard for alert state.
+#
+# Specified in docs/event-lifecycle.md §5.2 and §5.4. Loaded by the worker and
+# invoked with EVAL/EVALSHA, so the compare-and-set is atomic across the three
+# workers racing on the same alert key.
+#
+# KEYS[1] = fw:alert:{key}
+# KEYS[2] = fw:alert:open:{key}
+# ARGV[1] = broker_ts_ms
+# ARGV[2] = event id
+# ARGV[3] = severity
+# ARGV[4] = dedup window in ms
+#
+# Returns: 0 stale | 1 new occurrence | 2 coalesced | 3 closed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-fold
+  labels:
+    app.kubernetes.io/name: worker
+data:
+  alert-fold.lua: |
+    local wm_ts  = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
+    local wm_id  = redis.call('HGET', KEYS[1], 'watermark_id') or ''
+    local ts     = tonumber(ARGV[1])
+    local id     = ARGV[2]
+    local sev    = ARGV[3]
+    local window = tonumber(ARGV[4])
+
+    -- 1. ordering guard: (timestamp, id) lexicographic.
+    --    Stops a redelivered old CLOSE from retiring a newer CRITICAL.
+    if ts < wm_ts or (ts == wm_ts and id <= wm_id) then
+      return 0
+    end
+
+    local is_open = redis.call('EXISTS', KEYS[2])
+
+    -- 2. retirement events end the episode.
+    if sev == 'CLOSE' or sev == 'HARMLESS' then
+      redis.call('DEL', KEYS[2])
+      redis.call('HSET', KEYS[1],
+        'state', 'closed',
+        'severity', sev,
+        'closed_by', id,
+        'closed_at', ts,
+        'watermark', ts,
+        'watermark_id', id)
+      redis.call('PEXPIRE', KEYS[1], 604800000)
+      return 3
+    end
+
+    -- 3. occurrence rollup: repeats inside the window move last_seen only.
+    local last  = tonumber(redis.call('HGET', KEYS[1], 'last_seen') or '0')
+    local count = tonumber(redis.call('HGET', KEYS[1], 'count') or '0')
+    local first = redis.call('HGET', KEYS[1], 'first_seen') or tostring(ts)
+    local fresh = 0
+
+    if is_open == 0 or last == 0 then
+      count, first, fresh = 1, ts, 1                 -- new episode
+    elseif ts - last > window then
+      count, fresh = count + 1, 1                    -- new occurrence
+    end                                              -- else coalesced
+
+    redis.call('SET', KEYS[2], '1', 'EX', 604800)
+    redis.call('HSET', KEYS[1],
+      'state', 'open',
+      'severity', sev,
+      'last_id', id,
+      'first_seen', first,
+      'last_seen', ts,
+      'count', count,
+      'watermark', ts,
+      'watermark_id', id)
+    redis.call('PEXPIRE', KEYS[1], 604800000)
+    return (fresh == 1) and 1 or 2

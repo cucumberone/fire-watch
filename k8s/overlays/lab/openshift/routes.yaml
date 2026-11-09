@@ -1,0 +1,18 @@
+# OpenShift lab Route hostnames. Each lab install gets its own names so it can
+# never shadow a production Route on the same router.
+#
+# This file exists only in the OpenShift flavour. The Kubernetes flavour deletes
+# these Routes and exposes NodePort Services instead (see ../kubernetes).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ws-gateway
+spec:
+  host: ws.fire-watch-lab.apps.lab.local
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: frontend
+spec:
+  host: fire-watch-lab.apps.lab.local

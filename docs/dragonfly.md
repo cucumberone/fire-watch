@@ -37,23 +37,31 @@ Requirement: "always find 2 replicas before accepting writes". Dragonfly ships *
 
 Keep `--cluster_mode` at its default `emulated`. Multi-shard cluster mode is a data plane only: no control plane, no automatic failover, slot ownership pushed via `DFLYCLUSTER CONFIG` by an external manager. Wrong tool for 3 fully-replicated nodes.
 
-### Layer 2 — write guard (master side)
+### Layer 2 — write guard (evaluated by sentinel-bridge)
 
-Sidecar `dragonfly-write-guard`, one per Dragonfly pod, polls local `INFO REPLICATION`:
+`sentinel-bridge` polls every Dragonfly pod directly and reads `ROLE`:
 
 ```
-role:master
-connected_slaves:N
-slave0:ip=...,state=stable_sync,lag=0
+master -> [ "master", <offset>, [ [ip, port, offset], ... ] ]   # replica count = length
+slave  -> [ "slave", ip, port, state, offset ]
 ```
 
 Logic:
 
-- If `role:master` and `connected_slaves < 2` continuously for `FW_WRITE_GUARD_GRACE` (default 30s) → mark the master **degraded**.
-- On degraded: set pod label `fire-watch.io/writable=false`, emit `fw_dragonfly_write_guard_tripped=1`, publish to `fw:ch:alerts`. `sentinel-bridge` then removes that pod from the `dragonfly` Service, and workers see an empty endpoint list and stop writing ([workers.md](workers.md) §5).
-- Recover when `connected_slaves >= 2` for `FW_WRITE_GUARD_RECOVER` (default 60s).
+- If the pod Sentinel designates as master reports `master` with fewer than `FW_WRITE_GUARD_MIN_REPLICAS` (default 2) connected replicas → **withhold the endpoint**.
+- Withholding means `Endpoints/dragonfly` is set to zero addresses. Workers see an empty endpoint list and stop writing ([workers.md](workers.md) §5), and the pod gets label `fire-watch.io/writable=false` for humans and alerts.
+- When the replica count recovers, the endpoint is published again on the next cycle (`FW_RECONCILE_INTERVAL`, default 5s). There is no separate recovery timer to get stuck.
 
-The guard never writes to Dragonfly. It cannot: the state it would write lives in the very database it is judging, so it persists the state as a **pod label** instead. The earlier design read `fw:write_guard:state` from Dragonfly, which nothing ever wrote, leaving the guard inert ([fault-tolerance.md](fault-tolerance.md) §3.7).
+**This is evaluated in the bridge, not by a sidecar inside the Dragonfly pod.** An earlier design ran a `dragonfly-write-guard` sidecar per pod; it was removed because:
+
+| Sidecar problem | What the bridge does instead |
+|---|---|
+| Needed its own `INFO REPLICATION` polling loop per pod | the bridge already reads `ROLE` on every pod every cycle — the replica count is the same fact |
+| Could only express the verdict as a pod label, which something else had to interpret | the bridge owns the `Endpoints` object, so it can act on the verdict directly |
+| Had to be given `FW_WRITE_GUARD_MIN_REPLICAS=0` in the lab or it would withhold forever | one env var on the bridge, no per-pod sidecar to keep in sync |
+| 3 extra containers, 3 extra liveness probes, 3 sets of counters | zero extra containers |
+
+The guard still never writes to Dragonfly. It cannot: the state it would need to write lives in the very database it is judging. The verdict is expressed as an **empty endpoint list**, which is cluster state, not database state ([fault-tolerance.md](fault-tolerance.md) §3.7).
 
 Accepted limitation, stated plainly: this is a **routing** gate, not a storage-engine gate. A client that bypasses the Service and talks to a pod IP can still write. Workers and gateways are therefore forbidden from using pod IPs — enforced by review, since K8s cannot enforce it.
 
@@ -152,19 +160,23 @@ affinity:
 
 ## 7. Monitoring
 
-Metrics on `--admin_port=9222` (`/metrics`).
+Metrics on `--admin_port=9222` (`/metrics`). Implemented in [k8s/base/60-monitoring.yaml](../k8s/base/60-monitoring.yaml).
 
 | Signal | Alert condition |
 |---|---|
-| `dragonfly_connected_replicas` | `< 2` for 2 min |
+| connected replicas | `< 2` for 2 min — counted as `count(dragonfly_connected_replica_lag_records)`, because **there is no `dragonfly_connected_replicas` metric** |
 | `dragonfly_connected_replica_lag_records` | `> 10000` for 5 min |
 | `dragonfly_evicted_keys_total` | **`> 0` — page immediately**, retention is already broken ([sizing.md](sizing.md) §3.3) |
 | container RSS / limit (from cAdvisor, `container_memory_working_set_bytes`) | `> 0.90` — risk of OOMKill during a snapshot |
-| newest `.dfs` age (from pruner sidecar) | `> 90 min` |
-| snapshot load errors on restart | `> 0` |
-| `fw_dragonfly_write_guard_tripped` | `== 1` for 1 min |
+| `dragonfly_failed_restores_total` | `> 0` in 1h — **not `dragonfly_snapshot_load_num_errors`, which does not exist** |
+| `dragonfly_save_in_progress` | `== 1` for 30 min (a snapshot that never finishes) |
+| pod label `fire-watch.io/writable=false` (via kube-state-metrics) | `== 1` for 5 min — the bridge has emptied the Service endpoint |
 
 Deliberately **not** alerting on `used_memory / maxmemory`: `maxmemory` is sized to the working set by design, so that ratio sits near 1.0 permanently and would be pure noise. Eviction, not utilisation, is the failure signal here.
+
+The two metric names above are read from `src/server/metrics.cc` in the Dragonfly source, not inferred. An earlier revision named two metrics that Dragonfly does not emit; those alerts would have been silent forever.
+
+One note on the scrape target: Dragonfly serves `/metrics` on **6379** as well, but that is HTTP over the RESP port and scrapers fail with `Received HTTP/0.9 when not allowed`. The admin port 9222 is the one to scrape.
 
 ## 8. Verification checklist
 

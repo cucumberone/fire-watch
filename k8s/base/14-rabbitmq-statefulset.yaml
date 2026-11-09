@@ -1,0 +1,114 @@
+# RabbitMQ StatefulSet — 3 nodes, quorum queues, required anti-affinity.
+# See docs/rabbitmq.md. Every probe / affinity / storage choice is documented
+# there; this file is the executable form of it.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  labels:
+    app.kubernetes.io/name: rabbitmq
+spec:
+  serviceName: rabbitmq-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rabbitmq
+    spec:
+      serviceAccountName: rabbitmq
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      # Required, not preferred: best-effort affinity would let two pods share a
+      # node and silently reduce fault tolerance to a single node loss.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: rabbitmq
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: rabbitmq
+          image: docker.io/library/rabbitmq:4.1-management
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: amqp, containerPort: 5672 }
+            - { name: management, containerPort: 15672 }
+            - { name: epmd, containerPort: 4369 }
+            - { name: dist, containerPort: 25672 }
+          env:
+            - name: RABBITMQ_USE_LONGNAME
+              value: "true"
+            # POD_NAME must be declared BEFORE RABBITMQ_NODENAME: Kubernetes
+            # only expands $(VAR) from variables declared earlier in the list.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Stable, DNS-based node identity. A short name breaks after a
+            # reschedule because the pod hostname is not the identity.
+            - name: RABBITMQ_NODENAME
+              value: "rabbit@$(POD_NAME).rabbitmq-headless.fire-watch.svc.cluster.local"
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: username }
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { cpu: "1", memory: 2Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: config, mountPath: /etc/rabbitmq/rabbitmq.conf, subPath: rabbitmq.conf, readOnly: true }
+            - { name: config, mountPath: /etc/rabbitmq/enabled_plugins, subPath: enabled_plugins, readOnly: true }
+            - { name: config, mountPath: /etc/rabbitmq/definitions.json, subPath: definitions.json, readOnly: true }
+            - { name: data, mountPath: /var/lib/rabbitmq }
+          startupProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_running"]
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_running", "-q", "check_local_alarms"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            # Deliberately shallow: a deep check would kill nodes during a
+            # benign partition and cause a restart loop.
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                # Leave the cluster cleanly instead of being SIGKILLed
+                # mid-journal-write.
+                command: ["/bin/sh", "-c", "rabbitmqctl stop_app || true"]
+      volumes:
+        - name: config
+          configMap:
+            name: rabbitmq-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 96Gi

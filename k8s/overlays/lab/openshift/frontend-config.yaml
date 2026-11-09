@@ -1,0 +1,19 @@
+# Frontend runtime config for the OpenShift lab flavour.
+#
+# wsUrl must match the ws-gateway Route host set in routes.yaml. If the two files
+# disagree the UI loads but never connects, and the only symptom is a silent
+# WebSocket failure in the browser console.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  labels:
+    app.kubernetes.io/name: frontend
+data:
+  config.json: |
+    {
+      "wsUrl": "wss://ws.fire-watch-lab.apps.lab.local",
+      "apiUrl": "",
+      "backfillDefaultMinutes": 15,
+      "resolveWsHostFromPage": false
+    }

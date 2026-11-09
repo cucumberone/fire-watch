@@ -1,0 +1,32 @@
+# Shared lab base — everything that is true on BOTH platforms.
+#
+# This is a base, not an overlay: overlays/overlay/lab/{openshift,kubernetes}
+# both depend on it and add their platform-specific networking on top.
+#
+# NOT FAULT TOLERANT BY DESIGN. See docs/kustomize.md §3.
+#
+# Namespace: fire-watch-lab, so a lab apply can never touch production objects.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch-lab
+
+resources:
+  - ../../../base
+
+patches:
+  # ---- shape: 1 replica, small, no H/A scaffolding
+  - path: replicas.yaml
+  - path: resources.yaml
+  - path: storage.yaml
+  - path: delete-pdb.yaml
+  - path: delete-anti-affinity.yaml
+  - path: delete-hpa.yaml
+
+  # ---- monitoring: CRDs absent and no Prometheus in a lab
+  - path: delete-monitoring.yaml
+
+  # ---- component configuration for a single-node install
+  - path: dragonfly-lab.yaml
+  - path: sentinel-lab.yaml
+  - path: bridge-lab.yaml

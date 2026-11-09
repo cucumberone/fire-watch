@@ -1,0 +1,52 @@
+# Delete every PDB. With 1 replica, `minAvailable: 2` makes a pod impossible to
+# evict and makes `kubectl drain` hang forever. Deleting is the correct
+# operation here — omitting 01-pdb.yaml from the overlay's resources would also
+# work but would silently drop it from every future overlay too
+# (docs/kustomize.md §5).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rabbitmq
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dragonfly
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ws-gateway
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-bridge
+$patch: delete
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: http-ingress
+$patch: delete

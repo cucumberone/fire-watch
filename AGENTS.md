@@ -43,6 +43,8 @@ This repo sets up an event server.
 - [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, HPA
 - [Frontend](docs/frontend.md) — static React app, two Routes, CSP
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
+- [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms
+- [Monitoring](docs/monitoring.md) — 21 alerts, the redis-exporter, and two Dragonfly metric names that were wrong
 - [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay
 - [Sizing](docs/sizing.md) — capacity model and resource totals
 - [Validation](docs/validation.md) — failure drills and acceptance gate

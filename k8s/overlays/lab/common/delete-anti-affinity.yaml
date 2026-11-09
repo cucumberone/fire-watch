@@ -1,0 +1,93 @@
+# Remove required pod anti-affinity. With one replica there is nothing to
+# spread, and leaving `required` in place would be misleading about what the
+# lab actually guarantees (docs/kustomize.md §3.2).
+#
+# Setting the field to [] removes the rule entirely.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dragonfly
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-bridge
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-ingress
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution: []

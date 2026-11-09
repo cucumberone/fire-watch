@@ -1,0 +1,108 @@
+# PodDisruptionBudgets for every workload.
+#
+# Every component is at 3 replicas (bridge: 2), so minAvailable keeps a drain
+# from evicting a quorum. See docs/fault-tolerance.md §3.3.
+#
+# minAvailable: 1 for workers is deliberate — workers are a throughput
+# resource, not a quorum, and pinning them at 2 would block legitimate
+# single-pod maintenance.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rabbitmq
+  labels:
+    app.kubernetes.io/name: rabbitmq
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dragonfly
+  labels:
+    app.kubernetes.io/name: dragonfly
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dragonfly
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel
+  labels:
+    app.kubernetes.io/name: sentinel
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ws-gateway
+  labels:
+    app.kubernetes.io/name: ws-gateway
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ws-gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinel-bridge
+  labels:
+    app.kubernetes.io/name: sentinel-bridge
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel-bridge
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: http-ingress
+  labels:
+    app.kubernetes.io/name: http-ingress
+spec:
+  # minAvailable: 2 of 3 means at most one pod may be evicted at a time, so a
+  # node drain walks the ingest path down to 2 but never to 0. Ingest stops
+  # accepting new events only if all three are gone, which the cluster will not
+  # voluntarily allow.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: http-ingress

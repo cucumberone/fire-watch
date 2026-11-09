@@ -1,0 +1,42 @@
+# Dragonfly Services (docs/networking.md §1).
+#
+# dragonfly-headless: stable per-pod DNS for REPLICAOF and Sentinel.
+# dragonfly:          NO selector. Its Endpoints are maintained by
+#                     sentinel-bridge so the Service always points at exactly
+#                     one pod — the current master. A selector here would
+#                     round-robin across all three and send writes to replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dragonfly-headless
+  labels:
+    app.kubernetes.io/name: dragonfly
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: dragonfly
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client
+    - name: admin
+      port: 9222
+      targetPort: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dragonfly
+  labels:
+    app.kubernetes.io/name: dragonfly
+spec:
+  type: ClusterIP
+  # Intentionally NO selector — the Endpoints object is owned and rewritten by
+  # sentinel-bridge. No Endpoints object is declared here: until the bridge has
+  # run once, the Service has zero endpoints, so writes fail loudly instead of
+  # silently landing on a replica.
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client

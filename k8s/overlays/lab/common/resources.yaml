@@ -1,0 +1,126 @@
+# Tiny resources for every container. The base requests 8Gi/48Gi for Dragonfly
+# and 1Gi/2Gi for RabbitMQ, which cannot fit a homelab.
+#
+# Totals after this patch: ~1 CPU requested, ~2.5 GiB requested
+# (docs/kustomize.md §3.3).
+---
+# ------------------------------------------------------------------ RabbitMQ
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  template:
+    spec:
+      containers:
+        - name: rabbitmq
+          resources:
+            requests: { cpu: 50m,  memory: 128Mi }
+            limits:   { cpu: 300m, memory: 384Mi }
+---
+# ----------------------------------------------------------------- Dragonfly
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dragonfly
+spec:
+  template:
+    spec:
+      containers:
+        - name: dragonfly
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 1Gi }
+        - name: snapshot-pruner
+          resources:
+            requests: { cpu: 5m,  memory: 8Mi }
+            limits:   { cpu: 50m, memory: 32Mi }
+---
+# ------------------------------------------------------------------ Sentinel
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: seed-config
+          resources:
+            requests: { cpu: 5m,  memory: 8Mi }
+            limits:   { cpu: 50m, memory: 32Mi }
+      containers:
+        - name: sentinel
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 50m, memory: 64Mi }
+---
+# ------------------------------------------------------------------- Workers
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 192Mi }
+---
+# ---------------------------------------------------------------- WS gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 192Mi }
+---
+# ------------------------------------------------------------------ Frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  template:
+    spec:
+      containers:
+        - name: frontend
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 50m, memory: 32Mi }
+---
+# ------------------------------------------------------------ sentinel-bridge
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-bridge
+spec:
+  template:
+    spec:
+      containers:
+        - name: bridge
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 96Mi }
+---
+# ---------------------------------------------------------------- http-ingress
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-ingress
+spec:
+  template:
+    spec:
+      containers:
+        - name: ingress
+          resources:
+            requests: { cpu: 20m, memory: 48Mi }
+            limits:   { cpu: 150m, memory: 160Mi }

@@ -1,0 +1,31 @@
+# NodePort Services for the two externally-reachable components.
+#
+# Fixed nodePort values (30300 / 30800) so the frontend's wsUrl can be a
+# constant and you do not have to look up an assigned port after every apply.
+# 30000-32767 is the default NodePort range on every distribution.
+#
+# These replace the Routes. Nothing else in the deployment changes: RabbitMQ,
+# Dragonfly and Sentinel stay ClusterIP-only, exactly as in production.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-gateway
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30300
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30800

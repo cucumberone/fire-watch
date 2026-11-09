@@ -1,0 +1,49 @@
+# Base — the plan of record.
+#
+# NOTE on namespace ownership (see docs/networking.md §5):
+#   The namespace ALREADY EXISTS and is shared. This base therefore does NOT
+#   create a Namespace, ResourceQuota or LimitRange object — all three would
+#   affect workloads we do not own. `namespace:` below only labels the
+#   resources we apply; it does not create anything.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: fire-watch
+    includeSelectors: false
+
+resources:
+  - 10-rabbitmq-rbac.yaml
+  - 11-rabbitmq-config.yaml
+  - 13-rabbitmq-services.yaml
+  - 14-rabbitmq-statefulset.yaml
+  - 20-dragonfly-config.yaml
+  - 20-alert-fold-config.yaml
+  - 22-dragonfly-services.yaml
+  - 23-dragonfly-statefulset.yaml
+  - 30-sentinel-config.yaml
+  - 31-sentinel-statefulset.yaml
+  - 32-sentinel-bridge.yaml
+  - 33-redis-exporter.yaml
+  - 34-http-ingress.yaml
+  - 40-workers.yaml
+  - 41-ws-gateway.yaml
+  - 42-frontend.yaml
+  - 60-monitoring.yaml
+  - 01-pdb.yaml
+
+# Secrets are NOT in this base. Create them out of band so nothing secret
+# ever enters git:
+#
+#   kubectl -n fire-watch create secret generic fire-watch-rabbitmq \
+#     --from-literal=username=fw --from-literal=password="$(openssl rand -base64 32)"
+#   kubectl -n fire-watch create secret generic fire-watch-dragonfly \
+#     --from-literal=password="$(openssl rand -base64 32)"
+#   kubectl -n fire-watch create secret generic fire-watch-ingress \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# Required keys: fire-watch-rabbitmq{username,password}, fire-watch-dragonfly{password},
+#                fire-watch-ingress{token}

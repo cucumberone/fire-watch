@@ -1,0 +1,17 @@
+{
+  "name": "http-ingress",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Accepts HTTP from an external nginx, publishes to RabbitMQ as AMQP 0-9-1 with publisher confirms",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"src/**/*.test.js\""
+  },
+  "dependencies": {
+    "amqplib": "^0.10.5"
+  }
+}

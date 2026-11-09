@@ -1,0 +1,127 @@
+# Redis Sentinel — 3 replicas, quorum 2, persistent config for the epoch.
+# See docs/redis-sentinel.md and docs/fault-tolerance.md §3.2.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+  labels:
+    app.kubernetes.io/name: sentinel
+spec:
+  serviceName: sentinel-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinel
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: sentinel
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        # Copy the template into /data ONLY if no config exists yet, so the
+        # config epoch written by Sentinel itself survives a pod restart.
+        - name: seed-config
+          image: docker.io/library/redis:7.4
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ ! -f /data/sentinel.conf ]; then
+                sed "s|__DRAGONFLY_PASSWORD__|$DRAGONFLY_PASSWORD|" \
+                  /etc/sentinel-src/sentinel.conf.template > /data/sentinel.conf
+                chmod 0640 /data/sentinel.conf
+                echo "seeded /data/sentinel.conf"
+              else
+                echo "keeping existing /data/sentinel.conf (epoch preserved)"
+              fi
+          env:
+            - name: DRAGONFLY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: src, mountPath: /etc/sentinel-src, readOnly: true }
+            - { name: data, mountPath: /data }
+      containers:
+        - name: sentinel
+          image: docker.io/library/redis:7.4
+          imagePullPolicy: IfNotPresent
+          command: ["redis-sentinel", "/data/sentinel.conf"]
+          ports:
+            - { name: sentinel, containerPort: 26379 }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          startupProbe:
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 6
+      volumes:
+        - name: src
+          configMap:
+            name: sentinel-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-headless
+  labels:
+    app.kubernetes.io/name: sentinel
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel

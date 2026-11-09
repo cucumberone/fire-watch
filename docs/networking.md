@@ -13,6 +13,7 @@ Services, Routes, DNS, and every port used by `fire-watch`.
 | `sentinel-headless` | ClusterIP None | `app.kubernetes.io/name=sentinel` | 26379 | Sentinel inter-node gossip |
 | `ws-gateway` | ClusterIP | `app.kubernetes.io/name=ws-gateway` | 8080 | HTTP + WebSocket |
 | `frontend` | ClusterIP | `app.kubernetes.io/name=frontend` | 8080 | static assets |
+| `http-ingress` | **NodePort 30900** | `app.kubernetes.io/name=http-ingress` | 8080 | HTTP from an external nginx ([http-ingress.md](http-ingress.md) §4) |
 
 **Never** create a Service that load-balances across all Dragonfly pods. Writes must reach the master only.
 
@@ -50,7 +51,7 @@ Rule: application code may reference `rabbitmq`, `dragonfly`, and the sentinel h
 | 26379 | Redis Sentinel | in-cluster |
 | 8080 | gateway / frontend HTTP | via Route |
 
-Nothing is exposed to the internet except the two Routes.
+| Nothing is exposed to the internet except the two Routes and the ingress NodePort. |
 
 ## 5. NetworkPolicies — deliberately not used
 

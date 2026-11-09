@@ -20,6 +20,7 @@ workers persist them; a WebSocket gateway streams them to a React front end.
 
 | Component | Kind | Replicas | Stateful | Doc |
 |-----------|------|----------|----------|-----|
+| http-ingress | Deployment, NodePort 30900 | 3 | No | [http-ingress.md](http-ingress.md) |
 | RabbitMQ | StatefulSet, quorum queues | 3 | Yes (PVC) | [rabbitmq.md](rabbitmq.md) |
 | DragonflyDB | StatefulSet, 1 master + 2 replicas | 3 | Yes (PVC) | [dragonfly.md](dragonfly.md) |
 | Redis Sentinel | StatefulSet | 3 | No | [redis-sentinel.md](redis-sentinel.md) |
@@ -33,7 +34,10 @@ Namespace: `fire-watch`.
 
 ```mermaid
 flowchart LR
-  P[Event producers] -->|AMQP publish + publisher confirm| RMQ[(RabbitMQ<br/>3 nodes<br/>quorum queues)]
+  EXT[External producers] -->|HTTP| NGX[external nginx]
+  NGX -->|HTTP POST /events| ING[http-ingress x3]
+  ING -->|AMQP + confirms| RMQ[(RabbitMQ<br/>3 nodes<br/>quorum queues)]
+  P[Internal producers] -->|AMQP publish + publisher confirm| RMQ
   RMQ -->|consume q.event.ingest| W1[worker-0]
   RMQ -->|consume q.event.ingest| W2[worker-1]
   RMQ -->|consume q.event.ingest| W3[worker-2]
@@ -60,6 +64,8 @@ Three independent paths exist by design:
 1. **Durability path:** producer → RabbitMQ (quorum, on disk) → worker → Dragonfly → ack.
 2. **Recovery path:** worker → `q.audit.events` → `replay-gap` Job → Dragonfly.
 3. **Visualization path:** Dragonfly pub/sub → gateway → browser.
+
+The HTTP ingress is a producer, not a consumer: it converts HTTP to AMQP and does not answer 202 until the broker has confirmed. Both producer paths end at the same exchange and routing key, so nothing downstream can tell them apart.
 
 The gateway never touches RabbitMQ, and the durability path never depends on a browser being connected.
 

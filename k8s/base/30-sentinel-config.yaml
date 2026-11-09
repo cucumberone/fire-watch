@@ -1,0 +1,28 @@
+# Sentinel configuration (docs/redis-sentinel.md §3).
+#
+# The config MUST be persistent: Sentinel stores a monotonic config epoch in this
+# file and uses it to reject stale failover votes. An ephemeral file means a
+# restarted sentinel advertises epoch 0 and can authorise a second failover
+# while the first is still propagating — two masters. See
+# docs/fault-tolerance.md §3.2.
+#
+# The init container copies this template into /data only when absent, so
+# Sentinel's own +config-rewrite survives restarts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+  labels:
+    app.kubernetes.io/name: sentinel
+data:
+  sentinel.conf.template: |
+    port 26379
+    dir /data
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor fire-watch-dragonfly dragonfly-0.dragonfly-headless.fire-watch.svc.cluster.local 6379 2
+    sentinel auth-pass fire-watch-dragonfly __DRAGONFLY_PASSWORD__
+    sentinel down-after-milliseconds fire-watch-dragonfly 5000
+    sentinel failover-timeout fire-watch-dragonfly 60000
+    sentinel parallel-syncs fire-watch-dragonfly 1
+    sentinel deny-scripts-reconfig yes

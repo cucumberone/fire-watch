@@ -114,11 +114,16 @@ Trade-off: the stored `msgc` is no longer readable in `redis-cli`, and it is no 
 | RabbitMQ | 3 | 250m | 1 | 512Mi | 1Gi | 96Gi |
 | Dragonfly | 3 | 500m | 4 | 8Gi | **48Gi** | 64Gi |
 | Sentinel | 3 | 20m | 200m | 64Mi | 128Mi | — |
+| sentinel-bridge | 2 | 20m | 200m | 64Mi | 192Mi | — |
+| redis-exporter | 1 | 10m | 100m | 32Mi | 96Mi | — |
+| http-ingress | 3 | 100m | 500m | 128Mi | 384Mi | — |
 | Workers | 3 | 100m | 500m | 256Mi | 512Mi | — |
 | WS gateway | 3 | 200m | 1 | 256Mi | 768Mi | — |
 | Frontend | 3 | 20m | 200m | 64Mi | 128Mi | — |
 | Prometheus (optional) | 1 | 200m | 1 | 512Mi | 1Gi | 50Gi |
-| **Sum** | 19 pods | **≈ 3.5 CPU** | **≈ 21.7 CPU** | **≈ 27.9 GiB** | **≈ 152 GiB** | **530Gi** |
+| **Sum** | **25 pods** | **≈ 3.8 CPU** | **≈ 23.7 CPU** | **≈ 28.4 GiB** | **≈ 154 GiB** | **530Gi** |
+
+Dragonfly dominates both columns: `3 × 8Gi` of requests and `3 × 48Gi` of limits, i.e. 24 of the 28 GiB requested and 144 of the 154 GiB of limits. Everything else is noise by comparison, which is why the node-size decision in §3.3 is the only one that really matters.
 
 PV total: `3 × 96 (RabbitMQ) + 3 × 64 (Dragonfly) + 50 (Prometheus) = 530 GiB`.
 

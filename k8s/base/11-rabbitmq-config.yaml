@@ -1,0 +1,98 @@
+# RabbitMQ configuration.
+# Values are taken verbatim from docs/rabbitmq.md §2, §3, §6.1, §7.
+# Every line here is load-bearing — see the doc for the reasoning per key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  labels:
+    app.kubernetes.io/name: rabbitmq
+data:
+  # Plugin list. Peer discovery must be enabled at first boot, so it lives in
+  # the enabled_plugins file rather than being enabled at runtime.
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_peer_discovery_k8s,rabbitmq_prometheus].
+
+  rabbitmq.conf: |
+    # ---- cluster formation (docs/rabbitmq.md §2) -------------------------
+    cluster_formation.peer_discovery_backend = k8s
+    cluster_formation.k8s.host               = kubernetes.default.svc.cluster.local
+    cluster_formation.k8s.address_type       = hostname
+    cluster_formation.k8s.service_name       = rabbitmq-headless
+    cluster_formation.k8s.namespace          = fire-watch
+    cluster_formation.node_cleanup.only_log_warning = true
+    cluster_name                             = fire-watch
+    queue_master_locator                     = min-masters
+    load_definitions                         = /etc/rabbitmq/definitions.json
+
+    # ---- no-data-loss requirements (docs/rabbitmq.md §3) ------------------
+    default_queue_type                       = quorum
+    quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = false
+    cluster_partition_handling               = pause_minority
+    consumer_timeout                         = 900000
+    confirm_timeout                          = 15
+
+    # ---- ordering authority (docs/rabbitmq.md §3.1) -----------------------
+    # Broker-assigned arrival timestamp. overwrite=true so a producer cannot
+    # forge its position in the ordering (event-lifecycle.md §3).
+    message_interceptors.incoming.set_header_timestamp.overwrite = true
+
+    # ---- memory / disk ----------------------------------------------------
+    # 0.7 of the 1Gi limit ~= 700Mi usable before the memory alarm fires.
+    vm_memory_high_watermark.relative = 0.7
+    disk_free_limit.absolute          = 2GB
+
+    # ---- management -------------------------------------------------------
+    management.tcp.port = 15672
+
+  # Definitions are applied on first boot only (load_definitions).
+  # No users here: credentials come from the Secret via RABBITMQ_DEFAULT_*.
+  definitions.json: |
+    {
+      "vhosts": [{ "name": "/" }],
+      "exchanges": [
+        { "name": "fx.events",     "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+        { "name": "fx.events.dlx", "vhost": "/", "type": "fanout", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+        { "name": "fx.audit",      "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} }
+      ],
+      "queues": [
+        {
+          "name": "q.event.ingest",
+          "vhost": "/",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": "fx.events.dlx",
+            "x-dead-letter-routing-key": "event.ingest"
+          }
+        },
+        {
+          "name": "q.event.ingest.dlq",
+          "vhost": "/",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {
+            "x-queue-type": "quorum",
+            "x-max-length-bytes": 8589934592
+          }
+        },
+        {
+          "name": "q.audit.events",
+          "vhost": "/",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {
+            "x-queue-type": "quorum",
+            "x-message-ttl": 604800000,
+            "x-max-length-bytes": 68719476736,
+            "x-overflow": "reject-publish"
+          }
+        }
+      ],
+      "bindings": [
+        { "source": "fx.events",     "vhost": "/", "destination": "q.event.ingest",  "destination_type": "queue", "routing_key": "event.ingest", "arguments": {} },
+        { "source": "fx.events.dlx", "vhost": "/", "destination": "q.event.ingest.dlq", "destination_type": "queue", "routing_key": "event.ingest", "arguments": {} },
+        { "source": "fx.audit",      "vhost": "/", "destination": "q.audit.events",  "destination_type": "queue", "routing_key": "event.audit", "arguments": {} }
+      ]
+    }

@@ -1,0 +1,150 @@
+# WebSocket gateway — stateless fan-out, read-only, compression-transparent.
+# See docs/websocket-server.md. No write access to Dragonfly, so it cannot
+# violate the write-guard invariant even if misconfigured.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+  labels:
+    app.kubernetes.io/name: ws-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ws-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ws-gateway
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Required, not preferred: with all 3 pods on one node, losing that node
+        # would take the gateway to zero replicas (fault-tolerance.md §3.4).
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: ws-gateway
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: gateway
+          image: image-registry.openshift-image-registry.svc:5000/fire-watch/ws-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: SENTINELS,        value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
+            - { name: DFLY_MASTER_NAME, value: fire-watch-dragonfly }
+            - name: DRAGONFLY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+            - { name: FW_CHANNEL_EVENTS,  value: fw:ch:events }
+            - { name: FW_CHANNEL_ALERTS,  value: fw:ch:alerts }
+            - { name: FW_DEDUPE_LRU,      value: "10000" }
+            - { name: FW_BACKFILL_MAX,    value: "2000" }
+            - { name: FW_MAX_CONNS,       value: "5000" }
+            - { name: FW_MSG_MAX_BYTES,   value: "1048576" }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 768Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            # False while the Dragonfly subscriber is disconnected: a pod that
+            # cannot subscribe should not receive new sockets.
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                # Close sockets deliberately so a rolling update does not look
+                # like a crash to every connected browser.
+                command: ["/bin/sh", "-c", "kill -TERM 1 || true; sleep 5"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-gateway
+  labels:
+    app.kubernetes.io/name: ws-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ws-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Route instead of Ingress (R2). The 1h timeout annotation is mandatory: the
+# router default of 30s kills every WebSocket.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ws-gateway
+  labels:
+    app.kubernetes.io/name: ws-gateway
+  annotations:
+    haproxy.router.openshift.io/timeout: 1h
+    haproxy.router.openshift.io/disable_cookies: "true"
+spec:
+  to:
+    kind: Service
+    name: ws-gateway
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ws-gateway
+  labels:
+    app.kubernetes.io/name: ws-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ws-gateway
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Avoid flapping: keep a scaled-up pod for 5 minutes.
+      stabilizationWindowSeconds: 300

@@ -1,0 +1,17 @@
+# Delete both Routes.
+#
+# The OpenShift Route CRD does not exist on plain Kubernetes, so these objects
+# must not be in the applied set at all — a plain cluster rejects them with
+# "no matches for kind Route". $patch: delete removes them at render time, so
+# nothing OpenShift-specific reaches the API server.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ws-gateway
+$patch: delete
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: frontend
+$patch: delete

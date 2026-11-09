@@ -1,0 +1,125 @@
+# sentinel-bridge — applies REPLICAOF, patches the dragonfly Service selector,
+# and reacts to the write guard.
+#
+# Specified in docs/redis-sentinel.md §4. 2 replicas with Lease leader election
+# so the role-application logic is not a single point of failure
+# (docs/fault-tolerance.md §3.5). Only the lease holder acts.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-bridge
+  labels:
+    app.kubernetes.io/name: sentinel-bridge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinel-bridge
+  labels:
+    app.kubernetes.io/name: sentinel-bridge
+rules:
+  # Patch the dragonfly Service endpoints, read pods to resolve the master,
+  # read/patch pod labels for the write guard, and hold the leader Lease.
+  - apiGroups: [""]
+    resources: ["pods", "endpoints"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinel-bridge
+  labels:
+    app.kubernetes.io/name: sentinel-bridge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinel-bridge
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-bridge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-bridge
+  labels:
+    app.kubernetes.io/name: sentinel-bridge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinel-bridge
+    spec:
+      serviceAccountName: sentinel-bridge
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: sentinel-bridge
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: bridge
+          # Built from services/sentinel-bridge. Replace with a digest before a
+          # real deploy. Logic: services/sentinel-bridge/src/index.js
+          image: image-registry.openshift-image-registry.svc:5000/fire-watch/sentinel-bridge:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: health, containerPort: 8081 }
+          env:
+            - { name: FW_NAMESPACE,             value: fire-watch }
+            - { name: FW_SENTINEL_SERVICE,      value: sentinel-headless }
+            - { name: FW_DRAGONFLY_MASTER,      value: fire-watch-dragonfly }
+            - { name: FW_DRAGONFLY_SERVICE,     value: dragonfly }
+            - { name: FW_DRAGONFLY_STATEFULSET, value: dragonfly }
+            - { name: FW_DRAGONFLY_HEADLESS,    value: dragonfly-headless }
+            - { name: FW_LEASE_NAME,            value: sentinel-bridge-leader }
+            - { name: FW_RECONCILE_INTERVAL,    value: "5s" }
+            - { name: FW_SENTINEL_PORT,         value: "26379" }
+            - { name: FW_DRAGONFLY_PORT,        value: "6379" }
+            - { name: FW_WRITE_GUARD_MIN_REPLICAS, value: "2" }
+            - { name: FW_WRITABLE_LABEL,        value: fire-watch.io/writable }
+            # Sentinel is the component that decides a master is gone. Leave
+            # this false unless you want the bridge to also *request* failovers.
+            - { name: FW_ENABLE_FAILOVER_REQUEST, value: "false" }
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: DRAGONFLY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet: { path: /livez, port: 8081 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 5
+            periodSeconds: 10

@@ -68,6 +68,8 @@ Sentinel can promote a replica, but the promoted pod is still `dragonfly-2`, i.e
 
 Both are closed by one small controller, `sentinel-bridge` — a Deployment with **2 replicas** and `coordination.k8s.io/v1` `Lease` leader election, spread by required anti-affinity. Only the lease holder acts; the standby takes over within one lease duration (15s). A single-replica bridge would be a single point of failure for master discovery ([fault-tolerance.md](fault-tolerance.md) §3.5).
 
+**Implemented:** [services/sentinel-bridge](../services/sentinel-bridge/) — source, tests, container config and the full env reference.
+
 ```text
 loop every 5s:
   master := SENTINEL get-master-addr-by-name fire-watch-dragonfly
@@ -133,13 +135,21 @@ Outcomes:
 
 ## 7. Monitoring
 
+Sentinel speaks RESP on 26379 and has **no HTTP endpoint**, so Prometheus cannot scrape it directly. A `redis-exporter` Deployment bridges that ([k8s/base/33-redis-exporter.yaml](../k8s/base/33-redis-exporter.yaml)). Rules are in [k8s/base/60-monitoring.yaml](../k8s/base/60-monitoring.yaml).
+
 | Signal | Alert |
 |---|---|
-| `redis_sentinel_master_ok` (one per sentinel) | any target reports `0` |
-| `redis_sentinel_masters` | not exactly 1 master named `fire-watch-dragonfly` |
-| failover events (`+switch-master` in sentinel log) | `> 2` in 1h |
-| `sentinel-bridge` reconcile errors | `> 0` for 10 min |
-| pod label `fire-watch.io/writable=false` count | `> 0` for 5 min |
+| `redis_sentinel_master_status{master_name="fire-watch-dragonfly"}` | `!= 1` for 2 min |
+| sentinel count reporting the master | `< 2` for 5 min — quorum is lost, no failover possible |
+| `redis_sentinel_master_role_changes_total` | `> 2` per hour — failover flapping |
+| `redis_sentinel_master_status` series count | `!= 3` for 5 min |
+| pod label `fire-watch.io/writable=false` | `> 0` for 5 min (same signal as Dragonfly §7) |
+
+`redis_sentinel_*` metric names come from the exporter, not from Sentinel itself, and they vary by exporter version. Verify against the running exporter before trusting the rules:
+
+```bash
+kubectl -n fire-watch exec deploy/redis-exporter -- wget -qO- localhost:9121/metrics | grep sentinel
+```
 
 ## 8. Verification checklist
 

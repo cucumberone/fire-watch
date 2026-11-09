@@ -154,7 +154,7 @@ Per [dragonfly.md](dragonfly.md) §3, writes must not land on a master that has 
 if the dragonfly Service has no ready endpoint -> do not write; nack(requeue=true)
 ```
 
-The gate is the **Service**, not a key inside Dragonfly. A degraded Dragonfly cannot be asked to report its own degradation — and the write-guard sidecar cannot write to the database it is judging. The sidecar sets a pod label (`fire-watch.io/writable=false`), `sentinel-bridge` reacts by removing that pod from the `dragonfly` Service, and workers observe the resulting empty endpoint list ([fault-tolerance.md](fault-tolerance.md) §3.7).
+The gate is the **Service**, not a key inside Dragonfly. A degraded Dragonfly cannot be asked to report its own degradation. `sentinel-bridge` reads every pod's `ROLE`, and when the designated master has fewer than `FW_WRITE_GUARD_MIN_REPLICAS` connected replicas it sets `Endpoints/dragonfly` to zero addresses and labels the pod `fire-watch.io/writable=false`. Workers observe the empty endpoint list and stop writing ([dragonfly.md](dragonfly.md) §3, [fault-tolerance.md](fault-tolerance.md) §3.7).
 
 This also keeps the rule that the write target must come from the `dragonfly` Service / Sentinel — never from a pod IP (see [redis-sentinel.md](redis-sentinel.md) §5).
 

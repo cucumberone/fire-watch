@@ -1,0 +1,19 @@
+# OpenShift lab flavour — Route-based, exactly like production.
+#
+#   kubectl apply -k k8s/overlays/lab/openshift
+#
+# Use this when the lab is CRC, OpenShift Local, or any real OpenShift cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch-lab
+
+resources:
+  - ../common
+
+patches:
+  # Lab-specific Route hosts, so a lab apply can never shadow a production
+  # Route on the same router.
+  - path: routes.yaml
+  # Point the frontend at the lab gateway host.
+  - path: frontend-config.yaml

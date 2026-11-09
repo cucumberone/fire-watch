@@ -1,0 +1,125 @@
+# http-ingress — HTTP from an external nginx into RabbitMQ.
+#
+# This is a PRODUCER, not a consumer. It is separate from `worker` because the
+# two have opposite failure semantics: the ingress must answer 5xx when it cannot
+# publish, while a worker must never answer anything at all.
+#
+# Exposure: NodePort, because the traffic originates outside the cluster (an
+# external nginx) and OpenShift Routes speak HTTP but route to a Service — a
+# Route would work too, but a NodePort keeps the external nginx's existing
+# upstream pool unchanged and avoids the router's 30s timeout for large batches.
+# See docs/http-ingress.md §4.
+#
+# The Service is a plain LoadBalancer-less NodePort on a fixed port so the
+# external nginx config is a constant.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-ingress
+  labels:
+    app.kubernetes.io/name: http-ingress
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: http-ingress
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: http-ingress
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: http-ingress
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ingress
+          image: image-registry.openshift-image-registry.svc:5000/fire-watch/http-ingress:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: FW_PORT,           value: "8080" }
+            - { name: FW_EVENT_PATH,     value: /events }
+            - { name: FW_MAX_BODY_BYTES, value: "2097152" }
+            - { name: FW_MAX_BATCH,      value: "500" }
+            - { name: FW_CHANNELS,       value: "4" }
+            - { name: FW_CONFIRM_TIMEOUT_MS, value: "10000" }
+
+            # Shared secret the external nginx must send as X-Ingest-Token.
+            - name: FW_INGEST_TOKEN
+              valueFrom:
+                secretKeyRef: { name: fire-watch-ingress, key: token }
+
+            # Publish into the same exchange the producers use, so the queue
+            # topology, DLX and audit path are unchanged.
+            - { name: AMQP_EXCHANGE,    value: fx.events }
+            - { name: AMQP_ROUTING_KEY, value: event.ingest }
+            - { name: AMQP_HOST,        value: rabbitmq }
+            - { name: AMQP_PORT,        value: "5672" }
+            - name: AMQP_USER
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: username }
+            - name: AMQP_PASS
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 384Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            # False while the broker is unreachable: an ingress that cannot
+            # publish must leave the load balancer so nginx fails over instead
+            # of hammering a pod that will only answer 503.
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              # Let in-flight requests finish their confirm and answer 202.
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: http-ingress
+  labels:
+    app.kubernetes.io/name: http-ingress
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: http-ingress
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30900

@@ -1,0 +1,64 @@
+# Delete the monitoring objects for the lab.
+#
+# Two independent reasons:
+#   1. ServiceMonitor and PrometheusRule are CRDs from prometheus-operator.
+#      A lab cluster without the OpenShift monitoring stack or
+#      kube-prometheus-stack rejects them outright.
+#   2. Even where the CRDs exist, a lab has no Prometheus to scrape, so they
+#      would be inert.
+#
+# redis-exporter goes too: it exists only to feed the Sentinel ServiceMonitor,
+# and it costs a pod for no benefit in a lab.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rabbitmq
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dragonfly
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis-exporter
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-rabbitmq
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-dragonfly
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-sentinel
+$patch: delete
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-workloads
+$patch: delete
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+$patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+$patch: delete

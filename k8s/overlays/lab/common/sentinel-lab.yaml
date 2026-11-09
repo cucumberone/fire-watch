@@ -1,0 +1,21 @@
+# Sentinel in the lab has quorum 1: there is only one sentinel, so 2 is
+# unsatisfiable and no failover could ever be authorised. This makes the lab
+# start cleanly instead of reporting the master as down forever.
+#
+# The monitor line is otherwise identical to the base.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+data:
+  sentinel.conf.template: |
+    port 26379
+    dir /data
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor fire-watch-dragonfly dragonfly-0.dragonfly-headless.fire-watch-lab.svc.cluster.local 6379 1
+    sentinel auth-pass fire-watch-dragonfly __DRAGONFLY_PASSWORD__
+    sentinel down-after-milliseconds fire-watch-dragonfly 5000
+    sentinel failover-timeout fire-watch-dragonfly 60000
+    sentinel parallel-syncs fire-watch-dragonfly 1
+    sentinel deny-scripts-reconfig yes

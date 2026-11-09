@@ -1,0 +1,7 @@
+# No HPA in the lab: one small machine has nothing to scale onto, and min 3
+# would fight the replicas.yaml patch.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ws-gateway
+$patch: delete

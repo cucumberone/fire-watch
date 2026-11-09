@@ -2,20 +2,19 @@
 
 `k8s/` is a **Kustomize** tree, not a flat directory of YAML. One base describes the production-shaped deployment, overlays adjust it per environment.
 
+**Status: implemented and rendering.** `kubectl kustomize k8s/base` produces 35 objects. The lab produces 27 objects via `k8s/overlays/lab/openshift` and 25 via `k8s/overlays/lab/kubernetes` (the two Routes are deleted in the latter). The values below are verified against the rendered output, not aspirational.
+
 ```
 k8s/
-├── base/                       # the plan of record (3 replicas, H/A, full sizing)
+├── base/                          # the plan of record (3 replicas, H/A, full sizing)
 │   ├── kustomization.yaml
-│   ├── 00-namespace.yaml
 │   ├── 01-pdb.yaml
 │   ├── 10-rabbitmq-rbac.yaml
 │   ├── 11-rabbitmq-config.yaml
-│   ├── 12-rabbitmq-secret.yaml.example
 │   ├── 13-rabbitmq-services.yaml
 │   ├── 14-rabbitmq-statefulset.yaml
 │   ├── 20-dragonfly-config.yaml
 │   ├── 20-alert-fold-config.yaml
-│   ├── 21-dragonfly-secret.yaml.example
 │   ├── 22-dragonfly-services.yaml
 │   ├── 23-dragonfly-statefulset.yaml
 │   ├── 30-sentinel-config.yaml
@@ -23,17 +22,30 @@ k8s/
 │   ├── 32-sentinel-bridge.yaml
 │   ├── 40-workers.yaml
 │   ├── 41-ws-gateway.yaml
-│   ├── 42-frontend.yaml
-│   ├── 50-no-networkpolicies.md     # decision note only, no objects ([networking.md](networking.md) §5)
-│   └── 60-monitoring.yaml
+│   └── 42-frontend.yaml
 └── overlays/
-    ├── lab/                    # 1 replica, tiny pods, no H/A — for the home lab
-    │   ├── kustomization.yaml
-    │   ├── replicas.yaml
-    │   ├── resources.yaml
-    │   ├── storage.yaml
-    │   └── no-pdb.yaml         # delete PDBs: they block the single-pod lab
-    └── prod/                   # (later) digest pinning, Route hosts, quota bumps
+    ├── lab/
+    │   ├── common/                # lab base, platform-neutral (replicas, sizes, flags)
+    │   │   ├── kustomization.yaml
+    │   │   ├── replicas.yaml
+    │   │   ├── resources.yaml
+    │   │   ├── storage.yaml
+    │   │   ├── delete-pdb.yaml
+    │   │   ├── delete-anti-affinity.yaml
+    │   │   ├── delete-hpa.yaml
+    │   │   ├── dragonfly-lab.yaml
+    │   │   ├── sentinel-lab.yaml
+    │   │   └── bridge-lab.yaml
+    │   ├── openshift/             # Routes, lab hostnames
+    │   │   ├── kustomization.yaml
+    │   │   ├── routes.yaml
+    │   │   └── frontend-config.yaml
+    │   └── kubernetes/            # Routes deleted, NodePort 30300/30800
+    │       ├── kustomization.yaml
+    │       ├── delete-routes.yaml
+    │       ├── nodeports.yaml
+    │       └── frontend-config.yaml
+    └── prod/                      # (later) digest pinning, Route hosts, quota bumps
         └── kustomization.yaml
 ```
 
@@ -71,6 +83,8 @@ resources:
   - 30-sentinel-config.yaml
   - 31-sentinel-statefulset.yaml
   - 32-sentinel-bridge.yaml
+  - 33-redis-exporter.yaml
+  - 34-http-ingress.yaml
   - 40-workers.yaml
   - 41-ws-gateway.yaml
   - 42-frontend.yaml
@@ -90,13 +104,57 @@ Rules the base follows that overlays must **not** silently break:
 
 Purpose: run the whole system on one small machine, to exercise the event pipeline end to end. It is **explicitly not fault tolerant** and that is the point — it must be cheap, fast to start and easy to reset.
 
+### 3.0 Two flavours, one shared base
+
+The lab runs on **either OpenShift or plain Kubernetes**. Production is always OpenShift; the plain-Kubernetes flavour exists so the datastore half can be exercised on hardware that is already on the desk, not as a second production path.
+
+```
+overlays/lab/
+├── common/            # identical on both platforms
+│   ├── kustomization.yaml   (this IS the lab base, not an overlay)
+│   ├── replicas.yaml, resources.yaml, storage.yaml
+│   ├── delete-pdb.yaml, delete-anti-affinity.yaml, delete-hpa.yaml
+│   └── dragonfly-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml
+├── openshift/         # Route-based, like production
+│   ├── kustomization.yaml
+│   ├── routes.yaml           (lab hostnames)
+│   └── frontend-config.yaml  (wss://ws.fire-watch-lab.apps.lab.local)
+└── kubernetes/        # no Routes, NodePort instead
+    ├── kustomization.yaml
+    ├── delete-routes.yaml    ($patch: delete on both Routes)
+    ├── nodeports.yaml        (30300 ws-gateway, 30800 frontend)
+    └── frontend-config.yaml  (host resolved from the page)
+```
+
+```bash
+kubectl apply -k k8s/overlays/lab/openshift     # CRC / OpenShift Local / real OCP
+kubectl apply -k k8s/overlays/lab/kubernetes    # MicroK8s / kind / k3s
+```
+
+| | `lab/openshift` | `lab/kubernetes` |
+|---|---|---|
+| Objects rendered | 27 | 25 |
+| `Route` objects | 2 | **0** (deleted at render time) |
+| `ws-gateway` Service | ClusterIP | **NodePort 30300** |
+| `frontend` Service | ClusterIP | **NodePort 30800** |
+| Frontend `wsUrl` | `wss://ws.fire-watch-lab.apps.lab.local` | `ws://<page-host>:30300` |
+| Everything else | identical | identical |
+
+**`common/` is a base, not an overlay.** Both flavours list it under `resources`, which is what `base` in `kustomize.base` means. That matters because it makes `common` renderable on its own (`kubectl kustomize k8s/overlays/lab/common` → 27 objects) and it is the only structure where the two flavours cannot drift apart.
+
+**Deleting a CRD object works.** `kubernetes/delete-routes.yaml` uses `$patch: delete` on `route.openshift.io/v1` objects that the *local* kustomize has no schema for. Verified with kustomize 5.x shipped in `kubectl`: the objects are removed at render time and never reach the API server. Without this, a plain cluster fails with `no matches for kind "Route"`.
+
+**NodePorts are fixed** (30300/30800) rather than auto-assigned, so the frontend config can be a constant and you do not have to look up a port after every apply. Nothing but these two Services is exposed: RabbitMQ, Dragonfly and Sentinel stay ClusterIP-only on both flavours, exactly as in production.
+
+**The plain-Kubernetes frontend config sets `resolveWsHostFromPage: true`.** A NodePort is reachable on any node's IP, so hard-coding one would be wrong on a second machine and stale after a DHCP change. The frontend substitutes `location.hostname` and keeps the port. This is a small requirement on the frontend code — it is written down here because it is the one behavioural difference the overlay imposes on application code.
+
 ### 3.1 What it changes
 
 | Aspect | Base | lab |
 |---|---|---|
 | Replicas | 3 each (bridge 2) | **1 each** |
 | Anti-affinity | required | **removed** (1 replica, no spread to enforce; required would still schedule but blocks nothing) |
-| PDBs | all 7 workloads | **deleted** — a PDB with 1 replica and `minAvailable: 2` makes the pod impossible to evict |
+| PDBs | all 8 workloads | **deleted** — a PDB with 1 replica and `minAvailable: 2` makes the pod impossible to evict |
 | Dragonfly `maxmemory` | 36gb | **512mb** |
 | Dragonfly mem limit/request | 48Gi / 8Gi | **1Gi / 256Mi** |
 | Dragonfly PV | 64Gi | **2Gi** |
@@ -122,43 +180,67 @@ Purpose: run the whole system on one small machine, to exercise the event pipeli
 
 ### 3.3 Lab resource profile
 
-Total across all pods: **≈ 1 CPU requested, ≈ 2.5 GiB requested**, ≈ 6 GiB of storage. Fits any single-node cluster or a 2 vCPU / 4 GiB VM.
+Measured from `kubectl kustomize k8s/overlays/lab/common`, not estimated:
+
+```text
+1 replica per workload
+requests:  310m CPU, 656Mi memory   (0.64 GiB)
+limits:   1650m CPU, 2208Mi memory  (2.16 GiB)
+storage:      2Gi + 2Gi + 256Mi    (4.25 GiB)
+```
+
+Fits any single-node cluster or a 2 vCPU / 4 GiB VM.
 
 | Component | Req CPU | Lim CPU | Req Mem | Lim Mem | PV |
 |---|---|---|---|---|---|
 | RabbitMQ | 50m | 300m | 128Mi | 384Mi | 2Gi |
-| Dragonfly | 100m | 500m | 256Mi | 1Gi | 2Gi |
-| Sentinel | 10m | 50m | 32Mi | 64Mi | 256Mi |
+| Dragonfly (server) | 100m | 500m | 256Mi | 1Gi | 2Gi |
+| Dragonfly (pruner) | 5m | 50m | 8Mi | 32Mi | — |
+| Sentinel (server) | 10m | 50m | 32Mi | 64Mi | 256Mi |
+| Sentinel (init) | 5m | 50m | 8Mi | 32Mi | — |
 | Workers | 50m | 200m | 64Mi | 192Mi | — |
 | WS gateway | 50m | 200m | 64Mi | 192Mi | — |
 | Frontend | 10m | 50m | 16Mi | 32Mi | — |
+| sentinel-bridge | 10m | 100m | 32Mi | 96Mi | — |
+| http-ingress | 20m | 150m | 48Mi | 160Mi | — |
+| **Total** | **310m** | **1650m** | **656Mi** | **2.16Gi** | **4.25Gi** |
 
 ### 3.4 The lab kustomization
 
 ```yaml
-# k8s/overlays/lab/kustomization.yaml
+# k8s/overlays/lab/common/kustomization.yaml — the shared lab base
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: fire-watch-lab
-
 resources:
-  - ../../base
-
+  - ../../../base
 patches:
   - path: replicas.yaml
   - path: resources.yaml
   - path: storage.yaml
-  - path: no-pdb.yaml
-  - path: dragonfly-lab-args.yaml
-  - path: ingress-hosts.yaml
-
-# routes need distinct hostnames so the lab never collides with anything else
-replacements:
-  - source: { kind: ConfigMap, name: lab-hosts, fieldPath: data.wsHost }
-    targets:
-      - select: { kind: Route, name: ws-gateway }
-        fieldPaths: [spec.host]
+  - path: delete-pdb.yaml
+  - path: delete-anti-affinity.yaml
+  - path: delete-hpa.yaml
+  - path: dragonfly-lab.yaml
+  - path: sentinel-lab.yaml
+  - path: bridge-lab.yaml
 ```
+
+```yaml
+# k8s/overlays/lab/kubernetes/kustomization.yaml — plain-Kubernetes flavour
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: fire-watch-lab
+resources:
+  - ../common
+patches:
+  - path: delete-routes.yaml     # $patch: delete on both Routes
+  - path: nodeports.yaml         # ws-gateway 30300, frontend 30800
+  - path: frontend-config.yaml
+```
+
+The OpenShift flavour is the same file shape with `routes.yaml` and its own
+`frontend-config.yaml` instead of the three Kubernetes patches.
 
 `replicas.yaml` — one patch covering every workload (Kustomize has no cross-resource replicas field that reaches a StatefulSet and a Deployment in one entry):
 
@@ -199,7 +281,7 @@ metadata: { name: sentinel }
 spec: { replicas: 1 }
 ```
 
-`no-pdb.yaml` — delete, not shrink:
+`delete-pdb.yaml` — delete, not shrink:
 
 ```yaml
 $patch: delete
@@ -214,7 +296,7 @@ metadata: { name: dragonfly }
 # ... one entry per PDB in the base
 ```
 
-`dragonfly-lab-args.yaml` patches only the two arguments that must differ:
+`dragonfly-lab.yaml` patches the Dragonfly **ConfigMap**, not an args list:
 
 ```yaml
 apiVersion: apps/v1
@@ -245,17 +327,31 @@ Note the list is replaced wholesale — Kustomize replaces `args` rather than me
 ### 3.5 Applying it
 
 ```bash
-# render first — always look at what will be applied
-kubectl kustomize k8s/overlays/lab | less
+# ---- OpenShift (CRC, OpenShift Local, or a real OCP cluster)
+kubectl kustomize k8s/overlays/lab/openshift | less
+kubectl apply   -k k8s/overlays/lab/openshift
 
-# apply
-kubectl apply -k k8s/overlays/lab
-
-# tear down
-kubectl delete -k k8s/overlays/lab
+# ---- plain Kubernetes (MicroK8s, kind, k3s)
+kubectl kustomize k8s/overlays/lab/kubernetes | less
+kubectl apply   -k k8s/overlays/lab/kubernetes
 ```
 
-`kubectl apply -k` is built into kubectl and `oc`; there is no separate install step.
+Tear down. Note that `delete -k` does **not** remove the StatefulSet PVCs — that
+is deliberate, so a re-apply reuses the data:
+
+```bash
+kubectl delete -k k8s/overlays/lab/openshift      # or .../kubernetes
+kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=rabbitmq
+kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=dragonfly
+kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=sentinel
+```
+
+`kubectl apply -k` is built into `kubectl` and `oc`; there is no separate install
+step.
+
+On the plain-Kubernetes flavour the UI is at `http://<node-ip>:30800` and the
+gateway at `ws://<node-ip>:30300`. There is no Route, so nothing resolves by
+name — use the node address.
 
 ### 3.6 What the lab cannot test
 
@@ -272,10 +368,9 @@ State this before anyone trusts a lab result:
 | Memory/snapshot sizing | 512mb vs 36gb |
 | Eviction pressure | working set is far below `maxmemory` |
 
-**Consequence:** the write-guard sidecar needs a lab-specific setting, `FW_WRITE_GUARD_MIN_REPLICAS=0`, or it will trip permanently in the lab (a master with 1 configured replica has `connected_slaves:0`, which is below the base's expectation of 2). This is the single most likely "why is everything read-only in my lab" trap, so it belongs in the overlay explicitly:
+**Consequence:** the bridge needs a lab-specific setting, `FW_WRITE_GUARD_MIN_REPLICAS=0`, or it will withhold the endpoint permanently in the lab. A single Dragonfly has no replica, so its replica count is always 0, which is below the base's expectation of 2 — the Service would have zero endpoints forever. This is the single most likely "why is everything read-only in my lab" trap, so the overlay sets it explicitly in `bridge-lab.yaml`:
 
 ```yaml
-# env patch for the write-guard sidecar
 - name: FW_WRITE_GUARD_MIN_REPLICAS
   value: "0"
 ```
@@ -285,7 +380,7 @@ State this before anyone trusts a lab result:
 The lab overlay is a stepping stone, not a dead end. To get closer to production on a slightly bigger machine, add a second overlay that composes rather than replaces:
 
 ```yaml
-# k8s/overlays/lab-ha/kustomization.yaml
+# k8s/overlays/lab-ha/kustomization.yaml (a future third flavour-agnostic overlay)
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: fire-watch-lab

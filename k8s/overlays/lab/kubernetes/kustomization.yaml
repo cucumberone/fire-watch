@@ -1,0 +1,35 @@
+# Plain-Kubernetes lab flavour — no Routes, NodePort instead.
+#
+#   kubectl apply -k k8s/overlays/lab/kubernetes
+#
+# Use this on MicroK8s, kind, k3s, or any cluster without the OpenShift Route
+# CRD. Production is always OpenShift; this overlay exists so the datastore half
+# can be exercised on hardware you already have, not to be a production path.
+#
+# Differences from the OpenShift flavour:
+#   * the two Route objects are DELETED (the CRD does not exist)
+#   * the two Services become NodePort, so they are reachable from the host
+#   * the frontend's wsUrl points at the NodePort, not a Route host
+#
+# Everything else — replicas, resources, storage, Dragonfly flags, Sentinel
+# quorum, bridge settings — is identical, because it comes from ../common.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch-lab
+
+resources:
+  - ../common
+
+patches:
+  # Remove the OpenShift-only objects. $patch: delete works on unknown CRDs:
+  # tested with kustomize 5.x, the objects are dropped before rendering.
+  - path: delete-routes.yaml
+
+  # NodePort instead of ClusterIP, so a laptop or another host on the LAN can
+  # reach the UI and the WebSocket without a port-forward.
+  - path: nodeports.yaml
+
+  # The browser has to reach the gateway on the node IP + NodePort, not on a
+  # Route hostname.
+  - path: frontend-config.yaml

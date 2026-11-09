@@ -1,0 +1,48 @@
+# Small volumes. Storage is declared in volumeClaimTemplates, which a strategic
+# merge patch cannot reach (it is a list), so these use JSON6902 ops on the
+# index of the template list.
+#
+# Base sizes: rabbitmq 96Gi, dragonfly 64Gi, sentinel 1Gi.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  volumeClaimTemplates:
+    # replace the whole list — there is exactly one template
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dragonfly
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 256Mi

@@ -20,3 +20,8 @@ node_modules/
 dist/
 *.log
 tmp/
+
+# Node build artefacts
+npm-debug.log*
+# package-lock.json is intentionally NOT ignored: reproduced builds need it.
+# Generate it with `npm install` and commit it.

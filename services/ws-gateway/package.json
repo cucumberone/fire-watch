@@ -1,0 +1,18 @@
+{
+  "name": "ws-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stateless WebSocket fan-out from Dragonfly pub/sub to browsers",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"src/**/*.test.js\""
+  },
+  "dependencies": {
+    "ioredis": "^5.4.2",
+    "ws": "^8.18.0"
+  }
+}

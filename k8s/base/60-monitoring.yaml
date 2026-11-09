@@ -1,0 +1,353 @@
+# Monitoring: ServiceMonitors + PrometheusRules.
+#
+# Requires the OpenShift monitoring stack (or kube-prometheus-stack):
+#   prometheus-operator CRDs  (ServiceMonitor, PrometheusRule)
+#   kube-state-metrics        (pod labels, restart counters)
+#   cAdvisor                  (container_memory_working_set_bytes)
+#
+# The lab overlays DELETE this file: neither CRD exists on a lab cluster, and a
+# lab has no Prometheus. See overlays/lab/common/delete-monitoring.yaml.
+#
+# Metric names below were taken from the sources, not guessed:
+#   Dragonfly  src/server/metrics.cc
+#   RabbitMQ   rabbitmq_prometheus plugin
+#   Sentinel   oliver006/redis_exporter (sentinel mode)
+---
+# ===========================================================================
+# ServiceMonitors — tell the operator WHERE to scrape
+# ===========================================================================
+
+# RabbitMQ: metrics come from the rabbitmq_prometheus plugin on the management
+# port. Already enabled in base/11-rabbitmq-config.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rabbitmq
+  labels:
+    app.kubernetes.io/name: rabbitmq
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+  endpoints:
+    - port: management
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+# Dragonfly: metrics on the admin port (9222), not the client port.
+#
+# Dragonfly also serves /metrics on 6379, but that path returns HTTP over the
+# RESP port and confuses scrapers ("Received HTTP/0.9 when not allowed"). The
+# admin port is the documented one to use.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dragonfly
+  labels:
+    app.kubernetes.io/name: dragonfly
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dragonfly
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+# Sentinel via redis_exporter. Sentinel speaks RESP only — there is no HTTP
+# endpoint to scrape — so an exporter is required. See 33-redis-exporter.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis-exporter
+  labels:
+    app.kubernetes.io/name: redis-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+# ===========================================================================
+# PrometheusRules
+# ===========================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-rabbitmq
+  labels:
+    app.kubernetes.io/name: rabbitmq
+spec:
+  groups:
+    - name: fire-watch.rabbitmq
+      rules:
+        # --- a backlog that never drains means consumers are gone or stuck
+        - alert: RabbitMQQueueBacklogGrowing
+          # ready messages never going down over 15 min => nothing is consuming
+          expr: |
+            rabbitmq_quorum_queue_messages_ready > 0
+            and
+            delta(rabbitmq_quorum_queue_messages_ready[15m]) >= 0
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Quorum queue {{ $labels.queue }} is not draining"
+            description: "{{ $value }} messages ready and the backlog has not fallen in 15 minutes. Consumers are stopped or the write gate is closed."
+
+        # --- memory alarm: publishing is blocked, not slow
+        - alert: RabbitMQMemoryAlarm
+          expr: rabbitmq_alarms_memory_used_watermark == 1
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "RabbitMQ memory alarm on {{ $labels.node }}"
+            description: "Publishers are blocked until memory drops below the high watermark."
+
+        # --- disk alarm: same failure mode, different cause
+        - alert: RabbitMQDiskAlarm
+          expr: rabbitmq_alarms_free_disk_space_watermark == 1
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "RabbitMQ free-disk alarm on {{ $labels.node }}"
+            description: "Publishing is blocked. Check the PV and the audit queue size."
+
+        # --- unacked messages with no consumers: the consumer died silently
+        - alert: RabbitMQUnackedWithNoConsumers
+          expr: |
+            rabbitmq_queue_messages_unacked > 0
+            and on (queue)
+            rabbitmq_queue_consumers == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Queue {{ $labels.queue }} has unacked messages and no consumers"
+            description: "Messages are pinned to a consumer that is no longer connected. They will be redelivered on channel recovery, but only if the channel closes."
+
+        # --- quorum loss: fewer than 3 members means no tolerance for another loss
+        - alert: RabbitMQClusterIncomplete
+          expr: count(rabbitmq_identity_info) < 3
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Only {{ $value }} of 3 RabbitMQ nodes are being scraped"
+            description: "Quorum queues need 2 of 3 members. At 2 the cluster works but a second loss stops publishing."
+
+        # --- dead-lettered events: something was rejected, never silently
+        - alert: RabbitMQDeadLetteredEvents
+          expr: rabbitmq_queue_messages_ready{queue="q.event.ingest.dlq"} > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $value }} events in the dead-letter queue"
+            description: "Validation failures only — requeue is unlimited by design (fault-tolerance.md §3.1). Inspect with: rabbitmqadmin get queue=q.event.ingest.dlq"
+
+        # --- audit WAL filling up: retention or a burst will soon block ingest
+        - alert: RabbitMQAuditQueueFilling
+          expr: |
+            (rabbitmq_quorum_queue_messages_bytes{queue="q.audit.events"} or 0)
+            / 68719476736 > 0.70
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Audit WAL is {{ $value | humanizePercentage }} of its 64GiB cap"
+            description: "At 100% the worker's audit publish is rejected and ingest stalls. The 7-day TTL should normally keep this near 19GiB."
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-dragonfly
+  labels:
+    app.kubernetes.io/name: dragonfly
+spec:
+  groups:
+    - name: fire-watch.dragonfly
+      rules:
+        # --- fewer than 2 replicas: redundancy is degraded
+        #
+        # There is no dragonfly_connected_replicas metric. The lag metric is
+        # exported once per connected replica, so counting its series gives the
+        # replica count. The earlier docs named a metric that does not exist.
+        - alert: DragonflyReplicasMissing
+          expr: |
+            count by (namespace) (dragonfly_connected_replica_lag_records) < 2
+          for: 2m
+          labels: { severity: warning }
+          annotations:
+            summary: "Dragonfly has {{ $value }} connected replica(s), expected 2"
+            description: "The write guard withholds the Service endpoint below 2, so writes are already blocked if this persists past the grace period."
+
+        # --- replication falling behind
+        - alert: DragonflyReplicaLag
+          expr: dragonfly_connected_replica_lag_records > 10000
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Replica {{ $labels.replica_ip }} is {{ $value }} records behind"
+            description: "A large lag means a failover would lose those records from the replica's view. The audit queue still holds them."
+
+        # --- eviction: PAGE. retention is already broken.
+        #
+        # maxmemory is sized to the working set on purpose, so a non-zero
+        # eviction counter means the model in sizing.md is wrong. This is the
+        # single most important alert in the whole set.
+        - alert: DragonflyEvictingKeys
+          expr: increase(dragonfly_evicted_keys_total[5m]) > 0
+          for: 0m
+          labels: { severity: critical }
+          annotations:
+            summary: "Dragonfly is EVICTING keys — events are being lost"
+            description: "maxmemory-policy is noeviction, so this should be impossible. If it fires, either the flag was overridden or a different instance is being scraped. Check used_memory vs maxmemory and re-derive sizing.md §3.3."
+
+        # --- memory approaching the pod limit: OOMKill during a snapshot
+        - alert: DragonflyMemoryNearLimit
+          expr: |
+            container_memory_working_set_bytes{container="dragonfly"}
+            / on (pod, namespace) group_left
+            kube_pod_container_resource_limits{resource="memory", container="dragonfly"}
+            > 0.90
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Dragonfly {{ $labels.pod }} at {{ $value | humanizePercentage }} of its memory limit"
+            description: "Snapshot serialization allocates on top of the dataset. Above 90% an OOMKill during the hourly snapshot is likely."
+
+        # --- snapshot failing: the restart path is broken
+        #
+        # dragonfly_failed_restores_total is the documented counter. The docs
+        # previously named dragonfly_snapshot_load_num_errors, which does not
+        # exist in Dragonfly's metric set.
+        - alert: DragonflyRestoreFailures
+          expr: increase(dragonfly_failed_restores_total[1h]) > 0
+          for: 0m
+          labels: { severity: critical }
+          annotations:
+            summary: "Dragonfly failed to load a snapshot"
+            description: "A restart loaded the previous generation or nothing. Replay the gap from q.audit.events and investigate the .dfs files."
+
+        # --- a snapshot that never completes
+        - alert: DragonflySnapshotStuck
+          expr: dragonfly_save_in_progress == 1
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Dragonfly snapshot has been running for 30+ minutes"
+            description: "Expected duration is ~seconds at this dataset size. A stuck save blocks the next scheduled one."
+
+        # --- the write guard has emptied the Service endpoint
+        #
+        # The bridge sets this label; kube-state-metrics exposes it. This is a
+        # better signal than a custom counter because it reflects the actual
+        # routing state, which is what workers act on.
+        - alert: DragonflyWriteGateClosed
+          expr: |
+            kube_pod_labels{label_fire_watch_io_writable="false"} == 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Dragonfly {{ $labels.pod }} is marked NOT writable"
+            description: "sentinel-bridge has emptied Endpoints/dragonfly. Writers are blocked and events are accumulating in RabbitMQ. Check INFO REPLICATION for the missing replicas."
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-sentinel
+  labels:
+    app.kubernetes.io/name: sentinel
+spec:
+  groups:
+    - name: fire-watch.sentinel
+      rules:
+        # --- sentinel cannot see the master: no failover can be authorised
+        #
+        # redis_exporter exposes this per-master with a state label.
+        # Verify the exact series name against your exporter version:
+        #   kubectl -n fire-watch exec deploy/redis-exporter -- \
+        #     wget -qO- localhost:9121/metrics | grep sentinel
+        - alert: SentinelMasterNotOk
+          expr: redis_sentinel_master_status{master_name="fire-watch-dragonfly"} != 1
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Sentinel on {{ $labels.instance }} does not consider the master ok"
+            description: "If all three agree, Sentinel will promote a replica. If only one does, quorum protects you — but check why."
+
+        # --- not enough sentinels agreeing = no quorum
+        - alert: SentinelQuorumAtRisk
+          expr: |
+            count(redis_sentinel_master_status{master_name="fire-watch-dragonfly"}) < 2
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Only {{ $value }} sentinel(s) reachable, quorum needs 2"
+            description: "With fewer than 2 sentinels no failover can be authorised, so a master loss becomes an outage."
+
+        # --- repeated failovers: something is flapping
+        - alert: SentinelFailoverFlapping
+          expr: |
+            increase(redis_sentinel_master_role_changes_total{master_name="fire-watch-dragonfly"}[1h]) > 2
+          for: 0m
+          labels: { severity: critical }
+          annotations:
+            summary: "More than 2 master role changes in an hour"
+            description: "Either the master is genuinely unstable or the bridge and Sentinel disagree. Check bridge logs for repeated REPLICAOF."
+
+        # --- one master only
+        - alert: SentinelMasterCountWrong
+          expr: count(redis_sentinel_master_status{master_name="fire-watch-dragonfly"}) != 3
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $value }} of 3 sentinels are reporting the master"
+            description: "Missing sentinels weaken quorum. Check pod status and the sentinel PVCs (the config epoch lives on them)."
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fire-watch-workloads
+  labels:
+    app.kubernetes.io/name: fire-watch
+spec:
+  groups:
+    - name: fire-watch.workloads
+      rules:
+        # --- a worker that cannot write must not consume; this is how you see it
+        - alert: WorkersNotReady
+          expr: kube_deployment_status_replicas_ready{deployment="worker"} < 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "No worker pod is ready"
+            description: "Events are accumulating in q.event.ingest and nothing is draining them."
+
+        # --- crash loops across the board usually mean a bad config or a missing Secret
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace=~"fire-watch.*"}[15m]) * 60 * 15 > 3
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is restarting repeatedly"
+            description: "Check the previous logs. A missing Secret or a bad flag fails at boot, not at runtime."
+
+        # --- a pod that never schedules after a node loss
+        - alert: PodPending
+          expr: |
+            kube_pod_status_phase{namespace=~"fire-watch.*", phase="Pending"} == 1
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.pod }} has been Pending for 15+ minutes"
+            description: "Usually insufficient memory for a rescheduled Dragonfly. See sizing.md §3.3 — a 48Gi limit needs 128 GiB nodes to move."

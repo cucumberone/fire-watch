@@ -1,0 +1,106 @@
+# Workers — 3 replicas, consume, compress, write, audit, publish, ack last.
+# Pipeline order is specified in docs/workers.md §3 and must not be reordered:
+#   validate -> compress msgc -> write -> audit (PLAIN) -> publish -> ack
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: worker
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: worker
+          # Placeholder image: replace with the built worker image and pin a
+          # digest. Behaviour is specified in docs/workers.md.
+          image: image-registry.openshift-image-registry.svc:5000/fire-watch/worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            # ---- AMQP ----------------------------------------------------
+            - name: AMQP_HOST
+              value: rabbitmq
+            - name: AMQP_PORT
+              value: "5672"
+            - name: AMQP_USER
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: username }
+            - name: AMQP_PASS
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
+            - { name: AMQP_QUEUE,           value: q.event.ingest }
+            - { name: AMQP_AUDIT_EXCHANGE,  value: fx.audit }
+            - { name: AMQP_AUDIT_KEY,       value: event.audit }
+            - { name: AMQP_PREFETCH,        value: "32" }
+
+            # ---- Dragonfly (Sentinel-aware, never a pod IP) --------------
+            - { name: SENTINELS,           value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
+            - { name: DFLY_MASTER_NAME,    value: fire-watch-dragonfly }
+            - name: DRAGONFLY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+
+            # ---- behaviour ----------------------------------------------
+            - { name: FW_EVENT_TTL,            value: "604800" }
+            - { name: FW_INDEX_PRUNE_EVERY,    value: "1000" }
+            - { name: FW_ALERT_DEDUP_WINDOW,   value: "300000" }
+            - { name: FW_COMPRESS_MIN,         value: "1024" }
+            - { name: FW_COMPRESS_LEVEL,       value: "6" }
+            - { name: FW_FOLD_SCRIPT,          value: /opt/fold/alert-fold.lua }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: fold, mountPath: /opt/fold, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            # Must be false while the write gate is closed: a worker that
+            # cannot write must not consume (docs/workers.md §7).
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            # Process-only. Never fails on dependency loss, or an outage would
+            # restart-loop every worker at once.
+            httpGet: { path: /livez, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 6
+      volumes:
+        - name: fold
+          configMap:
+            name: alert-fold
+        - name: tmp
+          emptyDir: {}

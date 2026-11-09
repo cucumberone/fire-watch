@@ -29,7 +29,7 @@ Implementation order, open decisions, and known deviations from the spec.
 2. `dragonfly-headless` Service
 3. `dragonfly` StatefulSet with `snapshot_cron`, pruner sidecar, PDB
 4. `sentinel` ConfigMap + StatefulSet + `sentinel-headless` Service
-5. `sentinel-bridge` Deployment + RBAC (patch Service, exec into pods)
+5. `sentinel-bridge` Deployment + RBAC (patch Service, exec into pods) — **implemented**, source in [services/sentinel-bridge](../services/sentinel-bridge/)
 6. Verify: master + 2 stable_sync replicas, sentinels agree, Service points at the master
 
 ### Phase 3 — workloads
@@ -54,28 +54,38 @@ Implementation order, open decisions, and known deviations from the spec.
 
 | Path | Contents |
 |---|---|
-| `base/00-namespace.yaml` | Namespace, ResourceQuota, LimitRange |
 | `base/01-pdb.yaml` | PodDisruptionBudgets for all 7 workloads ([fault-tolerance.md](fault-tolerance.md) §3.3) |
 | `base/10-rabbitmq-rbac.yaml` | ServiceAccount, Role, RoleBinding |
 | `base/11-rabbitmq-config.yaml` | `enabled_plugins`, `rabbitmq.conf`, `definitions.json` ConfigMaps |
-| `base/12-rabbitmq-secret.yaml.example` | template only; real file is git-ignored |
 | `base/13-rabbitmq-services.yaml` | headless + client Services |
 | `base/14-rabbitmq-statefulset.yaml` | StatefulSet |
-| `base/20-dragonfly-config.yaml` | flags config + pruner script |
+| `base/20-dragonfly-config.yaml` | flags file + entrypoint + pruner script |
 | `base/20-alert-fold-config.yaml` | `alert-fold.lua` mounted into the worker |
-| `base/21-dragonfly-secret.yaml.example` | template only |
 | `base/22-dragonfly-services.yaml` | headless + master-pointer Service |
-| `base/23-dragonfly-statefulset.yaml` | StatefulSet |
-| `base/30-sentinel-config.yaml` | `sentinel.conf` |
+| `base/23-dragonfly-statefulset.yaml` | StatefulSet + snapshot-pruner sidecar |
+| `base/30-sentinel-config.yaml` | `sentinel.conf` template |
 | `base/31-sentinel-statefulset.yaml` | StatefulSet + headless Service + **persistent 1Gi volume** for the config epoch |
 | `base/32-sentinel-bridge.yaml` | Deployment, RBAC, ServiceAccount |
+| `base/33-redis-exporter.yaml` | Deployment + Service — Sentinel has no HTTP endpoint |
+| `base/34-http-ingress.yaml` | Deployment + NodePort 30900 — external nginx → AMQP ([http-ingress.md](http-ingress.md)) |
 | `base/40-workers.yaml` | Deployment |
 | `base/41-ws-gateway.yaml` | Deployment, Service, HPA, Route |
-| `base/42-frontend.yaml` | Deployment, Service, Route |
-| `base/50-networkpolicies.yaml` | **not used** — deliberately omitted while deploying into a shared namespace ([networking.md](networking.md) §5) |
-| `base/60-monitoring.yaml` | ServiceMonitors, PrometheusRules |
-| `overlays/lab/` | **1 replica each, tiny pods, no PDBs, 512mb Dragonfly** — homelab testing ([kustomize.md](kustomize.md) §3) |
+| `base/42-frontend.yaml` | Deployment, ConfigMap, Service, Route |
+| `base/kustomization.yaml` | resource list + namespace + common labels |
+| `base/60-monitoring.yaml` | 3 ServiceMonitors + 4 PrometheusRules (21 alerts) |
+| `overlays/lab/common/` | **lab base**: 1 replica each, tiny pods, no PDBs, no HPA, 512mb Dragonfly — shared by both flavours ([kustomize.md](kustomize.md) §3) |
+| `overlays/lab/openshift/` | Route-based lab (27 objects) |
+| `overlays/lab/kubernetes/` | NodePort lab, Routes deleted (25 objects) |
 | `overlays/prod/` | (later) digest pinning, Route hostnames, quota bumps |
+
+**Deliberately absent, with the reason:**
+
+| Not a file | Why |
+|---|---|
+| `00-namespace.yaml` | the namespace already exists and is shared with other workloads — creating it, or a ResourceQuota/LimitRange in it, would affect things we do not own ([networking.md](networking.md) §5.1) |
+| `*secret*.yaml` | credentials are created out of band, never committed. Commands are in `k8s/base/kustomization.yaml` |
+| `50-networkpolicies.yaml` | removed from scope while the namespace is shared ([networking.md](networking.md) §5) |
+| `60-monitoring.yaml` | **done** — ServiceMonitors, PrometheusRules, redis-exporter ([monitoring.md](monitoring.md)) |
 
 Rules for every manifest: pinned image digests, explicit `resources`, probes on every container, `securityContext` with `runAsNonRoot`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` where possible, pod anti-affinity, and no `:latest`.
 
@@ -97,13 +107,14 @@ Overlay rule: **overlays change replicas, resources, storage, schedules and host
 | 3.10 | `FW_ALERT_DEDUP_WINDOW` value | default 5 min. Defines what counts as a new occurrence; a value below the sensor's reporting interval makes `count` equal the raw event count ([event-lifecycle.md](event-lifecycle.md) §5.4) | no |
 | 3.11 | Lab H/A overlay (`overlays/lab-ha`) | cheap 3-replica rehearsal of quorum and failover, small resources ([kustomize.md](kustomize.md) §4) | no |
 | 3.12 | NetworkPolicies | **removed from scope** while the namespace is shared. Re-add once we own the namespace ([networking.md](networking.md) §5.4) | no |
+| 3.13 | Kubernetes flavour | **decided:** production OpenShift only; the **lab** has two flavours (`lab/openshift` and `lab/kubernetes`) sharing `lab/common` ([kustomize.md](kustomize.md) §3.0) | no |
 
 ## 4. Known deviations from `AGENTS.md`
 
 | Spec statement | Reality | Resolution |
 |---|---|---|
 | "Dragonfly shall use AOF feature" | AOF is not implemented in Dragonfly | RabbitMQ audit stream now covers the full 7-day retention ([persistence-and-durability.md](persistence-and-durability.md) §4.4); hourly snapshot for restart speed |
-| "always find 2 replicas to receive writes" | no such server flag exists in Dragonfly | write-guard sidecar + Service routing + Sentinel quorum. [dragonfly.md](dragonfly.md) §3 |
+| "always find 2 replicas to receive writes" | no such server flag exists in Dragonfly | replica-count check inside `sentinel-bridge` + empty `Endpoints` + Sentinel quorum. [dragonfly.md](dragonfly.md) §3 |
 | "Redis Sentinels are needed for the workers, I think" | confirmed: needed, and also needed for the gateway and Service selector | [redis-sentinel.md](redis-sentinel.md) |
 | "Dragonfly operator is off the table" | honoured — everything is raw manifests plus a small bridge controller | this document |
 | "No data loss" | achievable only via the audit-stream design | §3.1 |

@@ -1,0 +1,27 @@
+# Frontend runtime config for the plain-Kubernetes flavour.
+#
+# With no Route, the browser reaches the gateway on <node-ip>:30300. Rather than
+# hard-coding a node address (wrong on someone else's machine, and stale after a
+# DHCP change), the frontend resolves the host from the page it was served from:
+#
+#   served from http://192.168.50.4:30800  ->  ws://192.168.50.4:30300
+#   served from http://localhost:30800     ->  ws://localhost:30300
+#
+# `resolveWsHostFromPage: true` means: ignore this wsUrl's host and substitute
+# `location.hostname`, keep the port. The frontend code must implement that
+# behaviour — it is one line and it is the only way to make a NodePort UI work
+# from more than one machine.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  labels:
+    app.kubernetes.io/name: frontend
+data:
+  config.json: |
+    {
+      "wsUrl": "ws://127.0.0.1:30300",
+      "apiUrl": "",
+      "backfillDefaultMinutes": 15,
+      "resolveWsHostFromPage": true
+    }

@@ -137,9 +137,10 @@ The guard cannot write to Dragonfly (that is the very component it is judging), 
 
 | Signal | Written by | Read by | Mechanism |
 |---|---|---|---|
-| `fire-watch.io/writable` label | write-guard sidecar (local pod only) | `sentinel-bridge` | pod patch, no Dragonfly dependency |
-| `fw_dragonfly_write_guard_tripped` | write-guard | Prometheus | sidecar `/metrics` |
-| Service endpoint removal | `sentinel-bridge` | all clients | reacts to the label |
+| `Endpoints/dragonfly` (zero addresses) | `sentinel-bridge` | workers, gateway | cluster state, no Dragonfly dependency |
+| `fire-watch.io/writable` label | `sentinel-bridge` | humans, alerts | pod patch |
+
+The bridge evaluates the guard itself: it already reads `ROLE` on every pod each cycle, and the replica count is right there in the reply. The separate per-pod `dragonfly-write-guard` sidecar was **removed** — it duplicated that polling, could only express a verdict as a label for someone else to interpret, and needed its own lab override. Fewer moving parts, same guarantee.
 
 Workers then rely on the **Service** rather than on a key:
 

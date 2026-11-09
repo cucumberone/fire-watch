@@ -126,6 +126,35 @@ With ten columns the drawer is horizontally tight, so:
   auto`, so `min-width: 100%` keeps them filling the pane until the columns exceed
   it
 
+#### A header that never scrolls away
+
+Both tables pin their header. The mechanism is **two stacked tables** — one for
+the header, one for the body — inside a flex column, where only the body is a
+scroll container.
+
+`position: sticky` on the `th` does not work here, for two independent reasons:
+
+1. A no-wrap table needs `overflow-x: auto` on its wrapper, and setting
+   `overflow-x` makes an element a scroll container in **both** axes. The sticky
+   header then sticks to that box, which never scrolls vertically, so the header
+   scrolled away with the rows exactly as before.
+2. Even with that resolved, sticky is bounded by its containing block: when the
+   table ends, the header goes with it.
+
+Splitting the tables makes the behaviour structural rather than dependent on
+scroll ancestry — the header cannot scroll because it is not inside a scroller.
+
+Both tables share one `<colgroup>` and are `table-layout: fixed`, so the columns
+line up. The body's horizontal scroll offset is mirrored onto the header, or a
+sideways scroll would shear the header off its columns.
+
+The height chain matters as much as the split: `#root` → `main` → `section` →
+`.tablewrap` are all flex columns with `min-height: 0`. Without the `section`
+rule the wrapper keeps its content height, `.tbody` has nothing to scroll, and the
+whole section overflows instead — which is what pushed the header out of view to
+begin with. Measured after the fix, with both bodies scrolled: the alert header
+stayed at y=150 and the live header at y=305.
+
 #### Time format
 
 Every timestamp is rendered as **`YYYY-MM-DD HH:MM:SS`, 24-hour, local time**

@@ -647,6 +647,59 @@ function RecordInspector({ state, onClose }) {
   );
 }
 
+/**
+ * A table whose header never scrolls out of view.
+ *
+ * Two stacked tables — one for the header, one for the body — inside a flex
+ * column. Only the body scrolls.
+ *
+ * Why not `position: sticky` on the `th`:
+ *
+ * 1. A horizontally scrollable wrapper needs `overflow-x: auto`, and that makes
+ *    the element a scroll container in BOTH axes. The sticky header then sticks
+ *    to that box, which never scrolls vertically, so the header scrolled away
+ *    with the rows anyway.
+ * 2. Even with that fixed, sticky is bounded by its containing block: when the
+ *    table ends, the header goes with it.
+ *
+ * Splitting the tables makes the behaviour structural: the header cannot scroll
+ * because it is not inside a scroller.
+ *
+ * Both tables must share one column geometry, so the same `<colgroup>` is passed
+ * to both, and both are `table-layout: fixed`. The horizontal scroll offset is
+ * mirrored from the body to the header, so a sideways scroll does not shear the
+ * header off its columns.
+ */
+function ScrollTable({ cols, head, rows, bodyClass }) {
+  const headRef = useRef(null);
+  const bodyRef = useRef(null);
+
+  const onBodyScroll = useCallback(() => {
+    if (headRef.current && bodyRef.current) {
+      headRef.current.scrollLeft = bodyRef.current.scrollLeft;
+    }
+  }, []);
+
+  return (
+    <div className="tablewrap">
+      <div className="thead" ref={headRef}>
+        <table>
+          <colgroup>{cols}</colgroup>
+          <thead>
+            <tr>{head}</tr>
+          </thead>
+        </table>
+      </div>
+      <div className={bodyClass ? `tbody ${bodyClass}` : 'tbody'} ref={bodyRef} onScroll={onBodyScroll}>
+        <table>
+          <colgroup>{cols}</colgroup>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function AlertRow({ alert, ack, onContextMenu }) {
   const acked = Boolean(ack);
   return (
@@ -833,59 +886,57 @@ function App() {
         {sortedAlerts.length === 0
           ? <p className="dim">No open alerts.</p>
           : (
-            <div className="tablewrap">
-              <table>
-                <colgroup>
+            <ScrollTable
+              cols={(
+                <>
                   {ALERT_COLS.map((c, i) => (
                     <col key={c} style={{ width: `${alertWidthOf(i)}px` }} />
                   ))}
                   {/* Spacer: absorbs leftover width so the table still fills the
                       pane, instead of stretching the real columns. */}
                   <col />
-                </colgroup>
-                <thead>
-                  <tr>
-                    {ALERT_COLS.map((label, i) => (
-                      <ResizableTh
-                        key={label}
-                        index={i}
-                        width={alertWidthOf(i)}
-                        onBegin={beginAlertResize}
-                      >
-                        {label}
-                      </ResizableTh>
-                    ))}
-                    {/* Spacer header, aligned with the spacer col. */}
-                    <th />
-                  </tr>
-                </thead>
-              <tbody>
-                {sortedAlerts.map((a) => {
-                  const ack = acks.get(a.key);
-                  return (
-                    <AlertRow
-                      key={a.key}
-                      alert={a}
-                      ack={ack}
-                      onContextMenu={(e) => openInspector(
-                        e,
-                        a.event?.wire ?? a.event ?? a,
-                        a.key,
-                        [{
-                          label: ack ? `Acked by ${ack.by}` : 'Acknowledge',
-                          disabled: Boolean(ack),
-                          title: ack
-                            ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
-                            : 'Claim this alert; it clears when the alert re-fires',
-                          run: () => acknowledge(a.key),
-                        }],
-                      )}
-                    />
-                  );
-                })}
-              </tbody>
-              </table>
-            </div>
+                </>
+              )}
+              head={(
+                <>
+                  {ALERT_COLS.map((label, i) => (
+                    <ResizableTh
+                      key={label}
+                      index={i}
+                      width={alertWidthOf(i)}
+                      onBegin={beginAlertResize}
+                    >
+                      {label}
+                    </ResizableTh>
+                  ))}
+                  {/* Spacer header, aligned with the spacer col. */}
+                  <th />
+                </>
+              )}
+              rows={sortedAlerts.map((a) => {
+                const ack = acks.get(a.key);
+                return (
+                  <AlertRow
+                    key={a.key}
+                    alert={a}
+                    ack={ack}
+                    onContextMenu={(e) => openInspector(
+                      e,
+                      a.event?.wire ?? a.event ?? a,
+                      a.key,
+                      [{
+                        label: ack ? `Acked by ${ack.by}` : 'Acknowledge',
+                        disabled: Boolean(ack),
+                        title: ack
+                          ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
+                          : 'Claim this alert; it clears when the alert re-fires',
+                        run: () => acknowledge(a.key),
+                      }],
+                    )}
+                  />
+                );
+              })}
+            />
           )}
       </section>
       </main>
@@ -921,9 +972,9 @@ function App() {
           {shownEvents.length === 0
             ? <p className="dim">Nothing yet.</p>
             : (
-              <div className="tablewrap">
-                <table>
-                  <colgroup>
+              <ScrollTable
+                cols={(
+                  <>
                     {EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${eventWidthOf(i)}px` }} />
                     ))}
@@ -932,55 +983,53 @@ function App() {
                     ))}
                     {/* Spacer, same reasoning as the alert table. */}
                     <col />
-                  </colgroup>
-                  <thead>
-                    <tr>
-                      {EVENT_COLS.map((label, i) => (
-                        <ResizableTh
-                          key={label}
-                          index={i}
-                          width={eventWidthOf(i)}
-                          onBegin={beginEventResize}
-                        >
-                          {label}
-                        </ResizableTh>
-                      ))}
-                      {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
-                      {/* Spacer header, aligned with the spacer col. */}
-                      <th />
-                    </tr>
-                  </thead>
-                <tbody>
-                  {[...shownEvents].reverse().map((e) => {
-                    // An event row can also start an ack: the alert it belongs
-                    // to is `source:type`, and the operator is looking right at
-                    // it. Acking from here and from the alert table are the
-                    // same action on the same key.
-                    const ackKey = `${e.source}:${e.type}`;
-                    const ack = acks.get(ackKey);
-                    return (
-                      <EventRow
-                        key={e.id}
-                        evt={e}
-                        onContextMenu={(ev) => openInspector(
-                          ev,
-                          e.wire ?? e,
-                          `${e.source} · ${e.type}`,
-                          [{
-                            label: ack ? `Acked by ${ack.by}` : 'Acknowledge alert',
-                            disabled: Boolean(ack),
-                            title: ack
-                              ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
-                              : `Acknowledge ${ackKey}`,
-                            run: () => acknowledge(ackKey),
-                          }],
-                        )}
-                      />
-                    );
-                  })}
-                </tbody>
-                </table>
-              </div>
+                  </>
+                )}
+                head={(
+                  <>
+                    {EVENT_COLS.map((label, i) => (
+                      <ResizableTh
+                        key={label}
+                        index={i}
+                        width={eventWidthOf(i)}
+                        onBegin={beginEventResize}
+                      >
+                        {label}
+                      </ResizableTh>
+                    ))}
+                    {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                    {/* Spacer header, aligned with the spacer col. */}
+                    <th />
+                  </>
+                )}
+                rows={[...shownEvents].reverse().map((e) => {
+                  // An event row can also start an ack: the alert it belongs to
+                  // is `source:type`, and the operator is looking right at it.
+                  // Acking from here and from the alert table are the same
+                  // action on the same key.
+                  const ackKey = `${e.source}:${e.type}`;
+                  const ack = acks.get(ackKey);
+                  return (
+                    <EventRow
+                      key={e.id}
+                      evt={e}
+                      onContextMenu={(ev) => openInspector(
+                        ev,
+                        e.wire ?? e,
+                        `${e.source} · ${e.type}`,
+                        [{
+                          label: ack ? `Acked by ${ack.by}` : 'Acknowledge alert',
+                          disabled: Boolean(ack),
+                          title: ack
+                            ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
+                            : `Acknowledge ${ackKey}`,
+                          run: () => acknowledge(ackKey),
+                        }],
+                      )}
+                    />
+                  );
+                })}
+              />
             )}
         </div>
       </section>

@@ -133,11 +133,42 @@ td { padding:.4rem .5rem; border-bottom:1px solid var(--line); vertical-align:to
    corrupts the value. */
 th { white-space:normal; }
 
-/* Horizontal scrolling for a table whose columns are wider than the viewport.
-   min-width:100% keeps the table filling the pane when the columns are narrow,
-   and the overflow only appears once they are not. */
-.tablewrap { overflow-x:auto; max-width:100%; }
-.tablewrap > table { table-layout:fixed; min-width:100%; }
+/* A table whose header stays put while its BODY scrolls.
+
+   This is deliberately NOT position:sticky on the th.
+
+   Sticky failed here, twice over:
+   1. .tablewrap needs overflow-x:auto so a no-wrap table can scroll sideways,
+      and an element with overflow-x set becomes a scroll container in BOTH
+      axes. The sticky header then sticks to that box, which never scrolls
+      vertically, so it travelled with the content anyway.
+   2. Even with that fixed, sticky is bounded by its containing block: the
+      table ends and the header goes with it.
+
+   Splitting header and body into two stacked flex children makes the behaviour
+   structural instead of dependent on scroll ancestry: the header is a normal
+   block that never scrolls, and only .tbody is a scroll container. */
+.tablewrap { display:flex; flex-direction:column; min-height:0; flex:1 1 auto;
+             overflow:hidden; }
+.thead { overflow:hidden; flex:0 0 auto; }
+.tbody { overflow:auto; min-height:0; flex:1 1 auto; scrollbar-gutter:stable; }
+
+/* The chain that gives .tbody a bounded height: main is a flex column, each
+   section is a flex column that can shrink, and .tablewrap takes what is left.
+   Without the section rules the table wrapper kept its natural (content) height,
+   so .tbody had nothing to scroll and the whole section overflowed instead —
+   which is what pushed the header out of view before. */
+main > section { display:flex; flex-direction:column; min-height:0; flex:0 1 auto; }
+main > section:first-of-type { flex:1 1 auto; }
+/* Both tables are table-layout:fixed with the same colgroup, so the header and
+   body columns line up exactly. */
+.tablewrap > div > table { table-layout:fixed; min-width:100%; border-collapse:separate;
+                     border-spacing:0; }
+/* The header row must not scroll horizontally with the body, so the header and
+   body are separate scrollers sharing one horizontal offset — see the
+   scroll-sync note below. */
+.tablewrap thead { position:static; }
+.tablewrap thead th { position:static; }
 
 /* Column resize handle. A real element, not a pseudo-element, because it needs
    its own hit area and cursor. Sits over the right edge of the header cell so
@@ -224,12 +255,8 @@ html, body, #root { height:100%; }
 #root { display:flex; flex-direction:column; align-items:stretch; overflow:hidden; }
 /* width:100% because a flex item in a column does not stretch horizontally on
    its own once max-width stops capping it; it shrink-to-fits its content. */
-main { flex:1 1 auto; width:100%; min-height:0; overflow-y:auto;
-       /* main scrolls and the drawer body may not, so without a reserved gutter
-          the two tables end up 12px apart — main's content box is narrower by
-          exactly one scrollbar. Reserving it on both keeps the columns aligned
-          whether or not a scrollbar is currently shown. */
-       scrollbar-gutter: stable;
+main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
+       display:flex; flex-direction:column;
        /* Inset shadow, so it is painted against the scroll container's edge and
           does NOT scroll with the content. It marks the bottom edge as a
           scroll boundary, so a partially visible row reads as "more below"
@@ -251,7 +278,8 @@ main { flex:1 1 auto; width:100%; min-height:0; overflow-y:auto;
 .drawer-handle:hover { background:var(--pre-bg); }
 .drawer-handle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
 .drawer-chevron { font-size:.7rem; color:var(--dim); width:.75rem; }
-.drawer-body { max-height:38vh; overflow:auto; padding:0 1.5rem 1rem;
+.drawer-body { max-height:38vh; overflow:hidden; padding:0 1.5rem 0;
+               display:flex; flex-direction:column; min-height:0;
                /* Matches main's gutter so both tables line up exactly. */
                scrollbar-gutter: stable; }
 /* Keep the sticky header from floating over the drawer edge. */

@@ -73,16 +73,21 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   await dfl.write((c) => c.zadd(keys.index(evt.source), brokerTs, evt.id));
 
   // ------------------------------------------------------------ 3. alert fold
+  // The fold also maintains the open-alert index (KEYS[3]) so the index cannot
+  // drift from the state it indexes; see the comment block in alert-fold.lua.
+  // ARGV[5] is the bare alert key, which is what the index stores.
   const applied = await dfl.write((c) =>
     c.eval(
       fold.get(),
-      2,
+      3,
       keys.alert(key),
       keys.alertOpen(key),
+      keys.alertOpenIndex,
       String(brokerTs),
       evt.id,
       evt.severity,
       String(cfg.alertDedupWindow),
+      key,
     ),
   );
 

@@ -6,10 +6,21 @@
 #
 # KEYS[1] = fw:alert:{key}
 # KEYS[2] = fw:alert:open:{key}
+# KEYS[3] = fw:idx:alert:open   (zset: alert key -> last activity ms)
+#
+# KEYS[3] is what makes the board survive a page reload. Without it there is no
+# way to enumerate open alerts except SCAN fw:alert:open:*, which is an
+# unbounded scan and was rejected by design (websocket-server.md §3). It lives
+# inside this script so the index can never drift from the state it indexes:
+# both the close path and the open path are already atomic here, and a crash
+# between an HSET and a separate ZADD would otherwise leave a phantom row on
+# every operator's screen forever.
+#
 # ARGV[1] = broker_ts_ms
 # ARGV[2] = event id
 # ARGV[3] = severity
 # ARGV[4] = dedup window in ms
+# ARGV[5] = alert key (source:type), used as the index member
 #
 # Returns: 0 stale | 1 new occurrence | 2 coalesced | 3 closed
 apiVersion: v1
@@ -20,6 +31,19 @@ metadata:
     app.kubernetes.io/name: worker
 data:
   alert-fold.lua: |
+    -- Degrade gracefully if the open index is missing.
+    --
+    -- The worker and this ConfigMap are separate objects and do not roll out in
+    -- lockstep: a worker pod running newer code can invoke an older script (the
+    -- ConfigMap volume lags) or a cached script can outlive a revert. Reading
+    -- KEYS[3] unconditionally would turn every event into a runtime error in
+    -- exactly that window, and the worker would requeue forever.
+    --
+    -- So the index is maintained only when the caller supplied it. The index can
+    -- therefore be temporarily incomplete during a rolling update, which is a
+    -- far better failure than "no events are accepted at all".
+    local has_index = (KEYS[3] ~= nil) and (ARGV[5] ~= nil)
+
     local wm_ts  = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
     local wm_id  = redis.call('HGET', KEYS[1], 'watermark_id') or ''
     local ts     = tonumber(ARGV[1])
@@ -45,6 +69,11 @@ data:
     --    ack feature (docs/acknowledge.md §6).
     if sev == 'CLOSE' or sev == 'HARMLESS' then
       redis.call('DEL', KEYS[2])
+      -- Retirement must also drop the key from the open index, or the board
+      -- would hand a stale row to every client that connects afterwards.
+      if has_index then
+        redis.call('ZREM', KEYS[3], ARGV[5])
+      end
       redis.call('HSET', KEYS[1],
         'state', 'closed',
         'severity', sev,
@@ -70,6 +99,11 @@ data:
     end                                              -- else coalesced
 
     redis.call('SET', KEYS[2], '1', 'EX', 604800)
+    -- Keep the open index in step. The score is the last activity, so a bounded
+    -- ZREVRANGE always returns the most recently active alerts first.
+    if has_index then
+      redis.call('ZADD', KEYS[3], ts, ARGV[5])
+    end
     redis.call('HSET', KEYS[1],
       'state', 'open',
       'severity', sev,

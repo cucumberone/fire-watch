@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   matchesSubscription,
+  matchesAlertSubscription,
   validateSubscribe,
   RecentIds,
   backfillPlan,
@@ -19,6 +20,39 @@ const limits = { maxSubscriptions: 20, existing: 0 };
 test('empty filters match everything', () => {
   const sub = { sources: [], types: [] };
   assert.equal(matchesSubscription(sub, { source: 'a', type: 't' }), true);
+});
+
+// ------------------------------------------------- alert-key matching (snapshot)
+// Snapshot rows arrive as bare `source:type` keys, not events, so they cannot be
+// matched by matchesSubscription. Getting this wrong silently hides every open
+// alert from a filtered client, which looks identical to "nothing is firing".
+test('an unfiltered subscription matches every alert key', () => {
+  const sub = { sources: [], types: [] };
+  assert.equal(matchesAlertSubscription(sub, 'shop:check-001'), true);
+});
+
+test('alert-key matching splits on the FIRST colon only', () => {
+  // A type may contain colons; a source may not. Splitting on the last colon
+  // would mangle `net:if:eth0` into type `eth0`.
+  const sub = { sources: ['net'], types: [] };
+  assert.equal(matchesAlertSubscription(sub, 'net:if:eth0'), true);
+
+  const typed = { sources: [], types: ['if:eth0'] };
+  assert.equal(matchesAlertSubscription(typed, 'net:if:eth0'), true);
+});
+
+test('alert-key matching filters by source and by type', () => {
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, 'shop:a'), true);
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, 'db:a'), false);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, 'shop:a'), true);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, 'shop:b'), false);
+});
+
+test('alert-key matching ANDs source and type', () => {
+  const sub = { sources: ['shop'], types: ['a'] };
+  assert.equal(matchesAlertSubscription(sub, 'shop:a'), true);
+  assert.equal(matchesAlertSubscription(sub, 'shop:b'), false);
+  assert.equal(matchesAlertSubscription(sub, 'db:a'), false);
 });
 
 test('source filter matches only that source', () => {

@@ -199,6 +199,49 @@ function useSocket(config) {
       });
       return;
     }
+    if (frame.op === 'snapshot') {
+      // The state of the world as of connect. Without this the board is empty on
+      // load until something new fires, because events only create rows as they
+      // arrive — a reload would look like a dead cluster.
+      //
+      // A snapshot REPLACES the alert map rather than merging into it: it is the
+      // full open set, so a row it omits is genuinely closed. Merging would
+      // resurrect rows retired while the socket was down.
+      if (!Array.isArray(frame.alerts)) return;
+      const next = new Map();
+      for (const row of frame.alerts) {
+        if (!row || typeof row.key !== 'string') continue;
+        const evt = row.event ? toViewEvent(row.event) : null;
+        next.set(row.key, {
+          key: row.key,
+          severity: row.severity,
+          firstSeen: row.firstSeen,
+          lastSeen: row.lastSeen,
+          count: row.count,
+          event: evt ?? undefined,
+        });
+      }
+      setAlerts(next);
+
+      // Ack state rides along, so a reload does not lose "acked by alice".
+      const acked = new Map();
+      for (const row of frame.alerts) {
+        if (row?.key && row.ackedBy) {
+          acked.set(row.key, { by: row.ackedBy, at: row.ackedAt });
+        }
+      }
+      setAcks(acked);
+
+      // The snapshot carries the newest record per alert; seed the live tail with
+      // them too so the drawer is not empty before the first live event.
+      const seeded = frame.alerts
+        .map((r) => (r?.event ? toViewEvent(r.event) : null))
+        .filter(Boolean);
+      if (seeded.length > 0) {
+        setEvents((prev) => seeded.reduce((acc, e) => insertEvent(acc, e, EVENT_LIMIT), prev));
+      }
+      return;
+    }
     if (frame.op === 'hello') {
       if (frame.truncated) setNotice('Backfill was truncated — narrow the time window.');
       return;

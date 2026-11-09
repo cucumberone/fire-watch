@@ -33,6 +33,9 @@ export function loadConfig() {
 
     dedupeLru: int('FW_DEDUPE_LRU', 10000),
     backfillMax: int('FW_BACKFILL_MAX', 2000),
+    // Cap on the open-alert snapshot sent on connect. Bounded for the same reason
+    // backfill is: one client must not be able to make a pod do unbounded work.
+    alertSnapshotMax: int('FW_ALERT_SNAPSHOT_MAX', 2000),
     maxConns: int('FW_MAX_CONNS', 5000),
     msgMaxBytes: int('FW_MSG_MAX_BYTES', 1048576),
 

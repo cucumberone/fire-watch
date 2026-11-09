@@ -134,6 +134,61 @@ export class DragonflyReader {
     return out;
   }
 
+  /**
+   * Read the currently-open alerts, most recently active first.
+   *
+   * This is the snapshot a client needs on connect. A browser that reloads has no
+   * memory of what is already firing, and replaying history returns EVENTS only —
+   * the event stream cannot reconstruct which alerts are still open, because "an
+   * event was stored" and "this alert is still firing" are different facts.
+   * Without this the board is empty on every load until something new fires,
+   * which looks exactly like a broken deployment.
+   *
+   * The index is maintained inside alert-fold.lua, so it never disagrees with
+   * `fw:alert:open:*`. Reading it is bounded by `limit`, unlike
+   * `SCAN fw:alert:open:*`.
+   */
+  async readOpenAlerts(limit) {
+    const c = await this.connect();
+    const keys = await c.zrevrange('fw:idx:alert:open', 0, Math.max(0, limit - 1));
+    if (keys.length === 0) return [];
+
+    const hashes = await Promise.all(keys.map((k) => c.hgetall(`fw:alert:${k}`)));
+    const out = [];
+    keys.forEach((key, i) => {
+      const h = hashes[i];
+      if (!h || Object.keys(h).length === 0) return;
+      // Ignore anything the index is stale about. The fold removes retired
+      // alerts, so this only guards against a writer running older code.
+      if (h.state && h.state !== 'open') return;
+      out.push({
+        key,
+        severity: h.severity || 'WARNING',
+        firstSeen: Number(h.first_seen || 0),
+        lastSeen: Number(h.last_seen || 0),
+        count: Number(h.count || 0),
+        lastId: h.last_id || null,
+        ackedBy: h.acked_by || null,
+        ackedAt: h.acked_at ? Number(h.acked_at) : null,
+      });
+    });
+    return out;
+  }
+
+  /** Read a single stored event by id, so a snapshot can include its Summary. */
+  async readEvent(id) {
+    if (!id) return null;
+    const c = await this.connect();
+    const raw = await c.get(`fw:evt:${id}`);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      this.log.warn('unparseable stored event', { id, err: String(err) });
+      return null;
+    }
+  }
+
   async ping() {
     try {
       const c = await this.connect();

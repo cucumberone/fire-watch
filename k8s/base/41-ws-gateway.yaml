@@ -59,6 +59,8 @@ spec:
             - { name: FW_CHANNEL_ALERTS,  value: fw:ch:alerts }
             - { name: FW_DEDUPE_LRU,      value: "10000" }
             - { name: FW_BACKFILL_MAX,    value: "2000" }
+            # Cap on the open-alert snapshot sent on connect (websocket-server.md §3.1).
+            - { name: FW_ALERT_SNAPSHOT_MAX, value: "2000" }
             - { name: FW_MAX_CONNS,       value: "5000" }
             - { name: FW_MSG_MAX_BYTES,   value: "1048576" }
           resources:

@@ -47,7 +47,8 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 | De-duplication (occurrence) | render `count` from `op: alert` frames; never increment it per received event — the worker coalesces ([event-lifecycle.md](event-lifecycle.md) §5.4) |
 | Ordering | sort by broker timestamp, not arrival order and not producer `ts` — cross-worker delivery can invert ([event-lifecycle.md](event-lifecycle.md) §2) |
 | `applied` code | **must** be honoured: `0` stale / `1` new occurrence / `2` coalesced / `3` closed. Treating `2` as new causes entry churn; treating `0` as a close causes flicker ([event-lifecycle.md](event-lifecycle.md) §9) |
-| Alert state | render from `op: alert` frames and `fw:alert:*` on reconnect; never derive "is it open" or the count from the event list |
+| Alert state | render from `op: alert` frames and, on connect, from the `op: snapshot` frame; never derive "is it open" or the count from the event list ([websocket-server.md](websocket-server.md) §3.1) |
+| Initial load | `op: snapshot` **replaces** the alert map, it is not merged: it is the complete open set, so an omitted row is genuinely closed. Merging would resurrect rows retired while the socket was down |
 | `msgc` decoding | field may be gzip + base64. Decode with the native `DecompressionStream`; on failure render `[undecodable payload]` and keep the rest of the alert usable ([payload-and-compression.md](payload-and-compression.md) §5) |
 | `msg` decoding | always plain — leave it alone (it is below the compression threshold by design) |
 | Field naming | the wire says `msg` / `msgc`; the UI says **Summary** / **MsgCompleteString**. Renamed once, at the ingest boundary, by `toViewEvent()` in `src/lib.js` (§4.1) |

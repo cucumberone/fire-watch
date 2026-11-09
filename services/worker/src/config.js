@@ -63,6 +63,12 @@ export const keys = {
   index: (source) => `fw:idx:src:${source}`,
   alert: (key) => `fw:alert:${key}`,
   alertOpen: (key) => `fw:alert:open:${key}`,
+  // Index of OPEN alerts, so a client that connects later can be told what is
+  // already firing. Without it the only way to enumerate open alerts is
+  // `SCAN fw:alert:open:*`, which is an unbounded scan on the hot keyspace and
+  // was explicitly rejected (docs/websocket-server.md §3). Scores are the last
+  // activity timestamp, so a bounded read is "newest N open alerts".
+  alertOpenIndex: 'fw:idx:alert:open',
   channelEvents: 'fw:ch:events',
   channelAlerts: 'fw:ch:alerts',
 };

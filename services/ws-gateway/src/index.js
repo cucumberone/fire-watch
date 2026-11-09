@@ -18,6 +18,7 @@ import { createLogger } from './log.js';
 import { DragonflyReader } from './dragonfly.js';
 import {
   matchesSubscription,
+  matchesAlertSubscription,
   validateSubscribe,
   RecentIds,
   backfillPlan,
@@ -160,6 +161,35 @@ wss.on('connection', (ws, req) => {
 
     conn.subscriptions.push(verdict.sub);
     log.debug('subscription added', { subs: conn.subscriptions.length });
+
+    // ---- snapshot of open alerts
+    // Sent BEFORE the backfill so the board has its rows immediately, and sent
+    // for every subscribe regardless of `since` or `sources`: "what is firing
+    // right now" is not a time-windowed question. A client that connects to a
+    // quiet cluster would otherwise show an empty board forever, because the
+    // event replay only produces rows as new events arrive.
+    let snapshot = 0;
+    try {
+      const open = await reader.readOpenAlerts(cfg.alertSnapshotMax);
+      const alerts = [];
+      for (const a of open) {
+        // Only the alerts the client asked about. An unfiltered subscribe means
+        // "everything", which is the common case.
+        if (!matchesAlertSubscription(verdict.sub, a.key)) continue;
+        // Attach the last event so the row has a Summary and the inspector has a
+        // full record. Best-effort: a missing record must not drop the row.
+        const evt = await reader.readEvent(a.lastId);
+        alerts.push({ ...a, event: evt });
+      }
+      if (alerts.length > 0) {
+        send(JSON.stringify({ op: 'snapshot', alerts }));
+        snapshot = alerts.length;
+      }
+    } catch (err) {
+      // A snapshot failure must not break the live stream: the client still gets
+      // live frames, it simply opens with an empty board.
+      log.warn('alert snapshot failed', { err: String(err) });
+    }
 
     // ---- backfill, bounded
     const plan = backfillPlan(verdict.sub, Date.now(), cfg.backfillMax);

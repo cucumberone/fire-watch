@@ -44,6 +44,7 @@ Server → client:
 
 ```json
 { "op": "event", "event": { "id": "...", "source": "sensor-a", "type": "telemetry.temperature", "severity": "CRITICAL", "ts": "...", "payload": {} }, "applied": 1 }
+{ "op": "snapshot", "alerts": [ { "key": "sensor-a:telemetry.temperature", "severity": "CRITICAL", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3, "lastId": "abc", "ackedBy": null, "ackedAt": null, "event": { } } ] }
 { "op": "alert", "key": "sensor-a:telemetry.temperature", "state": "open", "severity": "CRITICAL", "first_seen": 1762699200000, "last_seen": 1762699260000, "count": 3 }
 { "op": "alert", "key": "sensor-a:telemetry.temperature", "state": "closed", "closed_at": 1762699900000 }
 { "op": "hello", "server": "ws-gateway-5f7c", "backfill": 42 }
@@ -59,6 +60,46 @@ Rules:
 - Raw events are still delivered on `op: event` for the event log. The UI must not compute alert state from them.
 - Backfill is capped (`FW_BACKFILL_MAX`, default 2000 records); when exceeded, reply with `"truncated": true` and let the client narrow its window.
 - Heartbeat: server sends `{"op":"ping"}` every 20s; the client must reply `{"op":"pong"}` within 10s or the socket is closed. Required because an OpenShift router will not report a half-open TCP connection.
+
+### 3.1 `op: snapshot` — why replaying events is not enough
+
+The first version of this protocol had no snapshot, and the board was **empty on
+every page load** while the cluster held 200 open alerts. That is not a frontend
+bug; it is a missing read path:
+
+- Backfill replays **events**. Events only become alert rows as they arrive, so on
+  a quiet cluster nothing arrives and nothing renders.
+- The event stream cannot reconstruct open state anyway: "an event was stored" and
+  "this alert is still firing" are different observations, and a client that
+  connects between two events has no way to learn about the other 199 alerts.
+
+So on every `subscribe` the gateway sends `op: snapshot` **before** `hello`,
+carrying every open alert the subscription matches, most recently active first,
+each with its newest event attached so the row has a Summary and the inspector has
+a full record.
+
+Two consequences worth stating:
+
+- The snapshot is **unconditional** — it ignores `since`. "What is open right now"
+  is not a time-windowed question, and gating it on `since` would have reproduced
+  the empty board for any client that sends a recent timestamp.
+- The client **replaces** its alert map with the snapshot rather than merging.
+  The snapshot is the complete open set, so a row it omits is genuinely closed;
+  merging would resurrect rows retired while the socket was down.
+
+**`fw:idx:alert:open`.** Enumerating open alerts needs an index, and
+`SCAN fw:alert:open:*` is precisely the unbounded scan §3 forbids. The index is a
+zset (member = alert key, score = last activity) maintained **inside
+`alert-fold.lua`**, not from application code. That placement is the point: the
+close path and the open path are already atomic there, so the index can never
+drift from `fw:alert:open:*`. A separate `ZADD` after the `EVAL` would leave a
+phantom row on every operator's board whenever a worker died between the two
+calls — and a phantom alert that nobody can clear is worse than a missing one.
+
+The read is bounded by `FW_ALERT_SNAPSHOT_MAX` (default 2000), and the fold script
+guards both index writes behind `if has_index`, so a worker running newer code
+against an older cached script (or the reverse, during a rolling update) degrades
+to "no index" instead of failing every event.
 
 ## 4. Resource guardrails per connection
 

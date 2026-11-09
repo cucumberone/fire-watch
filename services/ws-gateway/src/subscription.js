@@ -21,6 +21,29 @@ export function matchesSubscription(sub, evt) {
 }
 
 /**
+ * Match a bare alert key (`source:type`) against a subscription.
+ *
+ * Snapshots arrive as alert rows rather than events, so they have no `source` or
+ * `type` fields to compare — the key has to be split. The split is on the FIRST
+ * `:` only, because a type may legitimately contain colons while a source may
+ * not (alertKey builds the string as `${source}:${type}`).
+ */
+export function matchesAlertSubscription(sub, alertKey) {
+  const sources = sub.sources || [];
+  const types = sub.types || [];
+  if (sources.length === 0 && types.length === 0) return true;
+
+  const s = String(alertKey);
+  const i = s.indexOf(':');
+  const source = i === -1 ? s : s.slice(0, i);
+  const type = i === -1 ? '' : s.slice(i + 1);
+
+  const sourceOk = sources.length === 0 || sources.includes(source);
+  const typeOk = types.length === 0 || types.includes(type);
+  return sourceOk && typeOk;
+}
+
+/**
  * Validate a subscribe frame. Returns { ok: true, sub } or { ok: false, code, message }.
  *
  * Rejects anything that would let a client make the pod do unbounded work.

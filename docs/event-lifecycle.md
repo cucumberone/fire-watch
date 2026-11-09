@@ -102,6 +102,7 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 |---|---|---|---|
 | `fw:alert:{key}` | hash | current state + occurrence rollup + watermark | 7d (rolling) |
 | `fw:alert:open:{key}` | string | `"1"` while an alert is open | 7d |
+| `fw:idx:alert:open` | zset | member = alert key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN fw:alert:open:*` ([websocket-server.md](websocket-server.md) §3.1) | none (entries removed by the fold on retirement) |
 
 `fw:alert:{key}` fields:
 
@@ -125,7 +126,14 @@ Three workers can process different events for the same key concurrently, so the
 
 ```lua
 -- KEYS[1] = fw:alert:{key}          KEYS[2] = fw:alert:open:{key}
+-- KEYS[3] = fw:idx:alert:open      (optional: the open-alert index)
 -- ARGV[1] = broker_ts_ms  ARGV[2] = event id  ARGV[3] = severity  ARGV[4] = dedup window ms
+-- ARGV[5] = bare alert key, the index member
+--
+-- KEYS[3]/ARGV[5] are optional on purpose: the worker and this ConfigMap are
+-- separate objects and do not roll out in lockstep, so a newer script must still
+-- work when invoked with the old 2-key form.
+local has_index = (KEYS[3] ~= nil) and (ARGV[5] ~= nil)
 local wm_ts  = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
 local wm_id  = redis.call('HGET', KEYS[1], 'watermark_id') or ''
 local ts     = tonumber(ARGV[1])

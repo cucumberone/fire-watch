@@ -96,10 +96,27 @@ h1 { font-size:1.25rem; margin:0; }
 h2 { font-size:1rem; margin:2rem 0 .5rem; font-weight:600; }
 header { display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
          border-bottom:1px solid var(--line); padding-bottom:.75rem; }
-.controls { margin-left:auto; display:flex; gap:1rem; align-items:center; font-size:.8rem; }
-.switch { display:inline-flex; gap:.35rem; align-items:center; cursor:pointer;
-          user-select:none; color:var(--dim); }
-.switch input { accent-color: var(--accent); margin:0; cursor:pointer; }
+.controls { margin-left:auto; display:flex; gap:.6rem; align-items:center; font-size:.8rem; }
+/* Icon toggles. A real <button> with aria-pressed, not a styled checkbox:
+   the native control cannot be dressed up without faking its box, and a fake
+   box would lose the keyboard and screen-reader behaviour it had. */
+.togglegroup { display:inline-flex; gap:.25rem; padding:.15rem;
+               border:1px solid var(--line); border-radius:999px; }
+.iconbtn { display:inline-flex; align-items:center; justify-content:center;
+           width:1.9rem; height:1.9rem; padding:0; border:0; border-radius:999px;
+           background:transparent; color:var(--dim); cursor:pointer;
+           transition: background .15s ease, color .15s ease, opacity .15s ease; }
+.iconbtn:hover { background:var(--pre-bg); color:var(--fg); }
+.iconbtn:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+/* aria-pressed is the source of truth for the visual on-state, so the two can
+   never disagree. Each toggle gets its own hue: two identical blue pills gave
+   no clue which control was which at a glance, only that both were on. */
+.iconbtn { opacity:.75; }
+.iconbtn:hover { opacity:1; }
+.iconbtn[aria-pressed="true"] { opacity:1; background:var(--accent); color:#fff; }
+.iconbtn-theme[aria-pressed="true"] { background:var(--accent); }
+.iconbtn-rows[aria-pressed="true"] { background:var(--sev-warning-bg); color:var(--sev-warning-fg); }
+.icon { width:1.05rem; height:1.05rem; display:block; }
 table { width:100%; border-collapse:collapse; font-size:.85rem; }
 th { text-align:left; font-weight:600; color:var(--dim); border-bottom:1px solid var(--line);
      padding:.4rem .5rem; position:sticky; top:0; z-index:2; background:var(--bg); }

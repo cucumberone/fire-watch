@@ -324,6 +324,50 @@ function Badge({ severity }) {
   return <span className={`sev sev-${severity.toLowerCase()}`}>{severity}</span>;
 }
 
+// ---------------------------------------------------------------------- icons
+// Inline SVG rather than an icon font or emoji: no extra request, no font
+// loading flash, inherits currentColor so the theme handles it, and an emoji
+// would render in the OS emoji font on one platform and as tofu on another.
+const ICON_PROPS = {
+  viewBox: '0 0 24 24',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.8,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+  'aria-hidden': 'true',
+  focusable: 'false',
+};
+
+function IconSun() {
+  return (
+    <svg {...ICON_PROPS} className="icon">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+    </svg>
+  );
+}
+
+function IconMoon() {
+  return (
+    <svg {...ICON_PROPS} className="icon">
+      {/* Filled crescent: reads as "dark" at 18px, where an outline does not. */}
+      <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.8 6.8 0 0 0 9.8 9.8z" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function IconPalette() {
+  return (
+    <svg {...ICON_PROPS} className="icon">
+      <path d="M12 3a9 9 0 1 0 0 18c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8H16a5 5 0 0 0 5-5c0-3.9-4-7-9-7z" />
+      <circle cx="7.5" cy="11" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="10" cy="7.2" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="14.6" cy="7.6" r="1.1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 // --------------------------------------------------------------- inspector
 /**
  * Right-click menu for a record: the actions available on that row, then every
@@ -403,8 +447,9 @@ function AlertRow({ alert, ack, onContextMenu }) {
       onContextMenu={onContextMenu}
     >
       <td><Badge severity={alert.severity} /></td>
-      <td className="mono">{alert.key}</td>
-      {/* Order follows the live table: severity, first, last, count, summary */}
+      {/* Order follows the live table: severity, first, last, count, summary.
+          Key is last: it is a stable identifier, read once when you need it,
+          not scanned down the column on every glance. */}
       <td className="mono">{formatClock(alert.firstSeen)}</td>
       <td className="mono">{formatClock(alert.lastSeen)}</td>
       <td className="num">{alert.count}</td>
@@ -414,6 +459,7 @@ function AlertRow({ alert, ack, onContextMenu }) {
           ? <span className="acked-tag" title={`${ack.by} at ${formatClock(ack.at)}`}>acked · {ack.by}</span>
           : <span className="dim">—</span>}
       </td>
+      <td className="mono nowrap">{alert.key}</td>
     </tr>
   );
 }
@@ -522,22 +568,26 @@ function App() {
               auto
             </button>
           )}
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={darkMode}
-              onChange={() => setTheme(darkMode ? 'light' : 'dark')}
-            />
-            <span>Dark</span>
-          </label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={rowColor}
-              onChange={(e) => setRowColor(e.target.checked)}
-            />
-            <span>Colour rows</span>
-          </label>
+          <div className="togglegroup">
+            <button
+              className="iconbtn iconbtn-theme"
+              onClick={() => setTheme(darkMode ? 'light' : 'dark')}
+              aria-pressed={darkMode}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {darkMode ? <IconSun /> : <IconMoon />}
+            </button>
+            <button
+              className="iconbtn iconbtn-rows"
+              onClick={() => setRowColor(!rowColor)}
+              aria-pressed={rowColor}
+              aria-label={rowColor ? 'Turn off severity row colours' : 'Turn on severity row colours'}
+              title={rowColor ? 'Severity row colours: on' : 'Severity row colours: off'}
+            >
+              <IconPalette />
+            </button>
+          </div>
         </div>
       </header>
 
@@ -551,12 +601,12 @@ function App() {
               <thead>
                 <tr>
                   <th>Severity</th>
-                  <th>Key</th>
                   <th>First occurrence</th>
                   <th>Last occurrence</th>
                   <th>Count</th>
                   <th>Summary</th>
                   <th>Ack</th>
+                  <th>Key</th>
                 </tr>
               </thead>
               <tbody>

@@ -103,11 +103,14 @@ Both tables lead with identity and status, then time, then volume, then the huma
 | Open alerts | Live events |
 |---|---|
 | Severity | Severity |
-| Key | First occurrence |
-| First occurrence | Last occurrence |
-| Last occurrence | Count |
-| Count | Summary |
-| Summary | CIF, Alarm ID key, Alarm owner, Auto close, Support group |
+| First occurrence | First occurrence |
+| Last occurrence | Last occurrence |
+| Count | Count |
+| Summary | Summary |
+| Ack | CIF, Alarm ID key, Alarm owner, Auto close, Support group |
+| **Key** | |
+
+`Key` is deliberately **last** in the alert table. It is a stable identifier you read once when you need it, not something scanned down the column on every glance — putting it first pushed the signal (severity, recency, count) off to the right. Ack sits immediately before it because both are "about this specific row" rather than about the condition.
 
 With ten columns the drawer is horizontally tight, so:
 
@@ -124,6 +127,21 @@ Two presentation toggles live in the header. Both are client-side only — they 
 |---|---|---|---|
 | Theme | `auto`, `light`, `dark` | `auto` | `localStorage['fw:theme']` |
 | Colour rows | on, off | off | `localStorage['fw:rowColor']` |
+
+Both toggles are **icon buttons**, not checkboxes:
+
+| Control | Icon | On-state |
+|---|---|---|
+| Theme | crescent (dark) / sun (light) — the icon shows the mode you would switch *to* | blue pill |
+| Colour rows | palette | amber pill |
+
+Implementation notes:
+
+- real `<button>` with `aria-pressed`, not a styled `<input type=checkbox>` — dressing up a native checkbox means faking its box, and a fake box loses the keyboard and screen-reader behaviour the native control had
+- inline SVG, not an icon font or emoji: no extra request, no font-loading flash, inherits `currentColor` so the theme handles it, and an emoji renders in the OS emoji font on one platform and as tofu on another
+- the on-state is driven by `[aria-pressed="true"]` rather than a separate class, so the visual state and the announced state cannot disagree
+- the two on-states are different hues (blue / amber). Two identical blue pills told you *that* both were on but not *which* was which
+- the theme icon shows the destination mode, and its `aria-label` says `Switch to dark mode` / `Switch to light mode` — it never announces what is currently on, because `aria-pressed` already does
 
 Theme is applied as `html[data-theme="<value>"]`, or no attribute at all for `auto`. The CSS keys off the attribute *and* `prefers-color-scheme`, so:
 

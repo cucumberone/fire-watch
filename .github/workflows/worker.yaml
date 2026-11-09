@@ -1,0 +1,117 @@
+name: worker image
+
+# Builds and pushes ONLY the worker image.
+#
+#   ghcr.io/cucumberone/fire-watch/worker:<tag>
+#
+# One workflow per service, each with a `paths` filter, so a change to the
+# frontend does not rebuild the worker. Five services × five builds on every
+# push was pure waste: the images share no code, and a rebuild that changed
+# nothing still moves `latest` and invalidates every cached pull.
+#
+# Tags: branch name on a branch push, `pr-NN` on a pull request, semver on a tag
+# push, plus `sha-<short>` always. `latest` only moves on a push to the default
+# branch — never on a PR.
+#
+# No `pull_request_target`: it runs with a write token and repository secrets on
+# unreviewed code, so a PR editing the Dockerfile would get the registry
+# credential.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+    paths:
+      - 'services/worker/**'
+      - '.github/workflows/worker.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/worker/**'
+      - '.github/workflows/worker.yaml'
+  workflow_dispatch:
+
+# Scoped per service, not per ref. A shared group would make the worker build
+# cancel the frontend build when both are pushed in the same commit.
+concurrency:
+  group: image-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Hard-coded: OCI registry paths must be lowercase and the repository casing is
+  # `cucumberone/fire-watch`. If the repo is renamed, this is one of the places
+  # to change (the other is k8s/overlays/ghcr/kustomization.yaml).
+  IMAGE: ghcr.io/cucumberone/fire-watch/worker
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: services/worker/package-lock.json
+
+      # `npm ci`, not `npm install`: the lockfile is committed and a build must
+      # not resolve a different dependency tree than the one tested.
+      - name: Install
+        working-directory: services/worker
+        run: npm ci --no-audit --no-fund
+
+      # Tests gate the push. Publishing a broken image to `latest` is worse than
+      # publishing nothing.
+      - name: Test
+        working-directory: services/worker
+        run: npm test
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=fire-watch worker
+            org.opencontainers.image.description=fire-watch event server — worker
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/worker
+          file: services/worker/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # linux/amd64 only: the target is x86 OpenShift. Add arm64 here when
+          # there is an arm64 cluster to run it on.
+          platforms: linux/amd64
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+          provenance: true
+          sbom: true
+          pull: true

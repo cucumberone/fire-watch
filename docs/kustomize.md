@@ -2,7 +2,7 @@
 
 `k8s/` is a **Kustomize** tree, not a flat directory of YAML. One base describes the production-shaped deployment, overlays adjust it per environment.
 
-**Status: implemented and rendering.** `kubectl kustomize k8s/base` produces 35 objects. The lab produces 27 objects via `k8s/overlays/lab/openshift` and 25 via `k8s/overlays/lab/kubernetes` (the two Routes are deleted in the latter). The values below are verified against the rendered output, not aspirational.
+**Status: implemented and rendering.** `kubectl kustomize k8s/base` produces 48 objects, `k8s/overlays/ghcr` produces the same 48 with GHCR image references, and the lab produces 30 via `k8s/overlays/lab/openshift` and 28 via `k8s/overlays/lab/kubernetes` (the two Routes are deleted in the latter). `k8s/overlays/lab/common` also renders 30 on its own. The values below are verified against the rendered output, not aspirational.
 
 ```
 k8s/
@@ -109,38 +109,44 @@ Purpose: run the whole system on one small machine, to exercise the event pipeli
 The lab runs on **either OpenShift or plain Kubernetes**. Production is always OpenShift; the plain-Kubernetes flavour exists so the datastore half can be exercised on hardware that is already on the desk, not as a second production path.
 
 ```
-overlays/lab/
-├── common/            # identical on both platforms
-│   ├── kustomization.yaml   (this IS the lab base, not an overlay)
-│   ├── replicas.yaml, resources.yaml, storage.yaml
-│   ├── delete-pdb.yaml, delete-anti-affinity.yaml, delete-hpa.yaml
-│   └── dragonfly-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml
-├── openshift/         # Route-based, like production
-│   ├── kustomization.yaml
-│   ├── routes.yaml           (lab hostnames)
-│   └── frontend-config.yaml  (wss://ws.fire-watch-lab.apps.lab.local)
-└── kubernetes/        # no Routes, NodePort instead
-    ├── kustomization.yaml
-    ├── delete-routes.yaml    ($patch: delete on both Routes)
-    ├── nodeports.yaml        (30300 ws-gateway, 30800 frontend)
-    └── frontend-config.yaml  (host resolved from the page)
+overlays/
+├── ghcr/              # same production shape, images from GHCR
+│   └── kustomization.yaml   (image rewrite + imagePullSecrets)
+└── lab/
+    ├── common/            # identical on both platforms
+    │   ├── kustomization.yaml   (this IS the lab base, not an overlay)
+    │   ├── replicas.yaml, resources.yaml, storage.yaml
+    │   ├── delete-pdb.yaml, delete-anti-affinity.yaml, delete-hpa.yaml
+    │   └── dragonfly-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml
+    ├── openshift/         # Route-based, like production
+    │   ├── kustomization.yaml
+    │   ├── routes.yaml           (lab hostnames)
+    │   └── frontend-config.yaml  (wss://ws.fire-watch-lab.apps.lab.local)
+    └── kubernetes/        # no Routes, NodePort instead
+        ├── kustomization.yaml
+        ├── delete-routes.yaml    ($patch: delete on both Routes)
+        ├── nodeports.yaml        (30300 ws-gateway, 30800 frontend)
+        └── frontend-config.yaml  (host resolved from the page)
 ```
 
 ```bash
 kubectl apply -k k8s/overlays/lab/openshift     # CRC / OpenShift Local / real OCP
 kubectl apply -k k8s/overlays/lab/kubernetes    # MicroK8s / kind / k3s
+kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 ```
+
+`overlays/ghcr` is orthogonal to the lab: it changes where the five service images come from and nothing else. See [images.md](images.md) §6.
 
 | | `lab/openshift` | `lab/kubernetes` |
 |---|---|---|
-| Objects rendered | 27 | 25 |
+| Objects rendered | 30 | 28 |
 | `Route` objects | 2 | **0** (deleted at render time) |
 | `ws-gateway` Service | ClusterIP | **NodePort 30300** |
 | `frontend` Service | ClusterIP | **NodePort 30800** |
 | Frontend `wsUrl` | `wss://ws.fire-watch-lab.apps.lab.local` | `ws://<page-host>:30300` |
 | Everything else | identical | identical |
 
-**`common/` is a base, not an overlay.** Both flavours list it under `resources`, which is what `base` in `kustomize.base` means. That matters because it makes `common` renderable on its own (`kubectl kustomize k8s/overlays/lab/common` → 27 objects) and it is the only structure where the two flavours cannot drift apart.
+**`common/` is a base, not an overlay.** Both flavours list it under `resources`, which is what `base` in `kustomize.base` means. That matters because it makes `common` renderable on its own (`kubectl kustomize k8s/overlays/lab/common` → 30 objects) and it is the only structure where the two flavours cannot drift apart.
 
 **Deleting a CRD object works.** `kubernetes/delete-routes.yaml` uses `$patch: delete` on `route.openshift.io/v1` objects that the *local* kustomize has no schema for. Verified with kustomize 5.x shipped in `kubectl`: the objects are removed at render time and never reach the API server. Without this, a plain cluster fails with `no matches for kind "Route"`.
 

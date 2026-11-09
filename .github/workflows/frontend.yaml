@@ -1,0 +1,104 @@
+name: frontend image
+
+# Builds and pushes ONLY the frontend image.
+#
+#   ghcr.io/cucumberone/fire-watch/frontend:<tag>
+#
+# Path-filtered, so an unrelated change does not rebuild it. See worker.yaml for
+# the full rationale on path filters, tags and the absence of
+# `pull_request_target`.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+    paths:
+      - 'services/frontend/**'
+      - '.github/workflows/frontend.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/frontend/**'
+      - '.github/workflows/frontend.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: image-frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/cucumberone/fire-watch/frontend
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Install and test
+        working-directory: services/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      # dist/ is git-ignored, so it NEVER exists on a fresh checkout. This step
+      # is the only reason the image build has anything to COPY.
+      - name: Build assets into dist/
+        working-directory: services/frontend
+        run: |
+          npm run build
+          test -f dist/index.html || { echo "dist/index.html missing"; exit 1; }
+          test -f dist/app.css     || { echo "dist/app.css missing"; exit 1; }
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=fire-watch frontend
+            org.opencontainers.image.description=fire-watch event server — static React UI
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/frontend
+          file: services/frontend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+          provenance: true
+          sbom: true
+          pull: true

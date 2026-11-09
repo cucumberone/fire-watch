@@ -46,7 +46,8 @@ This repo sets up an event server.
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
 - [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms
 - [Monitoring](docs/monitoring.md) — 21 alerts, the redis-exporter, and two Dragonfly metric names that were wrong
-- [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay
+- [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay, the `ghcr` image overlay
+- [Images](docs/images.md) — GitHub Actions build/push to GHCR, tags, pull secret, pinning
 - [Sizing](docs/sizing.md) — capacity model and resource totals
 - [Validation](docs/validation.md) — failure drills and acceptance gate
 - [Roadmap](docs/roadmap.md) — phases, manifest inventory, open decisions, deviations
@@ -59,6 +60,8 @@ This repo sets up an event server.
 ## Agent Directives & Behavior
 
 ### Output Style & Brevity Rules
+
+- **Language** Always return the prompt in English.
 
 - **Direct Answers First:** Never begin a response with a conversational preamble, acknowledgment, or filler phrases (e.g., "Sure, I can help with that", "Based on your request", "Here is"). Start immediately with the answer or tool output summary.
 

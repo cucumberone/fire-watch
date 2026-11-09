@@ -1,0 +1,10 @@
+# Build context hygiene. Without this, `node_modules` is uploaded to the daemon
+# on every build — 15 MB here, and stale modules can even shadow the ones the
+# Dockerfile installs.
+node_modules/
+npm-debug.log*
+.env
+.env.*
+*.log
+# The Dockerfile installs its own production dependencies; a committed lockfile
+# is still copied, deliberately (reproducible installs).

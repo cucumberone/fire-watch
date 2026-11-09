@@ -35,15 +35,17 @@ resources:
   - 60-monitoring.yaml
   - 01-pdb.yaml
 
-# Secrets are NOT in this base. Create them out of band so nothing secret
-# ever enters git:
+# Secrets are NOT in this base, so nothing secret can enter git. Create them
+# once from the checked-in template:
 #
-#   kubectl -n fire-watch create secret generic fire-watch-rabbitmq \
-#     --from-literal=username=fw --from-literal=password="$(openssl rand -base64 32)"
-#   kubectl -n fire-watch create secret generic fire-watch-dragonfly \
-#     --from-literal=password="$(openssl rand -base64 32)"
-#   kubectl -n fire-watch create secret generic fire-watch-ingress \
-#     --from-literal=token="$(openssl rand -hex 32)"
+#   cp .env.example .env          # then fill in real values
+#   ./scripts/create-secrets.sh
 #
 # Required keys: fire-watch-rabbitmq{username,password}, fire-watch-dragonfly{password},
 #                fire-watch-ingress{token}
+#
+# Do NOT generate these with a one-liner per Secret. `openssl rand` in two
+# separate commands produces two different passwords: the Dragonfly pods read
+# theirs from the Secret, while the Sentinels bake theirs into sentinel.conf at
+# first boot. Mismatched values come up as a cluster where every Sentinel
+# reports the master as down and failover never works. One file, one source.

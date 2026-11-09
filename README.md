@@ -52,6 +52,28 @@ The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the t
 
 `k8s/` is a Kustomize tree. The base is the production shape (OpenShift). The lab has two flavours — pick the one that matches your lab cluster, both render the same deployment apart from networking.
 
+### 1. Secrets first
+
+Secrets are **not** in the base manifests, so nothing secret can enter git. Generate them once:
+
+```bash
+cp .env.example .env                    # or use the generated .env already present
+./scripts/create-secrets.sh --dry-run   # inspect the rendered Secrets
+./scripts/create-secrets.sh             # create/update them in $NAMESPACE
+```
+
+`.env` is git-ignored; `.env.example` is the committed template. The script reads `.env`, so the Dragonfly password the pods get and the password the Sentinels seed into `sentinel.conf` are provably the same string — the old commented-out snippet in `k8s/base/kustomization.yaml` regenerated a fresh password per invocation, which would have brought the cluster up with mismatched credentials.
+
+| Secret | Keys | Consumed by |
+|---|---|---|
+| `fire-watch-rabbitmq` | `username`, `password` | RabbitMQ, workers, http-ingress |
+| `fire-watch-dragonfly` | `password` | Dragonfly `--requirepass`, all 3 Sentinels, workers, ws-gateway, sentinel-bridge, redis-exporter |
+| `fire-watch-ingress` | `token` | http-ingress bearer auth |
+
+Rotation notes — including the extra Sentinel step that a Dragonfly password change needs — are in `.env`.
+
+### 2. Workloads
+
 ```bash
 kubectl kustomize k8s/base | less                     # review production shape
 kubectl apply -k k8s/base                             # OpenShift, production
@@ -66,22 +88,20 @@ See [docs/kustomize.md](docs/kustomize.md) §3 for what the lab changes, how the
 
 ## Status
 
-**Manifests implemented.** `k8s/base` renders 44 objects. The lab renders 27 (OpenShift flavour) or 25 (Kubernetes flavour) — 1 replica each, no PDBs, no HPA, no monitoring. All verified with `kubectl kustomize`.
+**Manifests implemented.** `k8s/base` renders 48 objects. The lab renders 30 (OpenShift flavour) or 28 (Kubernetes flavour) — 1 replica each, no PDBs, no HPA, no monitoring. `k8s/overlays/ghcr` renders the same 48 with every service image repointed at GHCR. All verified with `kubectl kustomize`.
 
 Still needed before a real deploy:
 
 | Item | Why |
 |---|---|
-| Build images: `worker`, `ws-gateway`, `frontend` | manifests reference `image-registry.openshift-image-registry.svc:5000/fire-watch/*` |
-| Build `sentinel-bridge` | source is in [services/sentinel-bridge](services/sentinel-bridge/) — needs only a container build, not a rewrite |
+| ~~Build images: `worker`, `ws-gateway`, `frontend`, `http-ingress`, `sentinel-bridge`~~ | done — GitHub Actions pushes all five to GHCR ([docs/images.md](docs/images.md)) |
 | Pin real image digests | base uses tags; production requires digests |
-| Create the two Secrets | `fire-watch-rabbitmq{username,password}`, `fire-watch-dragonfly{password}` — see `k8s/base/kustomization.yaml` |
+| ~~Create the two Secrets~~ | done — `./scripts/create-secrets.sh` reads `.env` |
 | Confirm node size | 48Gi Dragonfly limit needs 128 GiB nodes to reschedule ([docs/sizing.md](docs/sizing.md) §3.3) |
+| `ghcr-pull` pull secret | only if deploying via `k8s/overlays/ghcr` and the packages stay private ([docs/images.md](docs/images.md) §5) |
+
+`sentinel-bridge` is implemented — [services/sentinel-bridge](services/sentinel-bridge/). It needed a container build, not a rewrite, and CI now builds it.
 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
-
-### `sentinel-bridge`
-
-Implemented — [services/sentinel-bridge](services/sentinel-bridge/). 11 planner unit tests pass (`node --test src/plan.test.js`). It needs a container build, not a rewrite.

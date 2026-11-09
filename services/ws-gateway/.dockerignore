@@ -1,0 +1,7 @@
+# Build context hygiene. Without this, `node_modules` is uploaded to the daemon
+# on every build, and stale modules can shadow the ones the Dockerfile installs.
+node_modules/
+npm-debug.log*
+.env
+.env.*
+*.log

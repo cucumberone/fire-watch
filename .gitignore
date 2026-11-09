@@ -2,6 +2,9 @@
 *.env
 .env
 .env.*
+# The template carries placeholder names only, so it must be committed or the
+# repo is undeployable. Real values live in .env.
+!.env.example
 *.pem
 *.key
 *.crt

@@ -1,0 +1,90 @@
+# GHCR overlay — the same production shape, but every service image comes from
+# the GitHub Container Registry instead of the OpenShift internal registry.
+#
+#   kubectl apply -k k8s/overlays/ghcr
+#
+# Use this when the cluster cannot reach the internal registry (the usual case
+# for a non-OpenShift lab, or an OpenShift cluster building images elsewhere),
+# or when you simply want the CI-built digest to be the source of truth.
+#
+# Why an overlay and not an edit to the base: the base deliberately points at
+# `image-registry.openshift-image-registry.svc:5000/fire-watch/*`, which is what
+# an in-cluster build produces. Overriding here keeps one deployable description
+# of "the app" with two ways to get its images.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch
+
+resources:
+  - ../../base
+
+# The repository is private, so the pull needs a credential. Create the pull
+# secret out of band (never in git):
+#
+#   kubectl -n fire-watch create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io \
+#     --docker-username=<github-user> \
+#     --docker-password=<PAT with read:packages>
+#
+# Alternatively, on a cluster that supports it, link the GHCR package to the
+# repository so GITHUB_TOKEN-based pulls work without a PAT.
+images:
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/worker
+    newName: ghcr.io/cucumberone/fire-watch/worker
+    # `latest` is intentionally not pinned to a digest here: the workflow moves
+    # `latest` only on a push to main, and a digest pin would have to be edited
+    # by hand after every build. For production, pin: replace `latest` with the
+    # `sha-<short>` tag the CI run printed, or the full `@sha256:...` digest.
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/ws-gateway
+    newName: ghcr.io/cucumberone/fire-watch/ws-gateway
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/frontend
+    newName: ghcr.io/cucumberone/fire-watch/frontend
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/http-ingress
+    newName: ghcr.io/cucumberone/fire-watch/http-ingress
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/sentinel-bridge
+    newName: ghcr.io/cucumberone/fire-watch/sentinel-bridge
+    newTag: latest
+
+# Attach the pull secret to every pod that runs one of our images. RabbitMQ,
+# Dragonfly and Redis come from docker.io and need no credential.
+patches:
+  - target:
+      kind: Deployment
+      name: worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: ws-gateway
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: http-ingress
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: sentinel-bridge
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]

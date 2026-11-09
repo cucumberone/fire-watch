@@ -81,7 +81,13 @@ spec:
         - name: gateway
           resources:
             requests: { cpu: 50m, memory: 64Mi }
-            limits:   { cpu: 200m, memory: 192Mi }
+            # 500m, not 200m. At 200m this pod was measurably CPU-throttled:
+            # /sys/fs/cgroup/cpu.stat showed 111s of cumulative throttled_usec,
+            # climbing ~600ms every 3s, and the connect-time alert snapshot
+            # (docs/websocket-server.md §3.2) became bimodal — 8ms when it won
+            # the quota, ~100-200ms when it lost it. The snapshot is a burst of
+            # string work for up to 2000 rows, so it sits right at the old quota.
+            limits:   { cpu: 500m, memory: 192Mi }
 ---
 # ------------------------------------------------------------------ Frontend
 apiVersion: apps/v1

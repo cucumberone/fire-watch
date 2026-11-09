@@ -101,6 +101,50 @@ guards both index writes behind `if has_index`, so a worker running newer code
 against an older cached script (or the reverse, during a rolling update) degrades
 to "no index" instead of failing every event.
 
+### 3.2 Snapshot cost: three round trips, measured
+
+The snapshot runs on **every** connect, so the number of round trips must not grow
+with the number of open alerts. This was got wrong first and had to be measured —
+with 199 open alerts on the lab cluster:
+
+| Shape | Time |
+|---|---|
+| `HGETALL` per alert, sequential (naive) | **1092 ms** |
+| `HGETALL` per alert, pipelined | 102–694 ms |
+| `HGETALL` per alert, `Promise.all` | 99–205 ms |
+| Lua, 199× `HGETALL` + table fold | 97–204 ms |
+| Lua, 199× `HMGET` (7 named fields) | 8–200 ms |
+| one `MGET` of 199 keys | 3–80 ms |
+
+The naive shape blocks the WebSocket handshake for ~1 s at 199 alerts and ~11 s at
+the 2000 cap — which reads as "the gateway is hanging", not as a slow snapshot.
+
+The shipped path is exactly **three** round trips regardless of alert count:
+`ZREVRANGE` the index, one `EVALSHA` returning 7 named fields per alert via
+`HMGET`, then one `MGET` for the event records. `HMGET` beat `HGETALL` because
+`HGETALL` returns a flat field/value array that Lua then has to fold into a table —
+1600 hash-table inserts for 199 alerts, which was the single largest cost.
+
+Two Dragonfly-specific constraints shaped this:
+
+- **Scripts may only touch declared keys.** Dragonfly enforces Redis Cluster
+  semantics and rejects dynamic key construction:
+  `ERR script tried accessing undeclared key, key: fw:alert:shop:check-175`.
+  So the index must be read by the caller and every alert hash passed in `KEYS`,
+  and the `fw:evt:*` records must be fetched afterwards — their keys are not known
+  until the hashes have been read.
+- **Lua cannot return tables with nil holes**; they truncate silently. Missing
+  values are emitted as `""` and normalised in JS.
+
+**Residual latency is the gateway's CPU limit, not the read path.** Baseline `PING`
+to Dragonfly measured p50 0.93 ms / p95 5.5 ms, but ~1 in 30 operations stalled for
+~80 ms, giving the bimodal 8 ms / ~100 ms pattern above. The cause is CFS
+throttling: the gateway runs with `limits.cpu: 200m` and `/sys/fs/cgroup/cpu.stat`
+showed **111 s** of cumulative `throttled_usec`, climbing ~600 ms every 3 s, while
+Dragonfly was throttled in only 2 % of periods. The snapshot is a burst of CPU work
+(Node string handling for 199 rows), so it lands right at the quota. If handshake
+latency matters, raise that limit before optimising the reads further.
+
 ## 4. Resource guardrails per connection
 
 | Limit | Default | Reason |

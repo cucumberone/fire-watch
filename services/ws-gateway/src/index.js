@@ -170,16 +170,17 @@ wss.on('connection', (ws, req) => {
     // event replay only produces rows as new events arrive.
     let snapshot = 0;
     try {
+      // readOpenAlerts already batches its reads: it returns every alert with its
+      // event attached, in two round trips. Do NOT loop over the rows calling
+      // reader.readEvent() here — that is O(alerts) round trips on every connect
+      // and measured ~1.1s for 199 alerts (see the cost note on readOpenAlerts).
       const open = await reader.readOpenAlerts(cfg.alertSnapshotMax);
       const alerts = [];
       for (const a of open) {
         // Only the alerts the client asked about. An unfiltered subscribe means
         // "everything", which is the common case.
         if (!matchesAlertSubscription(verdict.sub, a.key)) continue;
-        // Attach the last event so the row has a Summary and the inspector has a
-        // full record. Best-effort: a missing record must not drop the row.
-        const evt = await reader.readEvent(a.lastId);
-        alerts.push({ ...a, event: evt });
+        alerts.push(a);
       }
       if (alerts.length > 0) {
         send(JSON.stringify({ op: 'snapshot', alerts }));

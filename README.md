@@ -93,7 +93,9 @@ Rotation notes — including the extra Sentinel step that a Dragonfly password c
 
 ### 2. Build images (on demand)
 
-Each service has its own workflow and every one is **manual** — nothing builds on push. Run the one you changed from the Actions tab ("Run workflow"), and it pushes `ghcr.io/cucumberone/fire-watch/<service>`. See [docs/images.md](docs/images.md).
+Each service has its own workflow and every one is **manual** — nothing builds on push. Run the one you changed from the Actions tab ("Run workflow"), pick the **`lab`** or **`prod`** environment, and it pushes `ghcr.io/cucumberone/fire-watch/<service>`.
+
+Both environments publish to the same registry path by default, so the `ghcr` overlay works for either. To split them, set an `IMAGE_REGISTRY_PATH` variable in each environment — note that is an OCI registry path under `ghcr.io`, unrelated to the Kubernetes `NAMESPACE`. See [docs/images.md](docs/images.md) §1.2.
 
 ### 3. Workloads
 

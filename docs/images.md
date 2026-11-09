@@ -15,7 +15,12 @@ when a human asks for it.
 | `frontend.yaml` | `frontend` | manual |
 | `http-ingress.yaml` | `http-ingress` | manual |
 | `sentinel-bridge.yaml` | `sentinel-bridge` | manual |
-| `deploy.yaml` | — | manual, picks a GitHub Environment (`lab`/`prod`) |
+| `deploy.yaml` | — | manual |
+
+Every one of them takes an **`environment` input** (`lab` or `prod`) and binds the
+job to it with `environment: ${{ inputs.environment }}`. That is what makes
+`vars.*` and `secrets.*` resolve against the chosen Environment instead of the
+repository defaults — one workflow, either target, no branching (§1.2).
 
 ```mermaid
 flowchart LR
@@ -53,7 +58,46 @@ are always produced, so every run stays addressable regardless.
 would have produced images tagged **only** with a sha and never `latest` — while
 the workflow still read as though it did.
 
-### 1.2 Why no push trigger
+### 1.2 The environment input, and what it changes
+
+All six workflows ask which environment to target. For `deploy.yaml` that is
+load-bearing: it selects the namespace, kubeconfig, and broker/Dragonfly
+credentials (§9).
+
+For the five image workflows it selects one thing: the registry path.
+
+> **`NAMESPACE` vs `IMAGE_REGISTRY_PATH`** — similar names, unrelated things.
+> `NAMESPACE` is a **Kubernetes** namespace (`fire-watch-lab`) and only
+> `deploy.yaml` reads it. `IMAGE_REGISTRY_PATH` is an **OCI registry path**
+> under `ghcr.io` (`cucumberone/fire-watch`) and only the image workflows read
+> it. Renamed from `IMAGE_NAMESPACE` precisely because the old name invited that
+> confusion.
+
+```yaml
+env:
+  IMAGE: ghcr.io/${{ vars.IMAGE_REGISTRY_PATH || 'cucumberone/fire-watch' }}/worker
+```
+
+| `IMAGE_REGISTRY_PATH` set? | Result |
+|---|---|
+| unset in that environment | falls back to `cucumberone/fire-watch` — both environments publish to the same path, which is what `k8s/overlays/ghcr` expects |
+| set to e.g. `cucumberone/fire-watch-lab` | that environment's builds go to the separate path |
+
+The `||` is not decoration. An unset variable resolves to an empty string, so
+without the fallback the image name would become `ghcr.io//worker` and the push
+would fail at the registry with an error that does not mention the variable.
+
+**Deliberately no `environment`-scoped secrets are used by the image workflows.**
+They authenticate with `secrets.GITHUB_TOKEN`, which is per-run not per-environment.
+The environment binding exists so one variable can vary the destination, not to
+give builds environment credentials they do not need.
+
+**Prerequisite:** the Environments must exist in
+**Settings → Environments** before the first run. If you pick a name that does not
+exist yet, GitHub creates it with no protection and every variable is empty — the
+image would land on the fallback path and you would not notice.
+
+### 1.3 Why no push trigger
 
 Deploying or publishing on every push makes an image tag and a cluster mutation
 the same event. A merge that only fixes a typo in the docs would rebuild and
@@ -102,7 +146,7 @@ between two desired states.
 ghcr.io/cucumberone/fire-watch/<service>:<tag>
 ```
 
-`IMAGE_NAMESPACE`/`IMAGE` is hard-coded rather than `${{ github.repository }}` because OCI registry paths must be lowercase and the repository casing is `cucumberone/fire-watch`. If the repo is renamed, the `IMAGE` env var in each of the five workflows and the `images:` block in the GHCR overlay are the places to change.
+`IMAGE_REGISTRY_PATH`/`IMAGE` is hard-coded rather than `${{ github.repository }}` because OCI registry paths must be lowercase and the repository casing is `cucumberone/fire-watch`. If the repo is renamed, the `IMAGE` env var in each of the five workflows and the `images:` block in the GHCR overlay are the places to change.
 
 ## 5. Permissions and authentication
 

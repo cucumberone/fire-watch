@@ -15,12 +15,25 @@ name: sentinel-bridge image
 #   `manual-<yyyyMMdd-HHmmss>` always — distinguishes two runs of the same commit
 #   `latest`                  opt-in via the input
 #
+# The run is bound to a GitHub Environment (`lab` or `prod`), so an environment
+# variable such as IMAGE_REGISTRY_PATH can point the build at a different registry
+# namespace per environment without a second workflow.
+#
 # No `pull_request_target` exists here at all, so a PR can never reach the
 # registry credential.
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: Target GitHub Environment (lab or prod)
+        type: choice
+        required: true
+        # No default. A build should not claim an environment because a form was
+        # submitted without reading it.
+        options:
+          - lab
+          - prod
       push_latest:
         description: Also tag this build `latest`
         type: boolean
@@ -42,14 +55,23 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # Hard-coded: OCI registry paths must be lowercase and the repository casing is
-  # `cucumberone/fire-watch`. If the repo is renamed, this is one of the places
-  # to change (the other is k8s/overlays/ghcr/kustomization.yaml).
-  IMAGE: ghcr.io/cucumberone/fire-watch/sentinel-bridge
+  # Resolved from the environment's IMAGE_REGISTRY_PATH variable, falling back to the
+  # repository default. `||` matters: an unset variable yields an empty string,
+  # which would otherwise produce a bare `ghcr.io//sentinel-bridge` and fail at push time
+  # with a confusing registry error.
+  #
+  # Override IMAGE_REGISTRY_PATH per environment only if lab and prod publish to
+  # different namespaces — the default keeps both on one, which is what the
+  # k8s/overlays/ghcr manifests expect.
+  IMAGE: ghcr.io/${{ vars.IMAGE_REGISTRY_PATH || 'cucumberone/fire-watch' }}/sentinel-bridge
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Binds the run to the chosen Environment, which is what makes `vars.*`
+    # resolve against it instead of the repository defaults. If the environment
+    # does not exist, GitHub creates it with no protection — create it first.
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
 
@@ -125,6 +147,7 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
             echo "| Image | \`${{ env.IMAGE }}\` |"
             echo "| Tags | \`${{ steps.meta.outputs.version }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"

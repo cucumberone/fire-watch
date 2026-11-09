@@ -46,7 +46,7 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 | De-duplication (transport) | keyed on event `id` (overlap + at-least-once delivery can duplicate) |
 | De-duplication (occurrence) | render `count` from `op: alert` frames; never increment it per received event — the worker coalesces ([event-lifecycle.md](event-lifecycle.md) §5.4) |
 | Ordering | sort by broker timestamp, not arrival order and not producer `ts` — cross-worker delivery can invert ([event-lifecycle.md](event-lifecycle.md) §2) |
-| `applied` code | **must** be honoured: `0` stale / `1` new occurrence / `2` coalesced / `3` closed. Treating `2` as new causes entry churn; treating `0` as a close causes flicker ([event-lifecycle.md](event-lifecycle.md) §9) |
+| `applied` code | **must** be honoured: `0` dropped (duplicate or stale) / `1` applied / `3` closed. `2` is a retired alias for `1`. Treating `0` as an applied event double-counts redeliveries ([event-lifecycle.md](event-lifecycle.md) §9) |
 | Alert state | render from `op: alert` frames and, on connect, from the `op: snapshot` frame; never derive "is it open" or the count from the event list ([websocket-server.md](websocket-server.md) §3.1) |
 | Initial load | `op: snapshot` **replaces** the alert map, it is not merged: it is the complete open set, so an omitted row is genuinely closed. Merging would resurrect rows retired while the socket was down |
 | `msgc` decoding | field may be gzip + base64. Decode with the native `DecompressionStream`; on failure render `[undecodable payload]` and keep the rest of the alert usable ([payload-and-compression.md](payload-and-compression.md) §5) |
@@ -115,10 +115,91 @@ Both tables lead with identity and status, then time, then volume, then the huma
 
 With ten columns the drawer is horizontally tight, so:
 
-- identifier and timestamp cells are `white-space: nowrap` — a mid-token break reads as `CIF-\n7730`, which is worse than a scrollbar
-- headers may still wrap, because a wrapped header costs a line while a wrapped value corrupts the value
-- the Summary cell is capped (`min-width:12rem; max-width:26rem`) so a long message cannot inflate the table and force a scrollbar on an otherwise wide window
-- the drawer body scrolls horizontally when the viewport is narrow; that is the intended behaviour, not an overflow bug
+- **no cell ever wraps.** A wrapped value corrupts the value — `CIF-\n7730` is
+  unreadable, and a timestamp split across two lines is worse than a scrollbar.
+  Cells are `white-space: nowrap` with `text-overflow: ellipsis`; the container
+  scrolls horizontally. The full text of any record is available from the
+  right-click **Information** panel (§5.5).
+- headers may still wrap, because a wrapped header costs a line while a wrapped
+  value corrupts the value
+- the tables are `table-layout: fixed` inside a `.tablewrap` with `overflow-x:
+  auto`, so `min-width: 100%` keeps them filling the pane until the columns exceed
+  it
+
+#### Time format
+
+Every timestamp is rendered as **`YYYY-MM-DD HH:MM:SS`, 24-hour, local time**
+(`formatClock` in `src/lib.js`). Hand-rolled, not `toLocale*`:
+
+- locale-dependent output means two operators can see different strings for the
+  same alert, and the format can change under them after an OS locale change
+- the previous 12-hour clock lost the AM/PM distinction off the edge of a narrow
+  column, so 01:05 and 13:05 looked identical
+- the date was missing entirely, so yesterday's events were indistinguishable
+  from today's
+
+Local time, because an operator correlates against the clock in front of them; the
+inspector shows the raw ISO and epoch values for anyone who needs UTC.
+
+#### Resizable columns
+
+Each header cell carries a 7px drag handle on its right edge (`role="separator"`).
+Dragging sets a width for that column only; widths are persisted per table in
+`localStorage` (`fw:colw:alerts`, `fw:colw:events`) and a **reset columns** link
+restores the defaults.
+
+Three deliberate choices:
+
+- **`<colgroup>` with per-column widths, not flexbox.** The no-wrap rule means
+  columns are fixed-width boxes; there is no meaningful "flex" when the content
+  cannot reflow.
+- **A minimum of 48px.** Without a floor a drag can collapse a column to nothing,
+  and at zero width there is no handle left to drag it back.
+- **Listeners on `document`, not the handle.** The pointer leaves a 7px handle
+  almost immediately; a handle-local listener would stop tracking mid-drag.
+  `body.resizing` keeps the `col-resize` cursor and suppresses text selection for
+  the duration, or the drag selects the whole table.
+
+Only the leading columns of the live table are resizable; the enriched columns are
+appended after them with natural widths.
+
+#### Making the two tables the same width
+
+Both tables must line up: the alert table sits directly above the drawer, and a few
+pixels of offset is immediately visible as misaligned columns.
+
+Note that resizable columns (§4.3) change this on purpose: once an operator drags
+a column, the two tables are *no longer* the same width, because the widths are
+per-table state. What stays true is that both containers occupy the full pane, so
+the misalignment comes only from content and never from a layout bug.
+
+Three things are needed for the containers to match, and the first two were each
+wrong at some point:
+
+1. **No `max-width` cap.** `main` and `.drawer` were both limited to 1200px, which
+   wasted most of a wide monitor and forced the ten-column live table to wrap.
+   Both now fill the viewport.
+2. **`width: 100%` on `main`.** In a flex column, removing `max-width` is not
+   enough: the item shrink-to-fits its content and ended up *narrower* than the
+   drawer. `#root` states `align-items: stretch` explicitly for the same reason.
+3. **`scrollbar-gutter: stable` on both scroll containers.** `main` scrolls
+   vertically and `.drawer-body` may not, so `main`'s content box is narrower by
+   exactly one scrollbar (12px). Reserving the gutter on both keeps the columns
+   aligned whether or not a scrollbar is currently shown.
+
+Measured after the fix (table widths, px):
+
+| Viewport | Alert table | Live table | Delta |
+|---|---|---|---|
+| 1024 | 964 | 999 | −35 |
+| 1152 | 1092 | 1092 | **0** |
+| 1280 | 1220 | 1220 | **0** |
+| 1536 | 1476 | 1476 | **0** |
+
+Below ~1100px the ten-column live table cannot shrink past its nowrap minimum, so
+it overflows (and scrolls) while the alert table still fits. That is the intended
+trade-off: keeping identifiers unbroken matters more than matching widths on a
+narrow window.
 
 ## 5. UI preferences
 
@@ -222,7 +303,23 @@ The `❚❚ Pause` button freezes the **render**, not the socket. The socket kee
 
 ### 5.5 Record inspector
 
-Right-clicking a row in either table opens a fixed panel listing **every key/value pair of that record** — including `payload` keys the table does not show.
+Right-clicking a row in either table opens a **two-level menu**:
+
+```text
+level 1                          level 2
+┌──────────────────────┐         ┌──────────────────────┐
+│ Acknowledge          │  ──────▶│ ← source:type        │
+│ Information          │         │ every field, flat    │
+└──────────────────────┘         └──────────────────────┘
+```
+
+The split exists because the previous panel showed actions and the whole field
+dump together: a routine acknowledge sat next to ~40 lines of JSON. Actions are
+now one click and the detail is opt-in, and there is room to add actions later
+without the menu becoming a wall of text.
+
+`Information` lists **every key/value pair of that record** — including `payload`
+keys the table does not show.
 
 | Detail | Behaviour |
 |---|---|
@@ -232,7 +329,12 @@ Right-clicking a row in either table opens a fixed panel listing **every key/val
 | Still-compressed fields | labelled `[gzip, N base64 chars]` rather than dumping base64 |
 | Cycles | detected with a `WeakSet` and reported as `[circular]`; a malformed payload must never blow the stack on a right-click |
 | Positioning | coordinates clamped to the viewport so a right-click near an edge cannot open a panel off-screen |
-| Dismissal | Escape, click outside, or the ✕ button |
+| Dismissal | Escape, click outside, or the ✕ button. The ✕ is present in both levels; the back link returns to the action list |
+
+**Why Information exists instead of wrapping cells.** Cells never wrap (see §4.3),
+so a long value is necessarily clipped at a narrow width. The record is therefore
+read here, in a panel that can be as tall as it needs, rather than by reflowing the
+row and pushing every other column out of alignment.
 
 ### 5.6 Acknowledge is a menu action, not a button
 

@@ -19,10 +19,16 @@
 # ARGV[1] = broker_ts_ms
 # ARGV[2] = event id
 # ARGV[3] = severity
-# ARGV[4] = dedup window in ms
+# ARGV[4] = dedup window in ms  (UNUSED since the coalescing window was removed;
+#           kept in the signature so an older worker calling with 4 args still
+#           works during a rolling update)
 # ARGV[5] = alert key (source:type), used as the index member
 #
-# Returns: 0 stale | 1 new occurrence | 2 coalesced | 3 closed
+# Returns: 0 stale/duplicate | 1 applied | 3 closed
+#
+# There is no longer a separate "coalesced" return code. A DUPLICATE IS DROPPED
+# (returns 0) by the (timestamp, id) watermark below, so it never reaches the
+# counter; every event that does get through is counted, and moves last_seen.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -86,17 +92,27 @@ data:
       return 3
     end
 
-    -- 3. occurrence rollup: repeats inside the window move last_seen only.
+    -- 3. count it.
+    --
+    -- Every event that reaches here is a DISTINCT event: the watermark above
+    -- already dropped any exact repeat (same id, same or older timestamp). So
+    -- there is nothing to suppress and nothing to coalesce — one event, one
+    -- count, and last_seen always moves.
+    --
+    -- An earlier design coalesced repeats arriving within
+    -- FW_ALERT_DEDUP_WINDOW, which left every row reading "Count 1" during a
+    -- duplicate storm. That was removed: it is indistinguishable from a broken
+    -- counter, and the dedup it was imitating is already done by the watermark.
     local last  = tonumber(redis.call('HGET', KEYS[1], 'last_seen') or '0')
     local count = tonumber(redis.call('HGET', KEYS[1], 'count') or '0')
     local first = redis.call('HGET', KEYS[1], 'first_seen') or tostring(ts)
-    local fresh = 0
+    local episode_started = (is_open == 0 or last == 0)
 
-    if is_open == 0 or last == 0 then
-      count, first, fresh = 1, ts, 1                 -- new episode
-    elseif ts - last > window then
-      count, fresh = count + 1, 1                    -- new occurrence
-    end                                              -- else coalesced
+    if episode_started then
+      count, first = 1, ts                           -- first event of an episode
+    else
+      count = count + 1                              -- every event counts
+    end
 
     redis.call('SET', KEYS[2], '1', 'EX', 604800)
     -- Keep the open index in step. The score is the last activity, so a bounded
@@ -114,12 +130,14 @@ data:
       'watermark', ts,
       'watermark_id', id)
 
-    -- A new episode (fresh == 1) starts unacknowledged. The ack is an
-    -- operator's statement about a specific occurrence; carrying it into the
-    -- next episode would silently hide a re-fire (docs/acknowledge.md §6).
-    if fresh == 1 then
+    -- An acknowledgement belongs to one EPISODE, not one event. It is cleared
+    -- when the alert was not already open (a re-fire after retirement) and left
+    -- alone while the alert stays open — otherwise every duplicate would
+    -- silently un-acknowledge the row an operator had already claimed
+    -- (docs/acknowledge.md §6).
+    if episode_started then
       redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
     end
 
     redis.call('PEXPIRE', KEYS[1], 604800000)
-    return (fresh == 1) and 1 or 2
+    return 1

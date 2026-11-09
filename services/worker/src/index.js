@@ -111,10 +111,26 @@ async function handleMessage(msg) {
     });
 
     // ---- write + fold. Throws on transient failure -> requeue.
-    const { applied } = await persistEvent({
+    const { applied, duplicate } = await persistEvent({
       dfl, evt, storedPayload, brokerTs, cfg, fold, log,
     });
     lastWriteOk = true;
+
+    // ---- duplicate: dropped, and deliberately silent.
+    //
+    // The event record already existed for this id, so this is the same event
+    // being delivered again (a redelivery, or a producer re-sending an id it
+    // already used). Nothing downstream may see it: no fold, so no count and no
+    // Last occurrence change; no audit copy, because the first delivery already
+    // produced one; no live frame, so the tail does not show the same event
+    // twice.
+    //
+    // Still ACKED. Requeueing would loop forever on a message that can never
+    // succeed.
+    if (duplicate) {
+      log.debug('duplicate event id, dropped', { id: evt.id });
+      return 'ack';
+    }
 
     // ---- audit copy: PLAIN, confirmed, before the ack.
     // Reuse the original buffer: re-serializing would risk a different byte
@@ -126,7 +142,14 @@ async function handleMessage(msg) {
     try {
       await dfl.publish(
         keys.channelEvents,
-        JSON.stringify({ event: { ...evt, payload: storedPayload }, applied }),
+        // brokerTs is included deliberately. It is the only timestamp that
+        // reflects WHEN THIS EVENT ARRIVED, and a client needs it to move the
+        // row's "Last occurrence". Without it the frontend falls back to
+        // `prev.lastSeen` and Last occurrence silently stops advancing.
+        JSON.stringify({
+          event: { ...evt, payload: storedPayload, brokerTs },
+          applied,
+        }),
       );
       if (applied === 1 || applied === 3) {
         await dfl.publish(keys.channelAlerts, JSON.stringify({ key: `${evt.source}:${evt.type}`, applied }));

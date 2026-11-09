@@ -49,9 +49,21 @@ Why pub/sub is published only after the write: a browser must never see an event
 
 A worker failure **after** the Dragonfly write but **before** the ack causes a redelivery. That is safe by construction, and it is the exact scenario the design was built for:
 
-1. The redelivered message carries its **original** broker timestamp, so the alert fold sees an old timestamp and treats it as stale if anything newer has been applied ([event-lifecycle.md](event-lifecycle.md) §6).
-2. The record and index writes are idempotent, so a replay produces identical state.
+1. The record write is `SET fw:evt:{id} ... NX`. On redelivery the id already
+   exists, so the write returns `null` and the event is **dropped before anything
+   else runs** — no fold, no index, no audit copy, no live frame. It is still
+   ACKed, because a message that can never succeed must not loop forever.
+2. The index write is idempotent (`ZADD` on a repeated member only moves its
+   score), so a replay produces identical state.
 3. The fold is an atomic Lua script, so two workers racing on the same key converge on the highest timestamp.
+
+**Why identity is the event id, not the timestamp.** The fold's `(timestamp, id)`
+watermark compares against the broker arrival time, so it catches a redelivery
+(the same message keeps its original timestamp). It does *not* catch a producer
+re-sending an id or two POSTs carrying the same id: each is a new message with a
+new timestamp, so the repeat looks newer and would be counted every time. That is
+what a duplicate storm actually looks like, and it is why the gate lives on the
+event record rather than in the fold.
 
 Worked example — an old CLOSE must not retire a newer CRITICAL:
 
@@ -102,7 +114,7 @@ Fold return codes, forwarded as `applied`:
 |---|---|
 | `0` | stale — history only |
 | `1` | new occurrence |
-| `2` | coalesced into the current occurrence |
+| `2` | retired alias for `1` (was "coalesced"); duplicates never reach here — they return `0` |
 | `3` | alert closed |
 
 Duplicate processing produces no duplicate state. The one non-idempotent step is `PUBLISH` (a duplicate would double-render in the UI). Mitigation: each gateway keeps an in-process LRU of the last 10 000 event ids and drops repeats. It is deliberately **not** a Dragonfly write — gateways have no write access ([websocket-server.md](websocket-server.md) §5).

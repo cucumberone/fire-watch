@@ -32,6 +32,13 @@ const MSG_MAX_BYTES = 1048576;
 // little later" instead of erroring (docs/acknowledge.md §5).
 const MAX_ACK_KEYS = 200;
 
+// Column labels, defined once so the header, the colgroup and the resize state
+// cannot drift out of order. Order is documented in docs/frontend.md §4.3.
+const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
+// The enriched columns are fixed-width labels, so only the leading five are
+// user-resizable; ENRICHED_FIELDS is appended after them.
+const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary'];
+
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
 // ABSENCE of a key, so a later OS change still takes effect.
@@ -96,6 +103,106 @@ function usePreferences() {
   }, []);
 
   return { themePreference, darkMode, rowColor, setTheme, setRowColor };
+}
+
+// --------------------------------------------------------- column resizing
+// Widths are stored per table in localStorage so a reload keeps the layout an
+// operator has tuned.
+const COL_WIDTH_KEY = (table) => `fw:colw:${table}`;
+
+function readWidths(table) {
+  try {
+    const raw = window.localStorage.getItem(COL_WIDTH_KEY(table));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeWidths(table, widths) {
+  try {
+    window.localStorage.setItem(COL_WIDTH_KEY(table), JSON.stringify(widths));
+  } catch {
+    // Losing a column width is not worth failing a render over.
+  }
+}
+
+/**
+ * Column widths for one table, drag-resizable from the header separator.
+ *
+ * Implemented with `<colgroup>` and a per-column width rather than flexing the
+ * table: the requirement is that a cell NEVER wraps, so the only sane layout is
+ * fixed-width columns with horizontal overflow on the container. A `min-width`
+ * is enforced so a drag cannot collapse a column into an invisible sliver from
+ * which there is no way back.
+ *
+ * Widths are applied as inline styles because the number is user-chosen; there is
+ * no static class that can express "whatever they dragged to".
+ */
+const MIN_COL_WIDTH = 48;
+
+function useColumnWidths(table) {
+  const [widths, setWidths] = useState(() => readWidths(table));
+
+  const beginResize = useCallback((index, startX, startWidth) => (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const start = event.clientX ?? startX;
+    let latest = startWidth;
+
+    // Listeners on the document, not the handle: the pointer leaves the 6px
+    // handle almost immediately, and a handle-local listener would stop tracking.
+    const onMove = (e) => {
+      latest = Math.max(MIN_COL_WIDTH, startWidth + (e.clientX - start));
+      setWidths((prev) => ({ ...prev, [index]: latest }));
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.classList.remove('resizing');
+      setWidths((prev) => {
+        writeWidths(table, prev);
+        return prev;
+      });
+    };
+
+    // Suppresses text selection and the col-resize cursor while dragging.
+    document.body.classList.add('resizing');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [table]);
+
+  const reset = useCallback(() => {
+    setWidths({});
+    writeWidths(table, {});
+  }, [table]);
+
+  return { widths, beginResize, reset };
+}
+
+/**
+ * A header cell with a drag handle on its right edge.
+ *
+ * The handle is a separate element rather than a CSS pseudo-element because it
+ * needs its own hit area, its own cursor and its own mousedown target; a
+ * `::after` would still need pointer-events juggling to distinguish "click the
+ * header" from "drag the edge".
+ */
+function ResizableTh({ index, width, onBegin, children }) {
+  return (
+    <th style={width ? { width: `${width}px`, minWidth: `${width}px` } : undefined}>
+      {children}
+      <span
+        className="colresize"
+        role="separator"
+        aria-orientation="vertical"
+        title="Drag to resize this column"
+        onMouseDown={onBegin(index, 0, width || 0)}
+      />
+    </th>
+  );
 }
 
 // ---------------------------------------------------------------- gunzip shim
@@ -211,6 +318,9 @@ function useSocket(config) {
       const next = new Map();
       for (const row of frame.alerts) {
         if (!row || typeof row.key !== 'string') continue;
+        // The snapshot's event record carries brokerTs, but a row whose record
+        // has expired or was never stored still needs a Last occurrence. Fall
+        // back to the alert's own last_seen so the column is never blank.
         const evt = row.event ? toViewEvent(row.event) : null;
         next.set(row.key, {
           key: row.key,
@@ -413,14 +523,30 @@ function IconPalette() {
 
 // --------------------------------------------------------------- inspector
 /**
- * Right-click menu for a record: the actions available on that row, then every
- * key/value pair of the record.
+ * Right-click menu for a record.
+ *
+ * Two levels, deliberately:
+ *
+ *   level 1  the ACTIONS on this row — Acknowledge, Information
+ *   level 2  Information expands to every field of the record
+ *
+ * The previous version showed actions and the full field dump at once, which
+ * made a routine acknowledge sit next to 40 lines of JSON. Splitting them means
+ * the common action is one click and the detail is opt-in, and it leaves room
+ * for more actions later without the menu becoming a wall of text.
  *
  * Closed on Escape, on a click outside, and on scroll of the container it sits
  * in — a menu anchored to a row that has scrolled away is worse than no menu.
  */
 function RecordInspector({ state, onClose }) {
   const ref = useRef(null);
+  // Which submenu is expanded. Reset whenever a different row is opened, or the
+  // panel would reopen showing the previous row's Information.
+  const [view, setView] = useState('menu');
+
+  useEffect(() => {
+    setView('menu');
+  }, [state?.record, state?.title]);
 
   useEffect(() => {
     if (!state) return undefined;
@@ -447,10 +573,17 @@ function RecordInspector({ state, onClose }) {
       aria-label={state.title}
     >
       <div className="inspector-head">
-        <span>{state.title}</span>
+        {view === 'info' ? (
+          <button className="link inspector-back" onClick={() => setView('menu')}>
+            ← {state.title}
+          </button>
+        ) : (
+          <span>{state.title}</span>
+        )}
         <button className="link" onClick={onClose} aria-label="Close">✕</button>
       </div>
-      {actions.length > 0 ? (
+
+      {view === 'menu' ? (
         <div className="inspector-actions">
           {actions.map((a) => (
             <button
@@ -463,21 +596,31 @@ function RecordInspector({ state, onClose }) {
               {a.label}
             </button>
           ))}
+          <button
+            className="inspector-action"
+            onClick={() => setView('info')}
+            title="Show every field of this record"
+          >
+            Information
+          </button>
         </div>
-      ) : null}
-      <table className="inspector-table">
-        <tbody>
-          {entries.length === 0
-            ? <tr><td className="dim">No fields.</td></tr>
-            : entries.map(([k, v]) => (
-              <tr key={k}>
-                <th scope="row">{k}</th>
-                <td className="mono">{v}</td>
-              </tr>
-            ))}
-        </tbody>
-      </table>
-      <div className="inspector-hint">Esc or click outside to close</div>
+      ) : (
+        <table className="inspector-table">
+          <tbody>
+            {entries.length === 0
+              ? <tr><td className="dim">No fields.</td></tr>
+              : entries.map(([k, v]) => (
+                <tr key={k}>
+                  <th scope="row">{k}</th>
+                  <td className="mono">{v}</td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+      )}
+      <div className="inspector-hint">
+        {view === 'info' ? 'Esc or click outside to close' : 'Right-click action for this row'}
+      </div>
     </div>
   );
 }
@@ -563,6 +706,20 @@ function App() {
   const frozenRef = useRef(null);
   const [inspector, setInspector] = useState(null);
 
+  // Column widths are per table and persisted, so an operator tunes the layout
+  // once. Each table owns its own state: sizing the alert table must not move
+  // the live table's columns.
+  const {
+    widths: alertWidths,
+    beginResize: beginAlertResize,
+    reset: resetAlertWidths,
+  } = useColumnWidths('alerts');
+  const {
+    widths: eventWidths,
+    beginResize: beginEventResize,
+    reset: resetEventWidths,
+  } = useColumnWidths('events');
+
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
   if (!paused) frozenRef.current = events;
@@ -635,23 +792,44 @@ function App() {
       </header>
 
       <section>
-        <h2>Open alerts <span className="dim">({sortedAlerts.length})</span></h2>
-        <p className="hint dim">Right-click a row to acknowledge it or see every field.</p>
+        <h2>
+          Open alerts <span className="dim">({sortedAlerts.length})</span>
+          <button
+            className="link colreset"
+            onClick={resetAlertWidths}
+            title="Restore the default column widths"
+          >
+            reset columns
+          </button>
+        </h2>
+        <p className="hint dim">Right-click a row for Acknowledge or Information. Drag a column edge to widen it.</p>
         {sortedAlerts.length === 0
           ? <p className="dim">No open alerts.</p>
           : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>First occurrence</th>
-                  <th>Last occurrence</th>
-                  <th>Count</th>
-                  <th>Summary</th>
-                  <th>Ack</th>
-                  <th>Key</th>
-                </tr>
-              </thead>
+            <div className="tablewrap">
+              <table>
+                <colgroup>
+                  {ALERT_COLS.map((c, i) => (
+                    <col
+                      key={c}
+                      style={alertWidths[i] ? { width: `${alertWidths[i]}px` } : undefined}
+                    />
+                  ))}
+                </colgroup>
+                <thead>
+                  <tr>
+                    {ALERT_COLS.map((label, i) => (
+                      <ResizableTh
+                        key={label}
+                        index={i}
+                        width={alertWidths[i]}
+                        onBegin={beginAlertResize}
+                      >
+                        {label}
+                      </ResizableTh>
+                    ))}
+                  </tr>
+                </thead>
               <tbody>
                 {sortedAlerts.map((a) => {
                   const ack = acks.get(a.key);
@@ -677,7 +855,8 @@ function App() {
                   );
                 })}
               </tbody>
-            </table>
+              </table>
+            </div>
           )}
       </section>
       </main>
@@ -713,17 +892,34 @@ function App() {
           {shownEvents.length === 0
             ? <p className="dim">Nothing yet.</p>
             : (
-              <table>
-                <thead>
-                  <tr>
-                    <th>Severity</th>
-                    <th>First occurrence</th>
-                    <th>Last occurrence</th>
-                    <th>Count</th>
-                    <th>Summary</th>
-                    {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
-                  </tr>
-                </thead>
+              <div className="tablewrap">
+                <table>
+                  <colgroup>
+                    {EVENT_COLS.map((c, i) => (
+                      <col
+                        key={c}
+                        style={eventWidths[i] ? { width: `${eventWidths[i]}px` } : undefined}
+                      />
+                    ))}
+                    {ENRICHED_FIELDS.map((f) => (
+                      <col key={f.key} />
+                    ))}
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      {EVENT_COLS.map((label, i) => (
+                        <ResizableTh
+                          key={label}
+                          index={i}
+                          width={eventWidths[i]}
+                          onBegin={beginEventResize}
+                        >
+                          {label}
+                        </ResizableTh>
+                      ))}
+                      {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                    </tr>
+                  </thead>
                 <tbody>
                   {[...shownEvents].reverse().map((e) => {
                     // An event row can also start an ack: the alert it belongs
@@ -753,7 +949,8 @@ function App() {
                     );
                   })}
                 </tbody>
-              </table>
+                </table>
+              </div>
             )}
         </div>
       </section>

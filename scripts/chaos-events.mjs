@@ -10,18 +10,23 @@
  *
  * What it is actually testing
  * ---------------------------
- * The alert fold (k8s/base/20-alert-fold-config.yaml) rolls repeats up inside
- * FW_ALERT_DEDUP_WINDOW (5 min by default) instead of creating new occurrences:
+ * Dedup is the fold's (timestamp, id) watermark: a redelivered event returns 0
+ * and is dropped, so it changes neither `count` nor `last_seen`.
  *
- *   applied = 1  new occurrence        -> count += 1
- *   applied = 2  coalesced             -> count unchanged, last_seen moves
+ *   applied = 0  duplicate / stale     -> dropped, nothing changes
+ *   applied = 1  applied               -> count += 1, last_seen moves
  *   applied = 3  closed                -> alert retired
  *
- * So a genuine duplicate is invisible in `count` and visible only as a moving
- * `last_seen`. That is the property this script exercises: phase 1 sends exact
- * copies of some events, and phase 2 sends exact copies of some CLOSE events. If
- * dedup works, the alert count never exceeds N and no alert re-opens after being
- * closed.
+ * This script sends exact COPIES of some events: same id, same source, same
+ * type, but each copy gets a NEW broker timestamp (it is a new message). Those
+ * are therefore NOT duplicates by the fold's definition — they are distinct
+ * events and will be counted. That is the point of the exercise: a duplicate is
+ * identified by event id, not by "it looks the same as the last one", so a
+ * producer that re-sends the same payload under fresh ids is counted N times.
+ *
+ * To exercise the real dedup path, `--same-id` is provided: it re-sends copies
+ * with the ORIGINAL id, which the fold cannot tell from a redelivery, and those
+ * must be dropped.
  *
  * Two design constraints worth knowing before editing this file
  * ------------------------------------------------------------
@@ -81,6 +86,9 @@ const DEFAULTS = {
   token: process.env.FW_INGEST_TOKEN || '',
   seed: null,
   dryRun: false,
+  // When false (default) re-sent copies get a fresh id and are therefore counted
+  // as distinct events. --same-id keeps the original id so the fold drops them.
+  sameId: false,
 };
 
 /** Minimal .env reader. Only used to pick up FW_INGEST_TOKEN. */
@@ -202,6 +210,7 @@ function parseArgs(argv) {
       case '--token': cfg.token = next(); break;
       case '--seed': cfg.seed = Number(next()); break;
       case '--dry-run': cfg.dryRun = true; break;
+      case '--same-id': cfg.sameId = true; break;
       case '-h':
       case '--help': usage(); process.exit(0); break;
       default: fail(`unknown argument: ${a}`);
@@ -225,6 +234,9 @@ function usage() {
     '  --url URL             ingest endpoint (default $INGEST_URL or http://localhost:30900/events)\n' +
     '  --token T             ingest token (default $FW_INGEST_TOKEN)\n' +
     '  --seed N              reproduce a previous run exactly\n' +
+    '  --same-id             re-sent copies keep the original id, so the fold\n' +
+    '                        DROPS them (Count does not move). Without it the\n' +
+    '                        copies are new events and ARE counted.\n' +
     '  --dry-run             build and print, send nothing\n\n' +
     'Default behaviour is interactive: after phase 1 is ingested the script waits\n' +
     'for any keypress, so you can inspect the board before the CLOSE storm.\n',
@@ -267,30 +279,40 @@ function buildOpenEvents(cfg, random) {
 }
 
 /**
- * Pick a fraction of the opening events and re-send them verbatim, but label the
- * Summary so a human can tell an intentional duplicate from an accident.
+ * Pick a fraction of the opening events and re-send them, labelled so a human
+ * can tell an intentional copy from an accident.
  *
- * The duplicate keeps the SAME id, source and type. That is the whole point: it
- * must land on the same alert key so the fold can coalesce it.
+ * What makes a copy a DUPLICATE depends on `--same-id`:
+ *
+ *   default      the copy gets a fresh id. It is a distinct event with the same
+ *                payload, so the fold counts it: Count and Last occurrence both
+ *                move. This is the realistic case — a producer re-reporting the
+ *                same condition — and it is why `count` grows during a storm.
+ *   --same-id    the copy keeps the original id. The fold cannot tell it from a
+ *                redelivery, so it returns 0 and drops it: Count and Last
+ *                occurrence do not move. This is the path that proves dedup.
  */
 function buildOpenDuplicates(events, cfg, random) {
   const picks = [];
   for (const evt of events) {
     if (random() < cfg.duplicates) picks.push(evt);
   }
-  // Guarantee at least one duplicate in a non-empty run, otherwise the drill
+  // Guarantee at least one copy in a non-empty run, otherwise the drill
   // silently stops testing the thing it exists to test.
   if (events.length > 0 && picks.length === 0) {
     picks.push(events[Math.floor(random() * events.length)]);
   }
-  return picks.map((evt) => ({
+  return picks.map((evt, i) => ({
     ...evt,
+    // A fresh id makes this a NEW event carrying the same payload; keeping the
+    // id makes it a genuine duplicate the fold must drop.
+    id: cfg.sameId ? evt.id : `${evt.id}-copy${i + 1}`,
     payload: {
       ...evt.payload,
-      // Written into Summary so it shows up in the UI, as requested.
-      msg: `[DUPLICATE of ${evt.id}] ${evt.payload.msg}`,
-      duplicate_of: evt.id,
-      drill: 'open-duplicate',
+      // Written into Summary so it shows up in the UI.
+      msg: `[COPY of ${evt.id}] ${evt.payload.msg}`,
+      copy_of: evt.id,
+      drill: cfg.sameId ? 'open-duplicate-same-id' : 'open-copy-new-id',
     },
   }));
 }
@@ -519,7 +541,10 @@ async function main() {
     `\n${'-'.repeat(70)}\n` +
     `expected final state\n` +
     `  alerts opened      ${openEvents.length}\n` +
-    `  duplicate opens    ${openDupes.length}  (coalesced: applied=2, Count unchanged)\n` +
+    `  copies of opens    ${openDupes.length}  ` +
+      (cfg.sameId
+        ? '(same id: dropped by the fold, Count unchanged)\n'
+        : '(new id: counted as distinct events, Count moves)\n') +
     `  alerts closed      ${closeEvents.length}\n` +
     `  repeated closes    ${closeDupes.length}\n` +
     `  fully closed total ${openEvents.length}\n` +

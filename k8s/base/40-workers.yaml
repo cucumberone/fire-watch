@@ -76,6 +76,9 @@ spec:
             # ---- behaviour ----------------------------------------------
             - { name: FW_EVENT_TTL,            value: "604800" }
             - { name: FW_INDEX_PRUNE_EVERY,    value: "1000" }
+            # Kept for wire compatibility only: the coalescing window was removed,
+            # so this value no longer changes how events are counted. A redelivered
+            # event is dropped by the fold's (timestamp, id) watermark instead.
             - { name: FW_ALERT_DEDUP_WINDOW,   value: "300000" }
             - { name: FW_COMPRESS_MIN,         value: "1024" }
             - { name: FW_COMPRESS_LEVEL,       value: "6" }

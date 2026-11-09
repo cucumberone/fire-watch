@@ -112,7 +112,7 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 | `severity` | severity of the last applied event |
 | `first_seen` | broker ts of the first event in the **current open episode** |
 | `last_seen` | broker ts of the **most recent** applied event — this is the "last occurrence" |
-| `count` | occurrences in the current episode, after coalescing (§5.4) |
+| `count` | events applied in the current episode — every applied event counts; duplicates never get here (they are dropped by the watermark, §5.4) |
 | `acked_by` | operator label who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
 | `last_id` | event id of the most recent applied event |
 | `closed_by`, `closed_at` | the CLOSE/HARMLESS that retired the episode |
@@ -182,12 +182,58 @@ Return values — these become the `applied` field on the wire:
 
 | Code | Meaning | UI action |
 |---|---|---|
-| `0` | stale, dropped from the fold | show as history only, change nothing |
-| `1` | applied, **new occurrence** | update alert, bump `count`, set `last_seen` |
-| `2` | applied, **coalesced into the current occurrence** | update `last_seen` only, do not bump `count` |
+| `0` | **duplicate or stale — dropped** | change nothing |
+| `1` | applied | bump `count`, set `last_seen` |
 | `3` | applied, alert **closed** | remove the alert |
+| ~~`2`~~ | *retired*: was "coalesced". Clients still accept it as an alias for `1` during a rolling update | treat as `1` |
 
 Because the script is atomic, two workers racing on the same key converge on the higher `(timestamp, id)` pair regardless of which one arrives first. **That is what makes the design safe under redelivery, failover and multi-consumer reordering simultaneously.**
+
+#### Duplicates are dropped by event id; everything else is counted
+
+There is exactly one dedup rule: **an event is identified by its `id`**. The
+worker gates on the event record with `SET fw:evt:{id} ... NX`, so the second
+delivery of an id is dropped before it can touch the fold, the index, the stored
+record or the live stream:
+
+```
+first delivery  -> applied=1   count 1
+same id again   -> duplicate   count 1  (dropped, Last unchanged)
+new id, same key-> applied=1   count 2  (Last moves)
+```
+
+Everything that gets past that gate is a distinct event, so:
+
+- **`count` increments** — it is an event counter, and it matches what arrives.
+- **`last_seen` always moves**, so *Last occurrence* is literally "when the most
+  recent event arrived".
+- **The duplicate is dropped entirely** — no fold, no audit copy (the first
+  delivery already wrote one), no live frame. It is still ACKed: requeueing a
+  message that can never succeed would loop forever.
+
+#### Why the timestamp watermark alone was not enough
+
+The fold's `(timestamp, id)` watermark compares against `last_seen`, which is the
+**broker** arrival time. It catches a RabbitMQ redelivery, because the redelivered
+message is the same message and keeps its original timestamp. It does **not**
+catch a producer that re-sends an id, or two POSTs of the same id: each delivery
+is a new message with a new timestamp, so the repeat always looks newer and was
+counted every time. That is why a duplicate storm inflated `count` instead of
+being suppressed, and why the gate had to move to the event record.
+
+The watermark still matters for ordering — it is what stops an old `CLOSE` from
+retiring a newer `CRITICAL` — but identity comes from `id`.
+
+**Two rejected designs, and why.**
+
+1. *Coalesce repeats inside a 5-minute window* — `count` stayed at 1 during a
+   storm, indistinguishable from a broken counter.
+2. *Count everything but label repeats with a `+N` badge* — once `count` counts
+   every event and *Last occurrence* moves, the badge told the operator nothing
+   and implied a suppression that did not exist.
+
+Both were attempts to model "same condition still firing" from arrival times. That
+question needs a source-side occurrence id, not a clock.
 
 ### 5.3 Tie-break within the same millisecond
 
@@ -211,9 +257,15 @@ These are unrelated mechanisms and the design has both. Conflating them is the u
 
 #### Transport dedup (already implemented)
 
-- `SET fw:evt:{id}` — a redelivered event overwrites itself with identical bytes.
+- `SET fw:evt:{id} ... NX` — **the gate**. The second delivery of an id is
+  rejected by the store itself, so it never reaches the fold, the index or the
+  live stream. This is what makes a duplicate cheap: one command, nothing else
+  runs.
 - `ZADD fw:idx:src:{s}` — a repeated member only updates its score.
-- The watermark — a redelivered event older than the fold's watermark returns `0`.
+- The watermark — a redelivered event older than the fold's watermark returns
+  `0`. Still needed for ordering (an old `CLOSE` must not retire a newer
+  `CRITICAL`), but it cannot replace the `NX` gate: every broker delivery carries
+  a fresh timestamp, so a re-sent id always looks newer.
 - Gateway LRU — a repeated `PUBLISH` is dropped before it reaches the browser.
 
 #### Semantic dedup: coalescing repeated occurrences
@@ -331,7 +383,7 @@ All five are implemented. The first two are "dedup" in the usual sense; the last
 |---|---|
 | `0` | history only — do **not** touch alert state or counts |
 | `1` | new occurrence — update the alert row, increment `count`, refresh `last_seen` |
-| `2` | coalesced — refresh `last_seen` only; **do not** increment `count` and do not animate an entry |
+| `2` | retired — was "coalesced". Clients treat it as `1` so a gateway on the previous build cannot freeze a row mid-rollout |e an entry |
 | `3` | closed — remove the alert row |
 
 A UI that ignores `applied` will show alerts closing and immediately reopening (stale CLOSE, §4) and will show a permanently-firing alert with a count that increments 1 000 times a minute (§5.4). Both are fixed by honouring the code.

@@ -61,11 +61,29 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   const ttlSec = cfg.eventTtl;
 
   // Serialize once. The record keeps the envelope plain and only the payload
-  // fields compressed (payload-and-compression.md §4).
-  const record = JSON.stringify({ ...evt, payload: storedPayload });
+  // fields compressed (payload-and-compression.md §4). brokerTs is stored so a
+  // client that loads this record later can show when the event actually
+  // arrived, not just the producer's own `ts`.
+  const record = JSON.stringify({ ...evt, payload: storedPayload, brokerTs });
 
-  // ---------------------------------------------------------------- 1. record
-  await dfl.write((c) => c.set(keys.event(evt.id), record, 'EX', ttlSec));
+  // -------------------------------------------------- 1. record (duplicate gate)
+  //
+  // NX makes the SET itself the dedup test. A duplicate is identified by EVENT
+  // ID, not by "it looks like the last one": two events with the same id are the
+  // same event, whether they arrived as a RabbitMQ redelivery or as two POSTs
+  // from an over-eager producer.
+  //
+  // The previous design relied only on the fold's (timestamp, id) watermark,
+  // which cannot catch this case — every broker delivery carries a fresh
+  // timestamp, so a re-sent id always looked newer and was counted again. That
+  // is why a duplicate storm inflated `count` instead of being dropped.
+  //
+  // Returns null when the key already existed: the caller must NOT fold, count,
+  // publish or re-index it.
+  const created = await dfl.write((c) => c.set(keys.event(evt.id), record, 'EX', ttlSec, 'NX'));
+  if (created === null) {
+    return { applied: 0, duplicate: true, alertKey: key };
+  }
 
   // ----------------------------------------------------------------- 2. index
   // Score is the BROKER timestamp, not the producer ts: a redelivered event

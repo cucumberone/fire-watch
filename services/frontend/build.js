@@ -90,7 +90,7 @@ const css = `
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
        background:var(--bg); color:var(--fg); }
-main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+main { max-width: none; margin: 0 auto; padding: 1.5rem; }
 /* The drawer is in the flow, so no bottom padding is needed to clear it. */
 h1 { font-size:1.25rem; margin:0; }
 h2 { font-size:1rem; margin:2rem 0 .5rem; font-weight:600; }
@@ -120,7 +120,39 @@ header { display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
 table { width:100%; border-collapse:collapse; font-size:.85rem; }
 th { text-align:left; font-weight:600; color:var(--dim); border-bottom:1px solid var(--line);
      padding:.4rem .5rem; position:sticky; top:0; z-index:2; background:var(--bg); }
-td { padding:.4rem .5rem; border-bottom:1px solid var(--line); vertical-align:top; }
+
+/* NO CELL EVER WRAPS.
+   A wrapped value corrupts the value: "CIF-\n7730" is unreadable, and a time
+   split across two lines is worse than a scrollbar. The trade-off is accepted
+   deliberately — a narrow viewport scrolls horizontally, and the full text of
+   any record is available from the right-click Information panel rather than by
+   reflowing it in place. */
+td { padding:.4rem .5rem; border-bottom:1px solid var(--line); vertical-align:top;
+     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* Headers may still wrap: a wrapped header costs one line, a wrapped value
+   corrupts the value. */
+th { white-space:normal; }
+
+/* Horizontal scrolling for a table whose columns are wider than the viewport.
+   min-width:100% keeps the table filling the pane when the columns are narrow,
+   and the overflow only appears once they are not. */
+.tablewrap { overflow-x:auto; max-width:100%; }
+.tablewrap > table { table-layout:fixed; min-width:100%; }
+
+/* Column resize handle. A real element, not a pseudo-element, because it needs
+   its own hit area and cursor. Sits over the right edge of the header cell so
+   the pointer target is 7px wide however narrow the column is. */
+th { position:sticky; }
+.colresize { position:absolute; top:0; right:-3px; width:7px; height:100%;
+             cursor:col-resize; user-select:none; z-index:3; }
+.colresize::after { content:''; position:absolute; top:20%; bottom:20%; left:3px;
+                    width:1px; background:var(--line); }
+.colresize:hover::after, body.resizing .colresize::after { background:var(--accent); width:2px; }
+/* While dragging, the cursor must stay col-resize even over cells, and text
+   selection must be suppressed or the drag selects the whole table. */
+body.resizing { cursor:col-resize; user-select:none; }
+body.resizing * { cursor:col-resize !important; }
+.colreset { margin-left:.75rem; font-size:.75rem; font-weight:400; }
 /* main scrolls, so a sticky header sits over the row that was scrolled to the
    top. Without this, scrolling a row into view (keyboard focus, anchor jump)
    lands it underneath the header where it cannot be clicked. */
@@ -185,8 +217,19 @@ main.color-rows td .dim { color:inherit; opacity:.7; }
    layout height, so it cannot cover main at any scroll position, at any window
    size. */
 html, body, #root { height:100%; }
-#root { display:flex; flex-direction:column; overflow:hidden; }
-main { flex:1 1 auto; min-height:0; overflow-y:auto;
+/* align-items:stretch is the default, but it is stated here because the whole
+   two-table layout depends on it: main and the drawer are siblings in this flex
+   column and must have the same width. Without it a shrink-to-fit main ended up
+   narrower than the drawer and the two tables stopped lining up. */
+#root { display:flex; flex-direction:column; align-items:stretch; overflow:hidden; }
+/* width:100% because a flex item in a column does not stretch horizontally on
+   its own once max-width stops capping it; it shrink-to-fits its content. */
+main { flex:1 1 auto; width:100%; min-height:0; overflow-y:auto;
+       /* main scrolls and the drawer body may not, so without a reserved gutter
+          the two tables end up 12px apart — main's content box is narrower by
+          exactly one scrollbar. Reserving it on both keeps the columns aligned
+          whether or not a scrollbar is currently shown. */
+       scrollbar-gutter: stable;
        /* Inset shadow, so it is painted against the scroll container's edge and
           does NOT scroll with the content. It marks the bottom edge as a
           scroll boundary, so a partially visible row reads as "more below"
@@ -195,7 +238,12 @@ main { flex:1 1 auto; min-height:0; overflow-y:auto;
 .drawer { flex:0 0 auto; position:static;
           background:var(--bg); border-top:1px solid var(--line);
           box-shadow: 0 -2px 8px rgba(0,0,0,.12);
-          max-width:1200px; width:100%; margin:0 auto; }
+          /* No max-width, deliberately. This used to be capped at 1200px to
+             match main, which wasted every pixel past 1200 and forced the
+             ten-column live-events table to wrap or clip. Both the drawer and
+             main now fill the viewport, so the two tables are the same width and
+             the wide table actually gets the room it needs. */
+          width:100%; margin:0 auto; }
 .drawer-handle { display:flex; align-items:center; gap:.5rem; width:100%;
                  background:none; border:0; color:var(--fg); cursor:pointer;
                  font:inherit; font-size:.85rem; font-weight:600;
@@ -203,17 +251,13 @@ main { flex:1 1 auto; min-height:0; overflow-y:auto;
 .drawer-handle:hover { background:var(--pre-bg); }
 .drawer-handle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
 .drawer-chevron { font-size:.7rem; color:var(--dim); width:.75rem; }
-.drawer-body { max-height:38vh; overflow:auto; padding:0 1.5rem 1rem; }
+.drawer-body { max-height:38vh; overflow:auto; padding:0 1.5rem 1rem;
+               /* Matches main's gutter so both tables line up exactly. */
+               scrollbar-gutter: stable; }
 /* Keep the sticky header from floating over the drawer edge. */
 .drawer-body th { top:0; }
-/* Ten columns at 1200px is tight, so identifier and time cells must not break
-   mid-token: "CIF-\n7730" is unreadable. The table scrolls horizontally
-   instead, which keeps every value on one line. The Summary cell still wraps,
-   because prose benefits from it, and it is width-capped so a long message
-   cannot inflate the table and force a scrollbar on an otherwise wide window. */
-.drawer-body td.mono { white-space:nowrap; }
-.drawer-body th { white-space:normal; }      /* headers may wrap; values may not */
-.drawer-body td.summary { min-width:12rem; max-width:26rem; }
+/* The live table is inside .tablewrap now, so the old per-column caps are gone:
+   widths are user-controlled and nothing wraps (see the table rules above). */
 
 /* Acknowledgement. Acked rows stay visible — silencing an alert is not the
    same as resolving it, and hiding it would let real trouble disappear. The row
@@ -258,6 +302,11 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
                   padding:.45rem .6rem; border-bottom:1px solid var(--line);
                   font-weight:600; }
 .inspector-head .link { margin-left:auto; text-decoration:none; font-size:.85rem; }
+/* The back link replaces the title in the Information view, so it must NOT be
+   pushed to the right with the close button. */
+.inspector-head .inspector-back { margin-left:0; margin-right:auto;
+                                  text-decoration:none; font-size:.85rem;
+                                  overflow:hidden; text-overflow:ellipsis; }
 .inspector-table { width:100%; border-collapse:collapse; }
 .inspector-table th { text-align:left; font-weight:600; color:var(--dim);
                       padding:.25rem .6rem; width:42%; vertical-align:top;

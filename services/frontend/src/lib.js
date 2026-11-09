@@ -260,8 +260,32 @@ export function recordEntries(record) {
 }
 
 /** Epoch ms → locale clock time, or '' when the value is not a usable time. */
+/**
+ * Format an epoch-ms value as `YYYY-MM-DD HH:MM:SS`, 24-hour.
+ *
+ * Deliberately hand-rolled rather than `toLocaleTimeString()`:
+ *
+ * - `toLocale*` output depends on the browser's locale and OS settings, so two
+ *   operators looking at the same alert could see different strings, and the
+ *   same page could render differently after a locale change. An operations
+ *   board needs one unambiguous format.
+ * - The 12-hour clock lost the AM/PM distinction off the edge of a narrow
+ *   column, which made 01:05 and 13:05 look identical.
+ * - The date was missing entirely, so events from yesterday were
+ *   indistinguishable from today's.
+ *
+ * Local time, not UTC: an operator correlates against the wall clock in front of
+ * them. The inspector shows the raw ISO/epoch values for anyone who needs UTC.
+ */
 export function formatClock(ms) {
-  return Number.isFinite(ms) ? new Date(ms).toLocaleTimeString() : '';
+  if (!Number.isFinite(ms)) return '';
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  );
 }
 
 /** Severity ranking for sorting and display. Retirement events rank last. */
@@ -301,13 +325,19 @@ export function severityRowClass(severity, extra) {
 export function applyAlert(map, { key, applied, event }) {
   const next = new Map(map);
   if (applied === 0 || applied === null || applied === undefined) {
-    return next;                       // stale or backfill: no state change
+    // Stale, backfill, or a DUPLICATE the fold dropped. Duplicates are removed
+    // server-side by the (timestamp, id) watermark, so they never reach the
+    // counter and must not touch the row here either.
+    return next;
   }
   if (applied === 3) {
     next.delete(key);
     return next;
   }
-  if (applied === 1) {
+  if (applied === 1 || applied === 2) {
+    // 2 is accepted as an alias for 1 so a gateway still running the previous
+    // build (which emitted 2 for a coalesced repeat) cannot freeze a row during
+    // a rolling update. Both now mean the same thing: the event was applied.
     const prev = next.get(key);
     next.set(key, {
       key,
@@ -319,20 +349,6 @@ export function applyAlert(map, { key, applied, event }) {
       // an alert row must show the enriched fields of the occurrence that put
       // the row there, not a synthetic merge of every event ever folded in.
       event: event ?? prev?.event,
-    });
-    return next;
-  }
-  if (applied === 2) {
-    const prev = next.get(key);
-    if (!prev) return next;            // coalescing with no local state: ignore
-    // The fold overwrites `severity` on every applied event, coalesced or not
-    // (alert-fold.lua HSETs severity unconditionally). Mirror that here, or an
-    // escalation WARNING -> CRITICAL would not show up.
-    next.set(key, {
-      ...prev,
-      severity: event?.severity ?? prev.severity,
-      lastSeen: event?.brokerTs ?? prev.lastSeen,
-      event: event ?? prev.event,
     });
     return next;
   }

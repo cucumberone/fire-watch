@@ -120,12 +120,42 @@ test('applied=1 creates and then increments an alert', () => {
   assert.equal(map.get('a:t').firstSeen, 1000);
 });
 
-test('applied=2 moves lastSeen without incrementing count', () => {
+test('applied=2 moves lastSeen and DOES increment count', () => {
+  // 2 is kept as an alias for 1 so a gateway on the previous build cannot freeze
+  // a row mid-rollout. Both mean "applied"; duplicates never reach this branch
+  // because the fold drops them and returns 0.
   let map = new Map([['a:t', { key: 'a:t', severity: 'WARNING', count: 5, firstSeen: 1, lastSeen: 100 }]]);
   map = applyAlert(map, { key: 'a:t', applied: 2, event: { severity: 'CRITICAL', brokerTs: 900 } });
-  assert.equal(map.get('a:t').count, 5, 'coalescing must not increment');
-  assert.equal(map.get('a:t').lastSeen, 900);
+  assert.equal(map.get('a:t').count, 6, 'an applied event is counted');
+  assert.equal(map.get('a:t').lastSeen, 900, 'last occurrence always moves');
   assert.equal(map.get('a:t').severity, 'CRITICAL', 'severity escalation is still shown');
+});
+
+// --------------------------------------------------- duplicate handling (drop)
+// A true duplicate never reaches the client: the fold's (timestamp, id)
+// watermark returns 0 for it, so there is no "coalesced" concept and no "+N"
+// marker. Count counts events; Last occurrence is the newest event's arrival.
+test('applied=0 (a dropped duplicate) changes nothing at all', () => {
+  const before = { key: 'a:t', severity: 'CRITICAL', count: 4, firstSeen: 1, lastSeen: 500 };
+  const map = applyAlert(new Map([['a:t', before]]), {
+    key: 'a:t',
+    applied: 0,
+    event: { severity: 'CLOSE', brokerTs: 999 },
+  });
+  const after = map.get('a:t');
+  assert.equal(after.count, 4, 'a duplicate must not increment count');
+  assert.equal(after.lastSeen, 500, 'a duplicate must not move last occurrence');
+  assert.equal(after.severity, 'CRITICAL', 'a duplicate must not change severity');
+});
+
+test('every counted event advances last occurrence', () => {
+  let map = new Map();
+  map = applyAlert(map, { key: 'a:t', applied: 1, event: { severity: 'WARNING', brokerTs: 1000 } });
+  map = applyAlert(map, { key: 'a:t', applied: 1, event: { severity: 'WARNING', brokerTs: 2000 } });
+  map = applyAlert(map, { key: 'a:t', applied: 1, event: { severity: 'WARNING', brokerTs: 3000 } });
+  assert.equal(map.get('a:t').count, 3);
+  assert.equal(map.get('a:t').firstSeen, 1000, 'first occurrence never moves');
+  assert.equal(map.get('a:t').lastSeen, 3000, 'last occurrence tracks the newest event');
 });
 
 test('applied=3 removes the alert', () => {
@@ -421,8 +451,31 @@ test('recordEntries survives a circular reference', () => {
 });
 
 // ---------------------------------------------------------------- formatClock
+// The format is fixed at YYYY-MM-DD HH:MM:SS in 24-hour LOCAL time. It is
+// hand-rolled rather than locale-based so every operator sees the same string,
+// and so a 12-hour clock cannot hide the AM/PM distinction off the edge of a
+// narrow column.
 test('formatClock returns empty for unusable times', () => {
   assert.equal(formatClock(undefined), '');
   assert.equal(formatClock(NaN), '');
-  assert.deepEqual(recordEntries(undefined), []);
+  assert.equal(formatClock(null), '');
+  assert.equal(formatClock('not a number'), '');
+});
+
+test('formatClock renders YYYY-MM-DD HH:MM:SS', () => {
+  // Built from local components so the assertion is timezone-independent.
+  const d = new Date(2026, 10, 9, 13, 5, 7); // 9 Nov 2026, 13:05:07 local
+  assert.equal(formatClock(d.getTime()), '2026-11-09 13:05:07');
+});
+
+test('formatClock is 24-hour, so 1pm is 13 not 01', () => {
+  const am = new Date(2026, 0, 2, 1, 4, 9);
+  const pm = new Date(2026, 0, 2, 13, 4, 9);
+  assert.equal(formatClock(am.getTime()), '2026-01-02 01:04:09');
+  assert.equal(formatClock(pm.getTime()), '2026-01-02 13:04:09');
+});
+
+test('formatClock zero-pads every component', () => {
+  const d = new Date(2026, 0, 2, 3, 4, 5);
+  assert.equal(formatClock(d.getTime()), '2026-01-02 03:04:05');
 });

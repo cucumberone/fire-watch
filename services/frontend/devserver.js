@@ -178,6 +178,15 @@ wss.on('connection', async (ws) => {
       await new Promise((r) => setTimeout(r, 20));
     }
 
+    // A redelivery, to show the dedup path: the same event id twice. The real
+    // fold drops the second one (returns 0) because the (timestamp, id)
+    // watermark already saw it, so it must not change Count or Last occurrence.
+    {
+      const dup = mkEvent(0, { id: 'a1-0', source: 'core-sw-07', type: 'link.down', severity: 'FATAL' });
+      ws.send(JSON.stringify({ op: 'event', event: { ...dup, brokerTs: Date.now() }, applied: 0 }));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
     // Live tail. Semantics mirror the real fold: applied:1 opens/increments an
     // alert, applied:2 coalesces into an existing one, applied:3 retires it.
     // Retirement severities (CLOSE, HARMLESS) only ever produce applied:3.
@@ -191,7 +200,12 @@ wss.on('connection', async (ws) => {
       let source = 'edge-gw-02';
       let type = 'link.flap';
 
-      if (phase === 2) { applied = 2; severity = 'CRITICAL'; }      // coalesce
+      // Every other tick escalates the severity so a live CRITICAL is visible,
+      // and one tick per cycle is a dropped duplicate (applied 0) — exactly what
+      // the real fold returns for a redelivered event id, and proof that a
+      // duplicate does not touch Count or Last occurrence.
+      if (phase === 2) { severity = 'CRITICAL'; }
+      if (phase === 5) { applied = 0; }
       if (phase === 4) { applied = open ? 3 : 1; severity = open ? 'CLOSE' : 'CRITICAL'; open = !open; }
 
       const evt = mkEvent(n, {

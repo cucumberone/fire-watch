@@ -12,8 +12,14 @@ name: Deploy
 # Environment secrets.
 #
 # Per environment:
-#   Variables:  NAMESPACE  AMQP_HOST  AMQP_PORT  DFLY_MASTER_NAME  AMQP_USER
+#   Variables:  NAMESPACE  AMQP_USER
 #   Secrets:    AMQP_PASS  DRAGONFLY_PASSWORD  FW_INGEST_TOKEN  KUBECONFIG_B64
+#
+# Only these six are required. Hostnames and ports (AMQP_HOST, AMQP_PORT,
+# DFLY_MASTER_NAME) are NOT configuration here — they are literals in the
+# manifests, because they are in-cluster DNS names that never vary by
+# environment. Validating them here would make a deploy fail for a value no step
+# reads.
 #
 # AMQP_USER is a variable, not a secret: it is an account name, not a
 # credential. GitHub secrets cannot be read back after saving, which makes them
@@ -88,15 +94,15 @@ jobs:
       name: ${{ inputs.environment }}
       url: ${{ vars.DEPLOY_URL || '' }}
 
-    # Every value the run needs, declared once. Secrets cannot be referenced in
-    # an `if:` conditional, so they are surfaced as environment variables here
-    # and validated by name in the first step.
+    # Every value the run ACTUALLY consumes, declared once. Anything listed here
+    # is validated in the first step, so adding an entry that no step reads would
+    # turn into a hard requirement for no reason — which is exactly the bug this
+    # replaced: AMQP_HOST, AMQP_PORT and DFLY_MASTER_NAME were validated but
+    # never used, because those values live in the manifests (`k8s/base/40-workers.yaml`
+    # sets AMQP_HOST=rabbitmq directly), not in CI.
     env:
       # ---- environment variables (non-secret)
       NAMESPACE: ${{ vars.NAMESPACE }}
-      AMQP_HOST: ${{ vars.AMQP_HOST }}
-      AMQP_PORT: ${{ vars.AMQP_PORT }}
-      DFLY_MASTER_NAME: ${{ vars.DFLY_MASTER_NAME }}
       AMQP_USER: ${{ vars.AMQP_USER }}
       # ---- environment secrets
       AMQP_PASS: ${{ secrets.AMQP_PASS }}
@@ -119,7 +125,7 @@ jobs:
         run: |
           set -eu
           missing=0
-          for v in NAMESPACE AMQP_HOST AMQP_PORT DFLY_MASTER_NAME AMQP_USER; do
+          for v in NAMESPACE AMQP_USER; do
             if [ -z "${!v:-}" ]; then
               echo "::error::missing VARIABLE for environment '$TARGET_ENV': $v"
               missing=1

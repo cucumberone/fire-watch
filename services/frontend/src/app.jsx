@@ -39,6 +39,22 @@ const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 
 // user-resizable; ENRICHED_FIELDS is appended after them.
 const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary'];
 
+/**
+ * Default widths, in px, for every real column.
+ *
+ * Every column needs an explicit width, not just the ones the operator has
+ * dragged. With `table-layout: fixed` and `width: 100%`, an UNSIZED column is
+ * simply "whatever is left over" — so dragging one column grew it and silently
+ * shrank all the others (measured: they collapsed to 42px, below the 48px floor).
+ * Sizing them all makes a drag change exactly one column.
+ *
+ * A trailing spacer column soaks up any leftover space, so the table still fills
+ * the pane when the columns are narrower than it, and overflows (scrolls) when
+ * they are wider. Without the spacer, `width: 100%` redistributes again.
+ */
+const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
+const EVENT_DEFAULT_W = [96, 172, 172, 64, 340];
+
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
 // ABSENCE of a key, so a later OS change still takes effect.
@@ -134,52 +150,58 @@ function writeWidths(table, widths) {
  *
  * Implemented with `<colgroup>` and a per-column width rather than flexing the
  * table: the requirement is that a cell NEVER wraps, so the only sane layout is
- * fixed-width columns with horizontal overflow on the container. A `min-width`
- * is enforced so a drag cannot collapse a column into an invisible sliver from
- * which there is no way back.
+ * fixed-width columns with horizontal overflow on the container.
  *
- * Widths are applied as inline styles because the number is user-chosen; there is
- * no static class that can express "whatever they dragged to".
+ * `defaults` is required: see ALERT_DEFAULT_W for why every column must carry a
+ * width rather than only the dragged ones.
  */
 const MIN_COL_WIDTH = 48;
 
-function useColumnWidths(table) {
-  const [widths, setWidths] = useState(() => readWidths(table));
+function useColumnWidths(table, defaults) {
+  const [overrides, setOverrides] = useState(() => readWidths(table));
 
-  const beginResize = useCallback((index, startX, startWidth) => (event) => {
+  // Effective width for a column: the operator's value, else the default.
+  const widthOf = useCallback(
+    (index) => Math.max(MIN_COL_WIDTH, overrides[index] ?? defaults[index] ?? MIN_COL_WIDTH),
+    [overrides, defaults],
+  );
+
+  const beginResize = useCallback((index) => (event) => {
     event.preventDefault();
     event.stopPropagation();
-    const start = event.clientX ?? startX;
-    let latest = startWidth;
+    const startX = event.clientX;
+    const startWidth = widthOf(index);
 
-    // Listeners on the document, not the handle: the pointer leaves the 6px
+    // Listeners on the document, not the handle: the pointer leaves the 7px
     // handle almost immediately, and a handle-local listener would stop tracking.
     const onMove = (e) => {
-      latest = Math.max(MIN_COL_WIDTH, startWidth + (e.clientX - start));
-      setWidths((prev) => ({ ...prev, [index]: latest }));
+      const next = Math.max(MIN_COL_WIDTH, startWidth + (e.clientX - startX));
+      setOverrides((prev) => ({ ...prev, [index]: next }));
     };
     const onUp = () => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
       document.body.classList.remove('resizing');
-      setWidths((prev) => {
+      // Persist on drop, not per pixel: a drag is dozens of updates and
+      // localStorage is synchronous.
+      setOverrides((prev) => {
         writeWidths(table, prev);
         return prev;
       });
     };
 
-    // Suppresses text selection and the col-resize cursor while dragging.
+    // Suppresses text selection and holds the col-resize cursor while dragging.
     document.body.classList.add('resizing');
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [table]);
+  }, [table, widthOf]);
 
   const reset = useCallback(() => {
-    setWidths({});
+    setOverrides({});
     writeWidths(table, {});
   }, [table]);
 
-  return { widths, beginResize, reset };
+  return { widthOf, beginResize, reset };
 }
 
 /**
@@ -192,7 +214,7 @@ function useColumnWidths(table) {
  */
 function ResizableTh({ index, width, onBegin, children }) {
   return (
-    <th style={width ? { width: `${width}px`, minWidth: `${width}px` } : undefined}>
+    <th style={{ width: `${width}px`, minWidth: `${width}px` }}>
       {children}
       <span
         className="colresize"
@@ -646,6 +668,8 @@ function AlertRow({ alert, ack, onContextMenu }) {
           : <span className="dim">—</span>}
       </td>
       <td className="mono nowrap">{alert.key}</td>
+      {/* Spacer cell, matching the spacer column in the header. */}
+      <td />
     </tr>
   );
 }
@@ -679,10 +703,13 @@ function EventRow({ evt, onContextMenu }) {
         {ENRICHED_FIELDS.map((f) => (
           <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
         ))}
+        {/* Spacer cell, matching the spacer column in the header. */}
+        <td />
       </tr>
       {open && msgCompleteString ? (
         <tr className={rowClass}>
-          <td colSpan={5 + ENRICHED_FIELDS.length}>
+          {/* +1 for the spacer column, or the expanded row stops short. */}
+          <td colSpan={6 + ENRICHED_FIELDS.length}>
             <pre className="detail">{msgCompleteString}</pre>
           </td>
         </tr>
@@ -710,15 +737,15 @@ function App() {
   // once. Each table owns its own state: sizing the alert table must not move
   // the live table's columns.
   const {
-    widths: alertWidths,
+    widthOf: alertWidthOf,
     beginResize: beginAlertResize,
     reset: resetAlertWidths,
-  } = useColumnWidths('alerts');
+  } = useColumnWidths('alerts', ALERT_DEFAULT_W);
   const {
-    widths: eventWidths,
+    widthOf: eventWidthOf,
     beginResize: beginEventResize,
     reset: resetEventWidths,
-  } = useColumnWidths('events');
+  } = useColumnWidths('events', EVENT_DEFAULT_W);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -810,11 +837,11 @@ function App() {
               <table>
                 <colgroup>
                   {ALERT_COLS.map((c, i) => (
-                    <col
-                      key={c}
-                      style={alertWidths[i] ? { width: `${alertWidths[i]}px` } : undefined}
-                    />
+                    <col key={c} style={{ width: `${alertWidthOf(i)}px` }} />
                   ))}
+                  {/* Spacer: absorbs leftover width so the table still fills the
+                      pane, instead of stretching the real columns. */}
+                  <col />
                 </colgroup>
                 <thead>
                   <tr>
@@ -822,12 +849,14 @@ function App() {
                       <ResizableTh
                         key={label}
                         index={i}
-                        width={alertWidths[i]}
+                        width={alertWidthOf(i)}
                         onBegin={beginAlertResize}
                       >
                         {label}
                       </ResizableTh>
                     ))}
+                    {/* Spacer header, aligned with the spacer col. */}
+                    <th />
                   </tr>
                 </thead>
               <tbody>
@@ -896,14 +925,13 @@ function App() {
                 <table>
                   <colgroup>
                     {EVENT_COLS.map((c, i) => (
-                      <col
-                        key={c}
-                        style={eventWidths[i] ? { width: `${eventWidths[i]}px` } : undefined}
-                      />
+                      <col key={c} style={{ width: `${eventWidthOf(i)}px` }} />
                     ))}
                     {ENRICHED_FIELDS.map((f) => (
                       <col key={f.key} />
                     ))}
+                    {/* Spacer, same reasoning as the alert table. */}
+                    <col />
                   </colgroup>
                   <thead>
                     <tr>
@@ -911,13 +939,15 @@ function App() {
                         <ResizableTh
                           key={label}
                           index={i}
-                          width={eventWidths[i]}
+                          width={eventWidthOf(i)}
                           onBegin={beginEventResize}
                         >
                           {label}
                         </ResizableTh>
                       ))}
                       {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                      {/* Spacer header, aligned with the spacer col. */}
+                      <th />
                     </tr>
                   </thead>
                 <tbody>

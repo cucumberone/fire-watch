@@ -22,17 +22,36 @@ This repo sets up an event server.
 - **Probes:** if you see the need for readiness probes, create them and handle them.
 - **Dragonfly persistence:** use the AOF feature, but every hour refresh that file with a new one from what's left in Dragonfly. This is to make restart and reread fast.
 - **Redis Sentinels:** needed for the workers, I think.
-- **Sizing.**
+- **Sizing:** 1 000 events/min sustained (500/s storm peaks), 7-day retention — see [docs/sizing.md](docs/sizing.md), which shows this needs ~48 GiB per Dragonfly pod.
 
 ## Plan
 
 - Refine this spec and put the different components in their own `.md` files in the `docs` directory, then just link them in `AGENTS.md`.
 - Always update the relevant files under `docs` whenever changes are made.
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — components, data flow, message contract, failure matrix
+- [Fault Tolerance Audit](docs/fault-tolerance.md) — per-component H/A and split-brain verification, 9 defects found and fixed
+- [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, redelivery safety
+- [Payload & Compression](docs/payload-and-compression.md) — `msg` / `msgc`, gzip at the worker, `DecompressionStream` in the browser
+- [RabbitMQ](docs/rabbitmq.md) — 3-node quorum cluster, peer discovery, anti-affinity, probes
+- [DragonflyDB](docs/dragonfly.md) — master + 2 replicas, write guard, snapshots, sizing
+- [Redis Sentinel](docs/redis-sentinel.md) — failover, `sentinel-bridge`, split-brain walkthrough
+- [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
+- [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
+- [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, HPA
+- [Frontend](docs/frontend.md) — static React app, two Routes, CSP
+- [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
+- [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay
+- [Sizing](docs/sizing.md) — capacity model and resource totals
+- [Validation](docs/validation.md) — failure drills and acceptance gate
+- [Roadmap](docs/roadmap.md) — phases, manifest inventory, open decisions, deviations
+
 ## Guidelines
 
-- Never commit or push until I say so.
-- Keep the returning information at a minimum.
+- **commits** Never commit or push until I say so.
+- **Security:** Always add any sensitve files like keys secrets etc into .gitignore
 
 ## Agent Directives & Behavior
 
@@ -47,3 +66,4 @@ This repo sets up an event server.
 - **Code-First Hierarchy:** When answering code queries, output the copy-pasteable snippet immediately. Place brief bulleted explanations *below* the code block, never above it.
 
 - **No Conceptual Lectures:** Do not explain the history, theory, or architectural concepts of a technology unless explicitly asked to define or explain it.
+

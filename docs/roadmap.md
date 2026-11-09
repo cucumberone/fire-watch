@@ -1,0 +1,117 @@
+# Roadmap
+
+Implementation order, open decisions, and known deviations from the spec.
+
+## 1. Implementation phases
+
+### Phase 0 — decisions (blocks everything)
+
+| # | Decision | Owner action |
+|---|---|---|
+| 0.1 | Accept RabbitMQ-as-WAL instead of Dragonfly AOF (R1) | read [persistence-and-durability.md](persistence-and-durability.md) §3 and approve option 1 |
+| 0.2 | Measure the real event size distribution | [sizing.md](sizing.md) §2.2 — baseline uses the 2 048 B **floor**, not an average; every doubling doubles the working set |
+| 0.3 | Choose node size | [sizing.md](sizing.md) §3.3 — a survivor must host two 48Gi Dragonfly pods, so **128 GiB nodes** are needed to keep 3-replica redundancy through a node loss |
+| 0.4 | Confirm Sentinel is the role manager | [redis-sentinel.md](redis-sentinel.md) |
+| 0.5 | Confirm image tags/digests for RabbitMQ, Dragonfly, Redis | pin before any manifest is committed |
+
+### Phase 1 — broker
+
+1. Namespace, ResourceQuota, LimitRange
+2. `rabbitmq` Secret + `definitions.json` ConfigMap + `enabled_plugins`
+3. `rabbitmq-headless` and `rabbitmq` Services
+4. RBAC for the K8s peer-discovery plugin
+5. `rabbitmq` StatefulSet, PDB, anti-affinity, probes
+6. Verify: cluster_status 3 nodes, `q.event.ingest` quorum 3, `q.audit.events` quorum 3 with the 24h TTL and `reject-publish` overflow
+
+### Phase 2 — datastore
+
+1. `dragonfly` Secret (password) + ConfigMap (flags)
+2. `dragonfly-headless` Service
+3. `dragonfly` StatefulSet with `snapshot_cron`, pruner sidecar, PDB
+4. `sentinel` ConfigMap + StatefulSet + `sentinel-headless` Service
+5. `sentinel-bridge` Deployment + RBAC (patch Service, exec into pods)
+6. Verify: master + 2 stable_sync replicas, sentinels agree, Service points at the master
+
+### Phase 3 — workloads
+
+1. Producer contract doc + `fx.events` / `fx.events.dlx` definitions + `severity` enum + `msg`/`msgc` fields
+2. `alert-fold.lua` — the watermark guard, reviewed line by line ([event-lifecycle.md](event-lifecycle.md) §5.2)
+3. `worker` Deployment (`validate → compress msgc → write → audit (plain) → publish → ack`)
+4. `ws-gateway` Deployment + HPA + Route, forwarding `applied`, `op: alert` and compressed `msgc` untouched
+5. `frontend` Deployment + Route, with `DecompressionStream` decoding and an undecodable fallback
+6. Verify: event round trip producer → UI, idempotency checks in [workers.md](workers.md) §10, and the close-ordering drills in [validation.md](validation.md) §6
+
+### Phase 4 — hardening
+
+1. NetworkPolicies ([networking.md](networking.md) §5)
+2. ServiceMonitor / alert rules ([rabbitmq.md](rabbitmq.md) §8, [dragonfly.md](dragonfly.md) §7, [redis-sentinel.md](redis-sentinel.md) §7)
+3. `replay-gap` Job/CronJob ([persistence-and-durability.md](persistence-and-durability.md) §4)
+4. Run every scenario in [validation.md](validation.md)
+
+## 2. Manifest inventory — Kustomize tree
+
+`k8s/` is a Kustomize tree: a **base** describing the plan of record, and **overlays** that adjust it per environment. Layout, rationale and the lab overlay are specified in [kustomize.md](kustomize.md).
+
+| Path | Contents |
+|---|---|
+| `base/00-namespace.yaml` | Namespace, ResourceQuota, LimitRange |
+| `base/01-pdb.yaml` | PodDisruptionBudgets for all 7 workloads ([fault-tolerance.md](fault-tolerance.md) §3.3) |
+| `base/10-rabbitmq-rbac.yaml` | ServiceAccount, Role, RoleBinding |
+| `base/11-rabbitmq-config.yaml` | `enabled_plugins`, `rabbitmq.conf`, `definitions.json` ConfigMaps |
+| `base/12-rabbitmq-secret.yaml.example` | template only; real file is git-ignored |
+| `base/13-rabbitmq-services.yaml` | headless + client Services |
+| `base/14-rabbitmq-statefulset.yaml` | StatefulSet |
+| `base/20-dragonfly-config.yaml` | flags config + pruner script |
+| `base/20-alert-fold-config.yaml` | `alert-fold.lua` mounted into the worker |
+| `base/21-dragonfly-secret.yaml.example` | template only |
+| `base/22-dragonfly-services.yaml` | headless + master-pointer Service |
+| `base/23-dragonfly-statefulset.yaml` | StatefulSet |
+| `base/30-sentinel-config.yaml` | `sentinel.conf` |
+| `base/31-sentinel-statefulset.yaml` | StatefulSet + headless Service + **persistent 1Gi volume** for the config epoch |
+| `base/32-sentinel-bridge.yaml` | Deployment, RBAC, ServiceAccount |
+| `base/40-workers.yaml` | Deployment |
+| `base/41-ws-gateway.yaml` | Deployment, Service, HPA, Route |
+| `base/42-frontend.yaml` | Deployment, Service, Route |
+| `base/50-networkpolicies.yaml` | **not used** — deliberately omitted while deploying into a shared namespace ([networking.md](networking.md) §5) |
+| `base/60-monitoring.yaml` | ServiceMonitors, PrometheusRules |
+| `overlays/lab/` | **1 replica each, tiny pods, no PDBs, 512mb Dragonfly** — homelab testing ([kustomize.md](kustomize.md) §3) |
+| `overlays/prod/` | (later) digest pinning, Route hostnames, quota bumps |
+
+Rules for every manifest: pinned image digests, explicit `resources`, probes on every container, `securityContext` with `runAsNonRoot`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` where possible, pod anti-affinity, and no `:latest`.
+
+Overlay rule: **overlays change replicas, resources, storage, schedules and hostnames — never a durability or safety invariant.** Those live in the base and are reviewed there.
+
+## 3. Open decisions
+
+| # | Question | Current proposal | Blocking |
+|---|---|---|---|
+| 3.1 | Dragonfly durability without AOF | RabbitMQ audit stream + replay job | yes |
+| 3.2 | Storm headroom | Baseline assumes one 1-hour 500/s storm per week (+4.7 GiB). Daily storms need ≈57 GiB per pod or value compression ([sizing.md](sizing.md) §2.3–2.4) | no |
+| 3.3 | Role management | Sentinel + `sentinel-bridge` | yes |
+| 3.4 | Producer authentication | per-producer AMQP users, vhost `/`, permissions limited to `fx.events` | no |
+| 3.5 | In-cluster TLS for AMQP/RESP | deferred to a second phase | no |
+| 3.6 | Multi-tenant isolation (sources per customer) | not modelled; all sources share one keyspace | no |
+| 3.7 | Backfill reads from replicas | deferred until replica lag is monitored | no |
+| 3.8 | Alert key definition | default `{source}:{type}`; a per-source key would collapse unrelated alarms ([event-lifecycle.md](event-lifecycle.md) §5.1) | no |
+| 3.9 | Storm events aging out of alerts | alert state TTL is 7d, so an unclosed alert silently disappears with its last event; consider a longer TTL once retention is validated | no |
+| 3.10 | `FW_ALERT_DEDUP_WINDOW` value | default 5 min. Defines what counts as a new occurrence; a value below the sensor's reporting interval makes `count` equal the raw event count ([event-lifecycle.md](event-lifecycle.md) §5.4) | no |
+| 3.11 | Lab H/A overlay (`overlays/lab-ha`) | cheap 3-replica rehearsal of quorum and failover, small resources ([kustomize.md](kustomize.md) §4) | no |
+| 3.12 | NetworkPolicies | **removed from scope** while the namespace is shared. Re-add once we own the namespace ([networking.md](networking.md) §5.4) | no |
+
+## 4. Known deviations from `AGENTS.md`
+
+| Spec statement | Reality | Resolution |
+|---|---|---|
+| "Dragonfly shall use AOF feature" | AOF is not implemented in Dragonfly | RabbitMQ audit stream now covers the full 7-day retention ([persistence-and-durability.md](persistence-and-durability.md) §4.4); hourly snapshot for restart speed |
+| "always find 2 replicas to receive writes" | no such server flag exists in Dragonfly | write-guard sidecar + Service routing + Sentinel quorum. [dragonfly.md](dragonfly.md) §3 |
+| "Redis Sentinels are needed for the workers, I think" | confirmed: needed, and also needed for the gateway and Service selector | [redis-sentinel.md](redis-sentinel.md) |
+| "Dragonfly operator is off the table" | honoured — everything is raw manifests plus a small bridge controller | this document |
+| "No data loss" | achievable only via the audit-stream design | §3.1 |
+
+## 5. Explicitly out of scope (this iteration)
+
+- Multi-region / multi-cluster replication
+- Kafka or any additional WAL component
+- Dragonfly multi-shard cluster mode
+- Authentication/authorisation of browser clients (assumed handled at the Route or a future OIDC layer)
+- Long-term archival beyond the Dragonfly TTL and the audit queue window

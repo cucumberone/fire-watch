@@ -1,0 +1,22 @@
+# Secrets — never commit
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+k8s/**/secret*.yaml
+!k8s/**/secret*.yaml.example
+kubeconfig*
+.kube/
+*.kubeconfig
+
+# Local tooling
+.DS_Store
+node_modules/
+dist/
+*.log
+tmp/

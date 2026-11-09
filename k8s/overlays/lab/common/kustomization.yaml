@@ -30,3 +30,7 @@ patches:
   - path: dragonfly-lab.yaml
   - path: sentinel-lab.yaml
   - path: bridge-lab.yaml
+  # Peer discovery must look in fire-watch-lab, not the base's fire-watch.
+  # Without this the node starts as a single-node cluster and the pods still go
+  # Ready, so the missing H/A is invisible.
+  - path: rabbitmq-lab.yaml

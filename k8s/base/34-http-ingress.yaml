@@ -87,6 +87,7 @@ spec:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5
             failureThreshold: 24
+            timeoutSeconds: 10
           readinessProbe:
             # False while the broker is unreachable: an ingress that cannot
             # publish must leave the load balancer so nginx fails over instead
@@ -94,11 +95,13 @@ spec:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 10
           livenessProbe:
             httpGet: { path: /livez, port: http }
             initialDelaySeconds: 20
             periodSeconds: 30
             failureThreshold: 6
+            timeoutSeconds: 10
           lifecycle:
             preStop:
               # Let in-flight requests finish their confirm and answer 202.

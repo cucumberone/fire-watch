@@ -44,59 +44,23 @@ images:
     newName: ghcr.io/cucumberone/fire-watch/sentinel-bridge
     newTag: latest
 
-# imagePullSecrets ARE required.
+# NO imagePullSecrets — the five GHCR packages are PUBLIC.
 #
-# The packages are PRIVATE and cannot be made public: the organization
-# (`cucumberone`) disables "Make this package visible to anyone" in its package
-# settings, so the visibility toggle is greyed out. That is an org policy, not a
-# repo setting — moving the package to a personal account is the only way to get
-# a public one.
+# Verified the pull the way a cluster does it: GHCR answers 401 on a bare
+# manifest request and returns a `www-authenticate` challenge; following that
+# handshake with an ANONYMOUS token returns 200. So no credential is needed.
 #
-# Create the secret once in the lab namespace:
+#   curl -s "https://ghcr.io/v2/.../manifests/latest"          -> 401 + challenge
+#   curl -s "https://ghcr.io/token?scope=repository:...:pull"  -> anonymous token
+#   curl -H "Authorization: Bearer $TOKEN" ...                 -> 200
+#
+# That first 401 is NOT a visibility problem — it is how every container
+# registry works. Testing with a single bare curl and reading the 401 as
+# "private" is the mistake to avoid here.
+#
+# If the packages are ever made private, add the imagePullSecrets patches back
+# (one per Deployment) and create:
 #
 #   kubectl -n fire-watch-lab create secret docker-registry ghcr-pull \
-#     --docker-server=ghcr.io \
-#     --docker-username=<github-user> \
+#     --docker-server=ghcr.io --docker-username=<user> \
 #     --docker-password=<PAT with read:packages>
-#
-# `read:packages` is enough — the cluster only pulls, it never pushes.
-#
-# Verified failure mode without this secret: `ImagePullBackOff` with
-# `401 Unauthorized`, which does not hint at a missing pull secret. Hence the
-# patch below rather than a note somewhere.
-patches:
-  - target:
-      kind: Deployment
-      name: worker
-    patch: |-
-      - op: add
-        path: /spec/template/spec/imagePullSecrets
-        value: [{ name: ghcr-pull }]
-  - target:
-      kind: Deployment
-      name: ws-gateway
-    patch: |-
-      - op: add
-        path: /spec/template/spec/imagePullSecrets
-        value: [{ name: ghcr-pull }]
-  - target:
-      kind: Deployment
-      name: frontend
-    patch: |-
-      - op: add
-        path: /spec/template/spec/imagePullSecrets
-        value: [{ name: ghcr-pull }]
-  - target:
-      kind: Deployment
-      name: http-ingress
-    patch: |-
-      - op: add
-        path: /spec/template/spec/imagePullSecrets
-        value: [{ name: ghcr-pull }]
-  - target:
-      kind: Deployment
-      name: sentinel-bridge
-    patch: |-
-      - op: add
-        path: /spec/template/spec/imagePullSecrets
-        value: [{ name: ghcr-pull }]

@@ -62,11 +62,13 @@ spec:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 10
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 6
+            timeoutSeconds: 10
       volumes:
         - name: runtime-config
           configMap:
@@ -102,7 +104,9 @@ data:
         location = /index.html  { add_header Cache-Control "no-store" always; }
 
         # Fingerprinted bundles are immutable.
-        location ~* \.[0-9a-f]{12}\.(js|css)$ { add_header Cache-Control "immutable, max-age=31536000" always; }
+        # Quoted: the `{12}` quantifier is otherwise read as a block opener and
+        # nginx fails with `unknown directive "12}\.(js|css)$"`.
+        location ~* "\.[0-9a-f]{12}\.(js|css)$" { add_header Cache-Control "immutable, max-age=31536000" always; }
 
         # SPA fallback.
         location / { try_files $uri $uri/ /index.html; }

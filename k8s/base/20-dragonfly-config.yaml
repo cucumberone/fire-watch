@@ -2,7 +2,8 @@
 # Flags mirror docs/dragonfly.md §4.2 exactly. Two of them are correctness
 # requirements, not tuning:
 #   --requirepass          -> Sentinel and clients authenticate (fault-tolerance.md §3.6)
-#   --maxmemory-policy     -> noeviction, so eviction is loud, never silent (fault-tolerance.md §3.9)
+#   (no --maxmemory-policy) -> Dragonfly has no such flag; cache_mode=false is
+#                            already no-eviction (fault-tolerance.md §3.9)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,7 +20,6 @@ data:
     --df_snapshot_format=true
     --snapshot_cron=0 * * * *
     --maxmemory=36gb
-    --maxmemory-policy=noeviction
     --proactor_threads=4
     --replica_delete_expired=false
     --port=6379
@@ -32,9 +32,13 @@ data:
     #!/bin/sh
     set -eu
     : "${DRAGONFLY_PASSWORD:?DRAGONFLY_PASSWORD is required}"
+    # Skip blank lines AND comments. A `#` line passed through as an argument
+    # makes dragonfly exit with `Unknown command line flag`.
     set --
     while IFS= read -r line; do
-      [ -n "$line" ] || continue
+      case "$line" in
+        ''|'#'*) continue ;;
+      esac
       set -- "$@" "$line"
     done < /etc/dragonfly/dragonfly.flags
     exec dragonfly --requirepass="$DRAGONFLY_PASSWORD" "$@"

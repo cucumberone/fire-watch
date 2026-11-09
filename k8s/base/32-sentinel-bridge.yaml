@@ -86,8 +86,21 @@ spec:
           ports:
             - { name: health, containerPort: 8081 }
           env:
-            - { name: FW_NAMESPACE,             value: fire-watch }
+            # POD_NAMESPACE must be declared BEFORE any $(POD_NAMESPACE)
+            # reference: Kubernetes only expands $(VAR) from variables declared
+            # earlier in the list.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - { name: FW_NAMESPACE,             value: "$(POD_NAMESPACE)" }
             - { name: FW_SENTINEL_SERVICE,      value: sentinel-headless }
+            # SENTINELS is REQUIRED by the bridge's config (config.js:47) and was
+            # never set, so the process died at startup with
+            # "missing required environment variable SENTINELS".
+            # Same three hosts the worker uses; the namespace is interpolated
+            # from the pod so the lab and prod share one string.
+            - name: SENTINELS
+              value: "sentinel-0.sentinel-headless.$(POD_NAMESPACE):26379,sentinel-1.sentinel-headless.$(POD_NAMESPACE):26379,sentinel-2.sentinel-headless.$(POD_NAMESPACE):26379"
             - { name: FW_DRAGONFLY_MASTER,      value: fire-watch-dragonfly }
             - { name: FW_DRAGONFLY_SERVICE,     value: dragonfly }
             - { name: FW_DRAGONFLY_STATEFULSET, value: dragonfly }
@@ -119,7 +132,9 @@ spec:
             httpGet: { path: /livez, port: 8081 }
             initialDelaySeconds: 10
             periodSeconds: 30
+            timeoutSeconds: 10
           readinessProbe:
             httpGet: { path: /readyz, port: 8081 }
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 10

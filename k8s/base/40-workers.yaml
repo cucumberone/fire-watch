@@ -85,12 +85,14 @@ spec:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5
             failureThreshold: 24
+            timeoutSeconds: 10
           readinessProbe:
             # Must be false while the write gate is closed: a worker that
             # cannot write must not consume (docs/workers.md §7).
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 10
           livenessProbe:
             # Process-only. Never fails on dependency loss, or an outage would
             # restart-loop every worker at once.
@@ -98,6 +100,7 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
             failureThreshold: 6
+            timeoutSeconds: 10
       volumes:
         - name: fold
           configMap:

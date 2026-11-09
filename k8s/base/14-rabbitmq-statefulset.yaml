@@ -24,7 +24,22 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
+        # fsGroup 999 makes the PV group-writable. Erlang refuses a cookie that
+        # anyone but the owner can read, and the volume driver applies fsGroup as
+        # 0660 (`-rw-rw----`), so the node dies with:
+        #   Cookie file /var/lib/rabbitmq/.erlang.cookie must be accessible by
+        #   owner only
+        # fsGroupChangePolicy: OnRootMismatch is NOT enough — the file is created
+        # by RabbitMQ itself after the volume is prepared.
+        #
+        # The fix is to run the container with a supplementary group that can
+        # write, while keeping the cookie 0600. Kubernetes cannot express that
+        # directly, so the container entrypoint sets the cookie mode itself; see
+        # the preStop/command note below. runAsGroup keeps GID == UID so the
+        # directory is owned 999:999.
+        runAsGroup: 999
         fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       # Required, not preferred: best-effort affinity would let two pods share a
@@ -40,6 +55,46 @@ spec:
         - name: rabbitmq
           image: docker.io/library/rabbitmq:4.1-management
           imagePullPolicy: IfNotPresent
+          # Fix the Erlang cookie mode before the node starts, then exec the stock
+          # entrypoint unchanged.
+          #
+          # Why this is necessary: the volume driver applies fsGroup as 0660, so
+          # .erlang.cookie lands `-rw-rw----`. Erlang refuses to use a cookie that
+          # its group can read and aborts the node with
+          # "must be accessible by owner only". RabbitMQ creates the cookie itself
+          # on first boot, so no initContainer or fsGroupChangePolicy can catch it.
+          #
+          # chmod runs as the pod's user (999) and owns the file, so it is
+          # permitted. If the file does not exist yet, `|| true` keeps the first
+          # boot working — RabbitMQ then creates it 0600 itself because the umask
+          # applies before fsGroup.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              chmod 0600 /var/lib/rabbitmq/.erlang.cookie 2>/dev/null || true
+
+              # Render definitions.json with the real broker credentials.
+              #
+              # Why: `load_definitions` REPLACES broker state, including users.
+              # A definitions file without a `users` key therefore deletes the
+              # account that RABBITMQ_DEFAULT_USER just created — every client
+              # then fails with 403 ACCESS_REFUSED and the broker has no users at
+              # all. The user must be inside the definitions file.
+              #
+              # Placeholders instead of inline values, because a ConfigMap cannot
+              # reference a Secret. The password is written to an emptyDir, never
+              # to the ConfigMap and never to a layer.
+              sed -e "s|__AMQP_USER__|${RABBITMQ_DEFAULT_USER}|g" \
+                  -e "s|__AMQP_PASS__|${RABBITMQ_DEFAULT_PASS}|g" \
+                  /etc/rabbitmq/definitions.json \
+                  > /etc/rabbitmq/rendered/definitions.json
+              chmod 0600 /etc/rabbitmq/rendered/definitions.json
+
+              # No "$@" here: with `sh -c` the positional parameters are empty,
+              # and the stock entrypoint reads $1 under `set -u`, so passing an
+              # empty argument list aborts with `$1: unbound variable`.
+              exec docker-entrypoint.sh rabbitmq-server
           ports:
             - { name: amqp, containerPort: 5672 }
             - { name: management, containerPort: 15672 }
@@ -56,8 +111,15 @@ spec:
                   fieldPath: metadata.name
             # Stable, DNS-based node identity. A short name breaks after a
             # reschedule because the pod hostname is not the identity.
+            # Namespace comes from the POD's own field, not a literal. A
+            # hard-coded `fire-watch` broke the lab (namespace fire-watch-lab):
+            # the node name did not resolve and Erlang aborted with
+            #   epmd error for host ...: nxdomain
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
             - name: RABBITMQ_NODENAME
-              value: "rabbit@$(POD_NAME).rabbitmq-headless.fire-watch.svc.cluster.local"
+              value: "rabbit@$(POD_NAME).rabbitmq-headless.$(POD_NAMESPACE).svc.cluster.local"
             - name: RABBITMQ_DEFAULT_USER
               # Account NAME, not a credential — from the ConfigMap so it is
               # readable and auditable. Must equal the Secret's `username`,
@@ -77,25 +139,60 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/rabbitmq/rabbitmq.conf, subPath: rabbitmq.conf, readOnly: true }
             - { name: config, mountPath: /etc/rabbitmq/enabled_plugins, subPath: enabled_plugins, readOnly: true }
+            # NOT mounted directly: the ConfigMap has __AMQP_USER__ /
+            # __AMQP_PASS__ placeholders, because a Secret cannot be substituted
+            # into a ConfigMap. The rendered copy goes to an emptyDir that
+            # RabbitMQ reads. See the command block.
+            # The template, read-only from the ConfigMap, is the sed INPUT.
             - { name: config, mountPath: /etc/rabbitmq/definitions.json, subPath: definitions.json, readOnly: true }
+            # The rendered copy with real credentials, the sed OUTPUT.
+            - { name: rendered-defs, mountPath: /etc/rabbitmq/rendered }
             - { name: data, mountPath: /var/lib/rabbitmq }
+          # Probes use a TCP port check, NOT `rabbitmq-diagnostics`.
+          #
+          # Measured on this cluster: `rabbitmq-diagnostics -q ping` takes ~34s
+          # and `check_running` ~27s, because the CLI starts its own Erlang VM
+          # and waits for distribution to come up. No probe timeout can
+          # accommodate that, so every probe timed out while the broker was
+          # perfectly healthy — the pod sat at 0/1 with zero restarts.
+          #
+          # `bash -c 'exec 3<>/dev/tcp/...'` takes ~2s and answers the question
+          # that actually matters for probe purposes: is the AMQP listener
+          # accepting connections? That is what a client needs.
+          #
+          # The deeper checks still exist where they belong:
+          #   - alarms: RabbitMQQueueBacklog / memory alerts in monitoring
+          #   - cluster membership: rabbitmqctl cluster_status in validation.md
+          # A liveness probe must stay shallow anyway: a deep check would kill
+          # nodes during a benign partition and cause a restart loop.
           startupProbe:
             exec:
-              command: ["rabbitmq-diagnostics", "-q", "check_running"]
-            periodSeconds: 10
-            failureThreshold: 30
+              command:
+                - bash
+                - -c
+                - exec 3<>/dev/tcp/127.0.0.1/5672
+            periodSeconds: 5
+            timeoutSeconds: 5
+            # 60 * 5s = 5 minutes. A first boot has to create the mnesia schema;
+            # the 7-day audit queue definitions load after that.
+            failureThreshold: 60
           readinessProbe:
             exec:
-              command: ["rabbitmq-diagnostics", "-q", "check_running", "-q", "check_local_alarms"]
+              command:
+                - bash
+                - -c
+                - exec 3<>/dev/tcp/127.0.0.1/5672
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            # Deliberately shallow: a deep check would kill nodes during a
-            # benign partition and cause a restart loop.
             exec:
-              command: ["rabbitmq-diagnostics", "-q", "ping"]
+              command:
+                - bash
+                - -c
+                - exec 3<>/dev/tcp/127.0.0.1/5672
             periodSeconds: 30
-            timeoutSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 6
           lifecycle:
             preStop:
@@ -107,6 +204,10 @@ spec:
         - name: config
           configMap:
             name: rabbitmq-config
+        # Writable target for the rendered definitions.json (credentials are
+        # substituted at start; see the container command).
+        - name: rendered-defs
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

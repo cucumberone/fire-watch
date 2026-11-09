@@ -16,7 +16,6 @@ data:
     --df_snapshot_format=true
     --snapshot_cron=*/15 * * * *
     --maxmemory=512mb
-    --maxmemory-policy=noeviction
     --proactor_threads=1
     --replica_delete_expired=false
     --port=6379

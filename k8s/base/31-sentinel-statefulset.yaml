@@ -86,17 +86,20 @@ spec:
               command: ["redis-cli", "-p", "26379", "ping"]
             periodSeconds: 5
             failureThreshold: 30
+            timeoutSeconds: 10
           readinessProbe:
             exec:
               command: ["redis-cli", "-p", "26379", "ping"]
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 10
           livenessProbe:
             exec:
               command: ["redis-cli", "-p", "26379", "ping"]
             initialDelaySeconds: 30
             periodSeconds: 30
             failureThreshold: 6
+            timeoutSeconds: 10
       volumes:
         - name: src
           configMap:

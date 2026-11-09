@@ -19,18 +19,20 @@ data:
     cluster_formation.k8s.host               = kubernetes.default.svc.cluster.local
     cluster_formation.k8s.address_type       = hostname
     cluster_formation.k8s.service_name       = rabbitmq-headless
-    cluster_formation.k8s.namespace          = fire-watch
+
+
+
+
     cluster_formation.node_cleanup.only_log_warning = true
     cluster_name                             = fire-watch
     queue_master_locator                     = min-masters
-    load_definitions                         = /etc/rabbitmq/definitions.json
+    load_definitions                         = /etc/rabbitmq/rendered/definitions.json
 
     # ---- no-data-loss requirements (docs/rabbitmq.md §3) ------------------
     default_queue_type                       = quorum
     quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = false
     cluster_partition_handling               = pause_minority
     consumer_timeout                         = 900000
-    confirm_timeout                          = 15
 
     # ---- ordering authority (docs/rabbitmq.md §3.1) -----------------------
     # Broker-assigned arrival timestamp. overwrite=true so a producer cannot
@@ -40,7 +42,11 @@ data:
     # ---- memory / disk ----------------------------------------------------
     # 0.7 of the 1Gi limit ~= 700Mi usable before the memory alarm fires.
     vm_memory_high_watermark.relative = 0.7
-    disk_free_limit.absolute          = 2GB
+    # Bytes, bare integer. `2GB` fails RabbitMQ 4.x's transform_datatypes stage:
+    # disk_free_limit.absolute is typed as an integer, and a unit suffix makes
+    # the whole config unparseable, which shows up as
+    # `failed_to_prepare_configuration` with no line number.
+    disk_free_limit.absolute          = 2000000000
 
     # ---- management -------------------------------------------------------
     management.tcp.port = 15672
@@ -94,5 +100,22 @@ data:
         { "source": "fx.events",     "vhost": "/", "destination": "q.event.ingest",  "destination_type": "queue", "routing_key": "event.ingest", "arguments": {} },
         { "source": "fx.events.dlx", "vhost": "/", "destination": "q.event.ingest.dlq", "destination_type": "queue", "routing_key": "event.ingest", "arguments": {} },
         { "source": "fx.audit",      "vhost": "/", "destination": "q.audit.events",  "destination_type": "queue", "routing_key": "event.audit", "arguments": {} }
+      ],
+
+      "users": [
+        {
+          "name": "__AMQP_USER__",
+          "password": "__AMQP_PASS__",
+          "tags": ["administrator"]
+        }
+      ],
+      "permissions": [
+        {
+          "user": "__AMQP_USER__",
+          "vhost": "/",
+          "configure": ".*",
+          "write": ".*",
+          "read": ".*"
+        }
       ]
     }

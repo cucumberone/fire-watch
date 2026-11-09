@@ -1,0 +1,45 @@
+# RabbitMQ for the lab: peer discovery must use the LAB namespace.
+#
+# because that is what k8s/base deploys into. The lab deploys into
+# fire-watch-lab, so without this patch every node looks for its peers in a
+# namespace where no RabbitMQ pods exist.
+#
+# The failure is quiet rather than loud: each node starts happily as a
+# single-node cluster, so the pods go Ready and `rabbitmqctl cluster_status`
+# reports one node. Quorum queues then have a single replica and the whole H/A
+# story is silently absent.
+#
+# The base config is a ConfigMap, so this patches the *file content* rather than
+# a flag list — same approach as dragonfly-lab.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+data:
+  rabbitmq.conf: |
+    # ---- cluster formation (docs/rabbitmq.md §2) -------------------------
+    cluster_formation.peer_discovery_backend = k8s
+    cluster_formation.k8s.host               = kubernetes.default.svc.cluster.local
+    cluster_formation.k8s.address_type       = hostname
+    cluster_formation.k8s.service_name       = rabbitmq-headless
+    cluster_formation.node_cleanup.only_log_warning = true
+    cluster_name                             = fire-watch-lab
+    queue_master_locator                     = min-masters
+    load_definitions                         = /etc/rabbitmq/rendered/definitions.json
+
+    # ---- no-data-loss requirements (docs/rabbitmq.md §3) ------------------
+    default_queue_type                       = quorum
+    quorum_queue.property_equivalence.relaxed_checks_on_redeclaration = false
+    cluster_partition_handling               = pause_minority
+    consumer_timeout                         = 900000
+
+    # ---- ordering authority (docs/rabbitmq.md §3.1) -----------------------
+    message_interceptors.incoming.set_header_timestamp.overwrite = true
+
+    # ---- memory / disk -----------------------------------------------------
+    vm_memory_high_watermark.relative = 0.7
+    # Bytes, bare integer. `2GB` fails the transform_datatypes stage and the
+    # whole config becomes unparseable.
+    disk_free_limit.absolute          = 2000000000
+
+    management.tcp.port = 15672

@@ -45,7 +45,11 @@ spec:
             - { name: admin, containerPort: 9222 }
           # Flags come from the ConfigMap so the lab overlay patches one value
           # instead of repeating the whole list.
-          command: ["/bin/sh", "/opt/dfly/entrypoint.sh"]
+          # The ConfigMap is mounted at /etc/dragonfly, so the entrypoint lives
+          # there. It must be run as an explicit /bin/sh argument rather than as
+          # the command itself, because the ConfigMap's defaultMode does not make
+          # it executable and configMap volumes are read-only.
+          command: ["/bin/sh", "/etc/dragonfly/entrypoint.sh"]
           env:
             - name: DRAGONFLY_PASSWORD
               valueFrom:
@@ -69,6 +73,7 @@ spec:
               command: ["redis-cli", "-p", "6379", "--no-auth-warning", "-a", "$(DRAGONFLY_PASSWORD)", "ping"]
             periodSeconds: 5
             failureThreshold: 60
+            timeoutSeconds: 10
           readinessProbe:
             # A replica mid-full-sync must not count as healthy, so this checks
             # the link on replicas and the ping on the master.
@@ -85,6 +90,7 @@ spec:
                   fi
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 10
           livenessProbe:
             # Never assert ROLE here: a legitimate failover would restart the pod.
             exec:
@@ -93,6 +99,7 @@ spec:
             periodSeconds: 30
             failureThreshold: 6
 
+            timeoutSeconds: 10
         # ------------------------------------------------- snapshot pruner
         - name: snapshot-pruner
           image: docker.io/library/busybox:1.36
@@ -120,6 +127,7 @@ spec:
               command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/alive) )) -lt 900"]
             periodSeconds: 60
             failureThreshold: 3
+            timeoutSeconds: 10
       volumes:
         - name: config
           configMap:

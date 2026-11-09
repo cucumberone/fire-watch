@@ -23,10 +23,16 @@ export class LeaderElector {
 
   async _get() {
     try {
-      const res = await this.api.readNamespacedLease({
-        name: this.leaseName,
-        namespace: this.namespace,
-      });
+      // POSITIONAL signature in @kubernetes/client-node 0.22.x:
+      //   readNamespacedLease(name, namespace, pretty?, options?)
+      // The v1.x object form leaves `namespace` undefined here, and every lease
+      // call then throws "Required parameter namespace was null or undefined" —
+      // which surfaced as a permanent 503 on /readyz because ready is only set
+      // after a successful reconcile.
+      const res = await this.api.readNamespacedLease(
+        this.leaseName,
+        this.namespace,
+      );
       return res;
     } catch (err) {
       if (err?.response?.statusCode === 404 || err?.statusCode === 404) return null;
@@ -62,7 +68,7 @@ export class LeaderElector {
         },
       };
       try {
-        await this.api.createNamespacedLease({ namespace: this.namespace, body });
+        await this.api.createNamespacedLease(this.namespace, body);
         this.isLeader = true;
         this.log.info('lease acquired (created)', { lease: this.leaseName });
         return true;
@@ -77,11 +83,7 @@ export class LeaderElector {
     const holder = lease.spec?.holderIdentity;
     if (holder === this.identity) {
       lease.spec.renewTime = now;
-      await this.api.replaceNamespacedLease({
-        name: this.leaseName,
-        namespace: this.namespace,
-        body: lease,
-      });
+      await this.api.replaceNamespacedLease(this.leaseName, this.namespace, lease);
       if (!this.isLeader) this.log.info('lease renewed (still leader)', {});
       this.isLeader = true;
       return true;
@@ -96,11 +98,7 @@ export class LeaderElector {
         leaseTransitions: (lease.spec?.leaseTransitions || 0) + 1,
       };
       try {
-        await this.api.replaceNamespacedLease({
-          name: this.leaseName,
-          namespace: this.namespace,
-          body: lease,
-        });
+        await this.api.replaceNamespacedLease(this.leaseName, this.namespace, lease);
         this.isLeader = true;
         this.log.warn('lease taken over (previous holder expired)', { previous: holder });
         return true;
@@ -128,11 +126,7 @@ export class LeaderElector {
       const lease = await this._get();
       if (lease?.spec?.holderIdentity === this.identity) {
         lease.spec.renewTime = new Date(Date.now() - this.leaseDurationMs * 2).toISOString();
-        await this.api.replaceNamespacedLease({
-          name: this.leaseName,
-          namespace: this.namespace,
-          body: lease,
-        });
+        await this.api.replaceNamespacedLease(this.leaseName, this.namespace, lease);
         this.log.info('lease released');
       }
     } catch (err) {

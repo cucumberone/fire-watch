@@ -78,6 +78,10 @@ Still needed before a real deploy:
 | Create the two Secrets | `fire-watch-rabbitmq{username,password}`, `fire-watch-dragonfly{password}` — see `k8s/base/kustomization.yaml` |
 | Confirm node size | 48Gi Dragonfly limit needs 128 GiB nodes to reschedule ([docs/sizing.md](docs/sizing.md) §3.3) |
 
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
 ### `sentinel-bridge`
 
 Implemented — [services/sentinel-bridge](services/sentinel-bridge/). 11 planner unit tests pass (`node --test src/plan.test.js`). It needs a container build, not a rewrite.

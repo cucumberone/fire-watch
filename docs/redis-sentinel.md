@@ -125,6 +125,36 @@ so the process looked healthy and reported `ready`. Two rules follow:
   leadership must be verified from the cluster: `kubectl get lease
   sentinel-bridge-leader` must exist and name the current pod.
 
+### 4.2 The same call-convention defect in the pod/Endpoints layer
+
+Fixing the lease exposed the identical mistake in `kube.js`, where it was worse
+because it produced a *plausible wrong answer* instead of an error. `0.22.x` takes
+**positional** arguments and resolves to an envelope `{ response, body }`; the code
+used the v1.x object form and read `.items` off the envelope, which is `undefined`.
+
+Result, on a healthy one-pod cluster, with the leader lease correctly held:
+
+```json
+{"level":"warn","msg":"no dragonfly pods found","selector":"app.kubernetes.io/name=dragonfly"}
+```
+
+Nothing threw. An empty pod list is indistinguishable from an empty namespace, so
+the bridge silently stopped reconciling — the worst failure mode for a controller
+that mutates cluster state. All four `CoreV1Api` calls are affected:
+
+| Call | 0.22.x positional signature |
+|---|---|
+| `listNamespacedPod` | `(namespace, pretty, allowWatchBookmarks, _continue, fieldSelector, labelSelector, …)` — `labelSelector` is the **6th** argument |
+| `replaceNamespacedEndpoints` | `(name, namespace, body, …)` |
+| `createNamespacedEndpoints` | `(namespace, body, …)` |
+| `patchNamespacedPod` | `(name, namespace, body, …)` |
+
+`kube.test.js` now asserts the argument *positions*, not just the results, so the
+object form cannot come back unnoticed. The general lesson: when a generated client
+is pinned to an older major version, write a test that pins the calling convention.
+Type checking would have caught none of this — the object form is structurally valid
+in every version that accepts it.
+
 ## 5. Client behaviour
 
 Workers and gateways connect through a Sentinel-aware client:

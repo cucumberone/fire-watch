@@ -21,13 +21,44 @@ export function createKube() {
   };
 }
 
+/**
+ * @kubernetes/client-node 0.22.x differs from the v1.x API in TWO ways, and
+ * getting either one wrong fails silently rather than loudly:
+ *
+ *   1. Arguments are POSITIONAL, not a single object. Passing
+ *      `{ namespace, labelSelector }` leaves every positional parameter
+ *      undefined, so the selector is dropped and the call returns an unfiltered
+ *      or empty result instead of erroring.
+ *   2. The promise resolves to an envelope `{ response, body }`, not to the
+ *      resource. Reading `.items` off the envelope yields `undefined`, which
+ *      callers then treat as "zero results".
+ *
+ * Both bugs shipped here: `listPods` used the object form, so `.items` was
+ * undefined and the bridge reported "no dragonfly pods found" on a healthy
+ * 1-pod cluster while holding the leader lease.
+ *
+ * This helper exists so there is exactly one place where the shape is handled.
+ */
+function unwrap(res) {
+  return res?.body ?? res;
+}
+
 /** List the Dragonfly pods, in ordinal order. */
 export async function listPods(core, namespace, labelSelector) {
-  const res = await core.listNamespacedPod({
+  // listNamespacedPod(namespace, pretty, allowWatchBookmarks, _continue,
+  //                   fieldSelector, labelSelector, limit, resourceVersion, ...)
+  // labelSelector really is the 6th positional argument.
+  const res = await core.listNamespacedPod(
     namespace,
-    labelSelector,
-  });
-  return (res.items || []).sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
+    undefined,          // pretty
+    undefined,          // allowWatchBookmarks
+    undefined,          // _continue
+    undefined,          // fieldSelector
+    labelSelector,      // labelSelector
+  );
+  const list = unwrap(res);
+  const items = list?.items ?? [];
+  return items.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
 }
 
 /**
@@ -181,11 +212,8 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
   };
 
   try {
-    await core.replaceNamespacedEndpoints({
-      name,
-      namespace,
-      body,
-    });
+    // replaceNamespacedEndpoints(name, namespace, body, pretty, dryRun, ...)
+    await core.replaceNamespacedEndpoints(name, namespace, body);
     log.info('patched endpoints', { service: name, masters: endpoints });
   } catch (err) {
     // 404 on first boot is expected: the Endpoints object is created by the
@@ -198,7 +226,8 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
         ...body,
       };
       try {
-        await core.createNamespacedEndpoints({ namespace, body: created });
+        // createNamespacedEndpoints(namespace, body, pretty, dryRun, ...)
+        await core.createNamespacedEndpoints(namespace, created);
         log.info('created endpoints', { service: name, masters: endpoints });
       } catch (e2) {
         log.error('could not create endpoints', { service: name, err: String(e2) });
@@ -212,13 +241,10 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
 /** Reflect the write-guard verdict as a pod label, for humans and for alerts. */
 export async function setWritableLabel(core, namespace, podName, writable, labelKey, log) {
   try {
-    await core.patchNamespacedPod({
-      name: podName,
-      namespace,
-      body: {
-        metadata: {
-          labels: { [labelKey]: String(writable) },
-        },
+    // patchNamespacedPod(name, namespace, body, pretty, dryRun, ...)
+    await core.patchNamespacedPod(podName, namespace, {
+      metadata: {
+        labels: { [labelKey]: String(writable) },
       },
     });
   } catch (err) {

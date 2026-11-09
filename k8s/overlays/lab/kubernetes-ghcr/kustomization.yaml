@@ -1,0 +1,102 @@
+# Plain-Kubernetes lab flavour with GHCR images.
+#
+#   kubectl apply -k k8s/overlays/lab/kubernetes-ghcr
+#
+# This is `lab/kubernetes` (no Routes, NodePort) PLUS the GHCR image rewrite
+# from `overlays/ghcr`. It exists because `lab/kubernetes` still points at the
+# OpenShift internal registry, which a MicroK8s/kind/k3s node cannot resolve:
+#
+#   dial tcp: lookup image-registry.openshift-image-registry.svc on 127.0.0.53:53:
+#   no such host
+#
+# That failure is easy to misread as a DNS problem on the cluster. It is not —
+# the hostname only exists inside an OpenShift cluster.
+#
+# Composition: it lists TWO resources. Kustomize merges them, and because both
+# derive from the same base the result stays one coherent object set rather than
+# two copies of each workload.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fire-watch-lab
+
+resources:
+  # The lab overlay: replicas → 1, resources → small, PDBs/HPA deleted,
+  # Routes deleted, NodePorts, storage → 2Gi. Everything about "this is a lab".
+  - ../kubernetes
+
+# Image rewrite only. Applied after the resources above, so the base image names
+# are what get matched.
+images:
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/worker
+    newName: ghcr.io/cucumberone/fire-watch/worker
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/ws-gateway
+    newName: ghcr.io/cucumberone/fire-watch/ws-gateway
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/frontend
+    newName: ghcr.io/cucumberone/fire-watch/frontend
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/http-ingress
+    newName: ghcr.io/cucumberone/fire-watch/http-ingress
+    newTag: latest
+  - name: image-registry.openshift-image-registry.svc:5000/fire-watch/sentinel-bridge
+    newName: ghcr.io/cucumberone/fire-watch/sentinel-bridge
+    newTag: latest
+
+# imagePullSecrets ARE required.
+#
+# The packages are PRIVATE and cannot be made public: the organization
+# (`cucumberone`) disables "Make this package visible to anyone" in its package
+# settings, so the visibility toggle is greyed out. That is an org policy, not a
+# repo setting — moving the package to a personal account is the only way to get
+# a public one.
+#
+# Create the secret once in the lab namespace:
+#
+#   kubectl -n fire-watch-lab create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io \
+#     --docker-username=<github-user> \
+#     --docker-password=<PAT with read:packages>
+#
+# `read:packages` is enough — the cluster only pulls, it never pushes.
+#
+# Verified failure mode without this secret: `ImagePullBackOff` with
+# `401 Unauthorized`, which does not hint at a missing pull secret. Hence the
+# patch below rather than a note somewhere.
+patches:
+  - target:
+      kind: Deployment
+      name: worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: ws-gateway
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: http-ingress
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target:
+      kind: Deployment
+      name: sentinel-bridge
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]

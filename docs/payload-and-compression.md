@@ -9,6 +9,8 @@ Two plain-text payload fields, what each means, and whether they can be compress
 | `msg` | the short / current message text — a summary, a single line | ~64–256 B | changes on every occurrence |
 | `msgc` | the **c**omplete string — the full body, e.g. a stack trace, a multi-line log excerpt, a device-reported detail block | ~1–8 KiB, sometimes much more | usually the same for every occurrence of a condition |
 
+> **Naming:** these are wire names. The web UI labels them **Summary** and **MsgCompleteString**; the rename happens once at the frontend boundary and does not affect the wire, Dragonfly keys or the audit WAL ([frontend.md](frontend.md) §4.1).
+
 `msgc` is the long one. At 2 048 B minimum event size that is already the baseline, and it is the field that dominates memory, network and browser rendering cost.
 
 ## 2. Can they be compressed? Yes — but not both the same way

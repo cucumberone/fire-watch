@@ -80,11 +80,27 @@ Backpressure policy is explicit: a slow consumer is disconnected, not buffered. 
 | Pub/sub | `SUBSCRIBE fw:ch:events` on the **master**, since Dragonfly propagates pub/sub from the primary |
 | Backfill reads | `ZRANGEBYSCORE` + `MGET` against the master by default |
 | Read scaling (later) | point backfill reads at a replica Service once replica lag is monitored; not needed at current scale |
-| Write access | **none** — the gateway must never write |
+| Write access | **exactly one method**: `ackAlert` ([acknowledge.md](acknowledge.md) §4) |
 
-A gateway with no write access cannot violate the write-guard invariant even if it is misconfigured. De-duplication is therefore an in-process LRU of recent event ids (`FW_DEDUPE_LRU`, default 10 000), not a Dragonfly `SET`.
+There is no general write surface. `dragonfly.js` has no `set`, `del` or generic `eval`, so the gateway cannot modify events, indexes or alert state beyond the two ack fields. The absence of a method is a stronger guarantee than a comment.
 
-### 5.1 Compression transparency
+Because no event write is possible, de-duplication is an in-process LRU of recent event ids (`FW_DEDUPE_LRU`, default 10 000), not a Dragonfly `SET`.
+
+### 5.1 Acknowledgement writes
+
+An operator ack is the one client-initiated mutation, and it is deliberately narrow:
+
+| Guard | Reason |
+|---|---|
+| fixed Lua, `HSET` of `acked_by` / `acked_at` only | `severity`, `count`, `last_seen` and the watermark belong to the worker's fold; writing them here would race it |
+| `EXISTS` check first | an ack-only hash would render as a phantom row |
+| first-ack-wins | two clicks cannot fight, and a second click cannot silently re-attribute |
+| `PEXPIRE` extends the existing TTL | never invents retention |
+| READONLY → re-resolve master once, then fail | a demoted node must not report a successful ack |
+
+Broadcast is a single `fw:ch:alerts` frame, which every pod already receives, so a click reaches browsers on other pods with no pod-to-pod coordination.
+
+### 5.2 Compression transparency
 
 The gateway is a **byte pipe** for payload fields: `payload.msgc` may be gzip, and the gateway forwards it base64-encoded without decoding.
 

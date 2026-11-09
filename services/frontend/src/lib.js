@@ -91,11 +91,202 @@ export function base64ToBytes(b64) {
   return bytes;
 }
 
+/**
+ * Wire field names → the names the UI uses.
+ *
+ * Dragonfly, the message contract and the audit WAL all say `msg` / `msgc`
+ * (docs/payload-and-compression.md §1). The UI calls them **Summary** and
+ * **MsgCompleteString**, because "msgc" explains nothing to the person reading
+ * the screen and "Message" would collide with the whole event.
+ *
+ * The rename lives here, in one pure function, for two reasons: the components
+ * never touch the wire names, so the vocabulary cannot drift field by field,
+ * and the mapping is testable without a DOM.
+ */
+export const WIRE_FIELD = { summary: 'msg', msgCompleteString: 'msgc' };
+
+/**
+ * Fields the workers enrich onto an event before it reaches Dragonfly.
+ *
+ * `wire` lists every spelling accepted, because these come from an upstream
+ * alarm system and the casing has not been normalised: `CIF` and `AlarmIDKey`
+ * are acronym-bearing and keep `ID` uppercase, `SupportGroupName` is plain
+ * PascalCase. Matching is explicit rather than case-insensitive so a genuine
+ * `cif` (some unrelated field) can never be mistaken for the enriched one.
+ */
+export const ENRICHED_FIELDS = [
+  { key: 'cif', label: 'CIF', wire: ['CIF', 'cif'] },
+  {
+    key: 'alarmIdKey',
+    label: 'Alarm ID key',
+    wire: ['AlarmIDKey', 'AlarmIdKey', 'alarmIDKey', 'alarmIdKey', 'alarm_id_key'],
+  },
+  { key: 'alarmOwner', label: 'Alarm owner', wire: ['AlarmOwner', 'alarmOwner', 'alarm_owner'] },
+  { key: 'autoClose', label: 'Auto close', wire: ['AutoClose', 'autoClose', 'auto_close'] },
+  {
+    key: 'supportGroupName',
+    label: 'Support group',
+    wire: ['SupportGroupName', 'supportGroupName', 'support_group_name'],
+  },
+];
+
+/** gzip marker, matching services/worker/src/event.js. */
+const GZ_MARK = '__gz';
+
+/** First non-empty value of the given keys, or undefined. */
+function firstPresent(source, names) {
+  if (!source || typeof source !== 'object') return undefined;
+  for (const name of names) {
+    const value = source[name];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+/** Display text for a leaf value. Booleans read as yes/no, not true/false. */
+function asText(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  return String(value);
+}
+
+/** Parse a timestamp into epoch ms, falling back when it is unusable. */
+function asTime(value, fallback) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value !== '') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+/** Positive integer, else the fallback. Rejects 0, negatives and NaN. */
+function asCount(value, fallback) {
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Map a wire event to its view shape. Never mutates, never throws; a missing
+ * payload yields empty strings rather than `undefined`, so a row can never
+ * render `undefined` as text.
+ *
+ * Occurrence fields come from the worker's enrichment when present. Without
+ * enrichment a single raw event is its own first and last occurrence with a
+ * count of 1 — which is the honest answer, not a guess.
+ */
+export function toViewEvent(evt) {
+  const payload = evt?.payload;
+  const fallbackTs = asTime(evt?.brokerTs, asTime(evt?.ts, undefined));
+
+  const view = {
+    ...evt,
+    // The untouched wire record. The inspector shows this rather than the view
+    // event, or every field would appear twice: once as `payload.CIF` and once
+    // as the derived `cif`.
+    wire: evt,
+    summary: asText(firstPresent(payload, [WIRE_FIELD.summary])),
+    // Only a non-empty complete string is worth a disclosure toggle.
+    msgCompleteString: asText(firstPresent(payload, [WIRE_FIELD.msgCompleteString])),
+    firstOccurrence: asTime(
+      firstPresent(payload, ['FirstOccurrence', 'firstOccurrence', 'first_occurrence']),
+      fallbackTs,
+    ),
+    lastOccurrence: asTime(
+      firstPresent(payload, ['LastOccurrence', 'lastOccurrence', 'last_occurrence']),
+      fallbackTs,
+    ),
+    count: asCount(firstPresent(payload, ['Count', 'count']), 1),
+  };
+
+  for (const field of ENRICHED_FIELDS) {
+    view[field.key] = asText(firstPresent(payload, field.wire));
+  }
+  return view;
+}
+
+/**
+ * Flatten a record into ordered `[key, value]` pairs for the inspector.
+ *
+ * Nested objects and arrays are walked with dotted / indexed paths rather than
+ * being stringified, because the point of right-clicking is to see the fields
+ * *inside* `payload`, not `[object Object]`. `undefined` keys are omitted (an
+ * absent field is noise); `null` is shown, because absence and explicit null
+ * are different facts.
+ */
+export function recordEntries(record) {
+  const out = [];
+  // A cycle is not expected on the wire, but right-clicking a record must never
+  // be able to blow the stack — one malformed payload would blank the whole UI.
+  const seen = new WeakSet();
+
+  const walk = (value, path) => {
+    if (value === undefined) return;
+    // A missing record and an empty record both mean "nothing to show"; an
+    // entry with a blank key would render as a row of empty cells.
+    if (path === '' && value === null) return;
+    if (value === null) {
+      out.push([path, 'null']);
+      return;
+    }
+    if (typeof value === 'object') {
+      if (seen.has(value)) {
+        out.push([path, '[circular]']);
+        return;
+      }
+      seen.add(value);
+      if (typeof value[GZ_MARK] === 'string') {
+        out.push([path, `[gzip, ${value[GZ_MARK].length} base64 chars]`]);
+        return;
+      }
+      if (Array.isArray(value)) {
+        if (value.length === 0) out.push([path, '[]']);
+        else value.forEach((item, i) => walk(item, `${path}[${i}]`));
+        return;
+      }
+      const keys = Object.keys(value);
+      if (keys.length === 0) {
+        // Same for a root-level empty object: no key to attach it to.
+        if (path !== '') out.push([path, '{}']);
+        return;
+      }
+      for (const k of keys) walk(value[k], path === '' ? k : `${path}.${k}`);
+      return;
+    }
+    out.push([path, String(value)]);
+  };
+  walk(record, '');
+  return out;
+}
+
+/** Epoch ms → locale clock time, or '' when the value is not a usable time. */
+export function formatClock(ms) {
+  return Number.isFinite(ms) ? new Date(ms).toLocaleTimeString() : '';
+}
+
 /** Severity ranking for sorting and display. Retirement events rank last. */
 export const SEVERITY_RANK = { FATAL: 0, CRITICAL: 1, WARNING: 2, HARMLESS: 3, CLOSE: 4 };
 
 export function isRetirement(severity) {
   return severity === 'CLOSE' || severity === 'HARMLESS';
+}
+
+/**
+ * Resolve the colour scheme actually in effect.
+ *
+ * `preference` is the user's stored choice ('auto' | 'light' | 'dark');
+ * `systemDark` is the OS setting. Pure, so the switch logic is testable without
+ * a DOM.
+ */
+export function resolveTheme(preference, systemDark) {
+  if (preference === 'dark' || preference === 'light') return preference;
+  return systemDark ? 'dark' : 'light';
+}
+
+/** CSS class marking a row with its severity, used by the row-colour mode. */
+export function severityRowClass(severity, extra) {
+  const base = `row-${String(severity || 'unknown').toLowerCase()}`;
+  return extra ? `${base} ${extra}` : base;
 }
 
 /**
@@ -124,6 +315,10 @@ export function applyAlert(map, { key, applied, event }) {
       firstSeen: prev?.firstSeen ?? event?.brokerTs ?? Date.now(),
       lastSeen: event?.brokerTs ?? Date.now(),
       count: (prev?.count ?? 0) + 1,
+      // The latest applied event is the record worth inspecting: right-clicking
+      // an alert row must show the enriched fields of the occurrence that put
+      // the row there, not a synthetic merge of every event ever folded in.
+      event: event ?? prev?.event,
     });
     return next;
   }
@@ -137,6 +332,7 @@ export function applyAlert(map, { key, applied, event }) {
       ...prev,
       severity: event?.severity ?? prev.severity,
       lastSeen: event?.brokerTs ?? prev.lastSeen,
+      event: event ?? prev.event,
     });
     return next;
   }

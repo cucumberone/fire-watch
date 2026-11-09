@@ -1,13 +1,16 @@
 /**
- * Sentinel-aware READ-ONLY Dragonfly client.
+ * Sentinel-aware Dragonfly client for the gateway.
  *
- * The gateway has no write access to Dragonfly by design: a gateway with no
- * write access cannot violate the write-guard invariant even if it is
- * misconfigured (websocket-server.md §5).
+ * The gateway's own data path is READ-ONLY: it streams events to browsers and
+ * never modifies the event log. There is deliberately no generic `set`, `del`
+ * or `eval` wrapper, because the absence of a method is a stronger guarantee
+ * than a comment (websocket-server.md §5).
  *
- * This module therefore exposes only reads (subscribe, zrangebyscore, mget) and
- * has no `set`, `del`, or `eval` wrapper at all. That is deliberate — the
- * absence of a method is a stronger guarantee than a comment.
+ * The one exception is `ackAlert`: acknowledging an alert is an operator action
+ * issued from the UI, and it writes exactly two fields on one alert hash plus a
+ * pub/sub frame. It is implemented as a named method with a fixed command, not
+ * as a general write escape hatch, so this file still cannot be used to modify
+ * events or indexes (docs/acknowledge.md §4).
  */
 import Redis from 'ioredis';
 
@@ -15,7 +18,7 @@ export class DragonflyReader {
   constructor(cfg, log) {
     this.cfg = cfg;
     this.log = log;
-    this.client = null;      // reads
+    this.client = null;      // reads (and the one narrow write)
     this.subscriber = null;  // pub/sub, must be its own connection
   }
 
@@ -129,6 +132,89 @@ export class DragonflyReader {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The one write the gateway performs.
+   *
+   * Writes `acked_by` / `acked_at` onto a single alert hash and returns the
+   * previous values so the caller can decide whether this was a state change.
+   *
+   * Safety properties, all deliberate:
+   *
+   *  - Only these two fields are ever written. `severity`, `count`, `last_seen`
+   *    and the watermark belong to the worker's fold; touching them from the
+   *    gateway would race the fold and could resurrect an ordering bug.
+   *  - `HSETNX`-style guard via the Lua below: the ack is NOT overwritten if one
+   *    already exists, so two operators clicking at once cannot fight, and a
+   *    second click is a no-op rather than a silent re-attribution.
+   *  - The TTL is only extended, never created. An alert hash that has already
+   *    expired must not be resurrected as an ack-only entry with no alert data,
+   *    which would render as a phantom row in every UI.
+   *  - A READONLY reply means we are pointed at a demoted replica after a
+   *    failover: re-resolve the master once, then fail. The caller reports the
+   *    failure to the client; it must not be swallowed.
+   */
+  async ackAlert(hashKey, by, nowMs, ttlMs) {
+    const script = `
+      if redis.call('EXISTS', KEYS[1]) == 0 then
+        return {'missing'}
+      end
+      local prevBy = redis.call('HGET', KEYS[1], 'acked_by')
+      local prevAt = redis.call('HGET', KEYS[1], 'acked_at')
+      if prevAt and tonumber(prevAt) and tonumber(prevAt) > 0 then
+        return {'already', prevBy or '', prevAt}
+      end
+      redis.call('HSET', KEYS[1], 'acked_by', ARGV[1], 'acked_at', ARGV[2])
+      redis.call('PEXPIRE', KEYS[1], ARGV[3])
+      return {'acked', ARGV[1], ARGV[2]}
+    `;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const c = await this.connect();
+      try {
+        const res = await c.eval(script, 1, hashKey, by, String(nowMs), String(ttlMs));
+        const [status, ackedBy, ackedAt] = res;
+        if (status === 'missing') return { status: 'missing' };
+        if (status === 'already') return { status: 'already', ack: { by: ackedBy, at: Number(ackedAt) } };
+        return { status: 'acked', ack: { by: ackedBy, at: Number(ackedAt) } };
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');
+        if (!retryable || attempt === 1) throw err;
+        this.log.warn('ack write hit a demoted node, re-resolving master', { err: msg });
+        await this.reset();
+      }
+    }
+    throw new Error('unreachable');
+  }
+
+  /** Bulk read of ack state, keyed by alert key. Bounded by the caller. */
+  async readAcks(hashKeys) {
+    if (hashKeys.length === 0) return [];
+    const c = await this.connect();
+    const pipeline = c.pipeline();
+    for (const k of hashKeys) pipeline.hmget(k, 'acked_by', 'acked_at');
+    const results = await pipeline.exec();
+    return results.map(([err, value]) => {
+      if (err) return null;
+      if (!Array.isArray(value)) return null;
+      return { acked_by: value[0], acked_at: value[1] };
+    });
+  }
+
+  /** Drop the client so the next call re-resolves the master. */
+  async reset() {
+    if (this.client) {
+      try { this.client.disconnect(); } catch { /* ignore */ }
+    }
+    this.client = null;
+  }
+
+  /** Publish a frame. Used only to broadcast an ack change. */
+  async publish(channel, payload) {
+    const c = await this.connect();
+    return c.publish(channel, payload);
   }
 
   async quit() {

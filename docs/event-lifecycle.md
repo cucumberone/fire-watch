@@ -112,6 +112,7 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 | `first_seen` | broker ts of the first event in the **current open episode** |
 | `last_seen` | broker ts of the **most recent** applied event — this is the "last occurrence" |
 | `count` | occurrences in the current episode, after coalescing (§5.4) |
+| `acked_by` | operator label who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
 | `last_id` | event id of the most recent applied event |
 | `closed_by`, `closed_at` | the CLOSE/HARMLESS that retired the episode |
 | `watermark`, `watermark_id` | ordering guard (§5.2) |

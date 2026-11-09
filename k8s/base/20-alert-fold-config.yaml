@@ -36,6 +36,13 @@ data:
     local is_open = redis.call('EXISTS', KEYS[2])
 
     -- 2. retirement events end the episode.
+    --
+    --    An acknowledgement belongs to ONE episode. Clearing it here is what
+    --    stops a re-fire from looking already-handled: without the HDEL, an
+    --    operator would ack a resolved alert, the condition would return, and
+    --    the row would come back still marked "acked by alice" with nobody
+    --    looking at it. That is the single most dangerous failure mode of an
+    --    ack feature (docs/acknowledge.md §6).
     if sev == 'CLOSE' or sev == 'HARMLESS' then
       redis.call('DEL', KEYS[2])
       redis.call('HSET', KEYS[1],
@@ -45,6 +52,7 @@ data:
         'closed_at', ts,
         'watermark', ts,
         'watermark_id', id)
+      redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
       redis.call('PEXPIRE', KEYS[1], 604800000)
       return 3
     end
@@ -71,5 +79,13 @@ data:
       'count', count,
       'watermark', ts,
       'watermark_id', id)
+
+    -- A new episode (fresh == 1) starts unacknowledged. The ack is an
+    -- operator's statement about a specific occurrence; carrying it into the
+    -- next episode would silently hide a re-fire (docs/acknowledge.md §6).
+    if fresh == 1 then
+      redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
+    end
+
     redis.call('PEXPIRE', KEYS[1], 604800000)
     return (fresh == 1) and 1 or 2

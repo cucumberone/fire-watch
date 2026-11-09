@@ -1,0 +1,133 @@
+/**
+ * Tests for ack validation and rendering.
+ *   node --test "src/ack.test.js"
+ *
+ * These guard the write path: the gateway is now able to modify Dragonfly, so
+ * every rule that keeps that write narrow is pinned here.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  ANONYMOUS,
+  MAX_ALERT_QUERY_KEYS,
+  MAX_KEY_LEN,
+  ackAlertKey,
+  ackFrame,
+  isValidAlertKey,
+  normaliseAck,
+  validateAck,
+  validateAlertQuery,
+} from './ack.js';
+
+// ------------------------------------------------------------------ key rules
+test('accepts a normal source:type alert key', () => {
+  assert.equal(isValidAlertKey('sensor-a:telemetry.temperature'), true);
+  assert.equal(isValidAlertKey('a'), true);
+});
+
+test('rejects empty, non-string and over-long keys', () => {
+  for (const bad of ['', null, undefined, 42, {}, []]) {
+    assert.equal(isValidAlertKey(bad), false, JSON.stringify(bad));
+  }
+  assert.equal(isValidAlertKey('x'.repeat(MAX_KEY_LEN)), true);
+  assert.equal(isValidAlertKey('x'.repeat(MAX_KEY_LEN + 1)), false);
+});
+
+test('rejects keys containing control characters', () => {
+  // A newline in a key would forge a second log line; a NUL would truncate a
+  // hash field in some clients.
+  assert.equal(isValidAlertKey('a\nb'), false);
+  assert.equal(isValidAlertKey('a\u0000b'), false);
+  assert.equal(isValidAlertKey('a\u007fb'), false);
+});
+
+test('allows glob characters because HSET does no pattern matching', () => {
+  // Rejecting these would be a lie about what is dangerous here.
+  assert.equal(isValidAlertKey('sensor:*'), true);
+  assert.equal(isValidAlertKey('a?b'), true);
+  assert.equal(isValidAlertKey('a[b]'), true);
+});
+
+// -------------------------------------------------------------- validateAck
+test('validateAck accepts a valid frame', () => {
+  const v = validateAck({ op: 'ack', key: 'sw1:link.down', by: 'gunnar' });
+  assert.deepEqual(v, { ok: true, key: 'sw1:link.down', by: 'gunnar' });
+});
+
+test('validateAck defaults the operator to anonymous', () => {
+  assert.equal(validateAck({ op: 'ack', key: 'a:b' }).by, ANONYMOUS);
+  assert.equal(validateAck({ op: 'ack', key: 'a:b', by: '' }).by, ANONYMOUS);
+  assert.equal(validateAck({ op: 'ack', key: 'a:b', by: '   ' }).by, ANONYMOUS);
+  assert.equal(validateAck({ op: 'ack', key: 'a:b', by: 42 }).by, ANONYMOUS);
+});
+
+test('validateAck sanitises the operator label', () => {
+  // The label is displayed to other operators, so a newline or a control char
+  // must not survive, and a very long name must be truncated.
+  assert.equal(validateAck({ op: 'ack', key: 'a:b', by: 'g u n\nnar' }).by, 'g u n nar');
+  assert.equal(validateAck({ op: 'ack', key: 'a:b', by: 'x'.repeat(500) }).by.length, 128);
+});
+
+test('validateAck rejects a bad op and a bad key', () => {
+  assert.equal(validateAck({ op: 'subscribe' }).code, 'bad_op');
+  assert.equal(validateAck(null).code, 'bad_op');
+  assert.equal(validateAck({ op: 'ack' }).code, 'bad_key');
+  assert.equal(validateAck({ op: 'ack', key: 42 }).code, 'bad_key');
+  assert.equal(validateAck({ op: 'ack', key: '' }).code, 'bad_key');
+});
+
+// ------------------------------------------------------- validateAlertQuery
+test('validateAlertQuery accepts and de-duplicates keys', () => {
+  const v = validateAlertQuery({ op: 'alerts', keys: ['a:b', 'a:b', 'c:d'] });
+  assert.equal(v.ok, true);
+  assert.deepEqual(v.keys, ['a:b', 'c:d']);
+});
+
+test('validateAlertQuery accepts an empty list', () => {
+  // A UI with no alerts open yet sends an empty array; that is not an error.
+  assert.deepEqual(validateAlertQuery({ op: 'alerts', keys: [] }), { ok: true, keys: [] });
+});
+
+test('validateAlertQuery refuses an unbounded read', () => {
+  // This is the guard that stops a client asking the pod to scan the keyspace.
+  const v = validateAlertQuery({ op: 'alerts', keys: Array(MAX_ALERT_QUERY_KEYS + 1).fill('a:b') });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, 'too_many_keys');
+});
+
+test('validateAlertQuery rejects a non-array and an invalid key', () => {
+  assert.equal(validateAlertQuery({ op: 'alerts', keys: 'a:b' }).code, 'bad_keys');
+  assert.equal(validateAlertQuery({ op: 'alerts', keys: ['a:b', 'bad\nkey'] }).code, 'bad_key');
+});
+
+// ------------------------------------------------------------------ rendering
+test('ackAlertKey adds the fw:alert prefix', () => {
+  assert.equal(ackAlertKey('sw1:link.down'), 'fw:alert:sw1:link.down');
+});
+
+test('normaliseAck returns null when not acked', () => {
+  assert.equal(normaliseAck(null), null);
+  assert.equal(normaliseAck({}), null);
+  // A by-field without a timestamp is a partial write, not an ack.
+  assert.equal(normaliseAck({ acked_by: 'gunnar' }), null);
+  assert.equal(normaliseAck({ acked_by: 'gunnar', acked_at: '0' }), null);
+  assert.equal(normaliseAck({ acked_by: 'gunnar', acked_at: 'nope' }), null);
+});
+
+test('normaliseAck returns a usable ack, defaulting the operator', () => {
+  assert.deepEqual(normaliseAck({ acked_by: 'gunnar', acked_at: '1762699200000' }), {
+    by: 'gunnar',
+    at: 1762699200000,
+  });
+  assert.deepEqual(normaliseAck({ acked_at: '1762699200000' }), {
+    by: ANONYMOUS,
+    at: 1762699200000,
+  });
+});
+
+test('ackFrame is a JSON alert frame carrying the ack', () => {
+  const frame = JSON.parse(ackFrame('a:b', { by: 'gunnar', at: 1 }));
+  assert.equal(frame.op, 'alert');
+  assert.equal(frame.key, 'a:b');
+  assert.deepEqual(frame.ack, { by: 'gunnar', at: 1 });
+});

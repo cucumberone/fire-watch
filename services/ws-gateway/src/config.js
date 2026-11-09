@@ -44,6 +44,10 @@ export function loadConfig() {
     heartbeatMs: int('FW_HEARTBEAT_MS', 20000),
     pongTimeoutMs: int('FW_PONG_TIMEOUT_MS', 10000),
 
+    // Acks live on the alert hash, so they expire with it. Only extended, never
+    // created: an expired alert must not be resurrected as an ack-only entry.
+    alertTtlMs: int('FW_ALERT_TTL', 604800) * 1000,
+
     port: int('FW_PORT', 8080),
     logLevel: optional('FW_LOG_LEVEL', 'info'),
   };

@@ -24,6 +24,13 @@ import {
   eventFrame,
   alertFrame,
 } from './subscription.js';
+import {
+  validateAck,
+  validateAlertQuery,
+  ackAlertKey,
+  normaliseAck,
+  ackFrame,
+} from './ack.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
@@ -127,6 +134,16 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (frame.op === 'ack') {
+      await handleAck(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'alerts') {
+      await handleAlertQuery(conn, frame, send);
+      return;
+    }
+
     if (frame.op !== 'subscribe') {
       send(JSON.stringify({ op: 'error', code: 'bad_op', message: `unknown op ${frame.op}` }));
       return;
@@ -190,6 +207,103 @@ wss.on('connection', (ws, req) => {
 });
 
 // ------------------------------------------------------------------- pub/sub wiring
+/**
+ * Acknowledge an alert on behalf of an operator.
+ *
+ * Two pods can receive two clicks on the same alert; the Lua in `ackAlert`
+ * makes the first one win and the second a no-op, so the attribution cannot be
+ * overwritten by a later click.
+ *
+ * The broadcast is a single `fw:ch:alerts` frame. Every gateway pod receives it
+ * through its existing subscriber and fans it out to its own sockets, so the
+ * click reaches browsers connected to *other* pods without any pod-to-pod
+ * coordination (docs/acknowledge.md §5).
+ */
+async function handleAck(conn, frame, send) {
+  const verdict = validateAck(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  const hashKey = ackAlertKey(verdict.key);
+  let result;
+  try {
+    result = await reader.ackAlert(hashKey, verdict.by, Date.now(), cfg.alertTtlMs);
+  } catch (err) {
+    log.error('ack write failed', { key: verdict.key, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'ack_failed',
+      message: 'could not persist the acknowledgement, retry',
+    }));
+    return;
+  }
+
+  if (result.status === 'missing') {
+    // The alert hash has expired, or never existed. Do not create one: an
+    // ack-only hash would render as a phantom row with no severity and no count.
+    send(JSON.stringify({
+      op: 'error',
+      code: 'no_such_alert',
+      message: 'that alert no longer exists',
+    }));
+    return;
+  }
+
+  // Confirm to the originator so its UI settles even if the pub/sub frame is
+  // delayed or lost (a reconnect re-reads the state anyway).
+  send(ackFrame(verdict.key, result.ack));
+
+  if (result.status === 'acked') {
+    try {
+      await reader.publish(cfg.channelAlerts, JSON.stringify({
+        kind: 'ack',
+        key: verdict.key,
+        ack: result.ack,
+      }));
+    } catch (err) {
+      // The write is durable already. Other pods will not see this frame, so
+      // their clients keep showing the alert as un-acked until they re-read
+      // state on reconnect. Loud, because it is a real divergence.
+      log.error('ack broadcast failed after a durable write', {
+        key: verdict.key, err: String(err),
+      });
+    }
+  }
+}
+
+/**
+ * Bulk ack-state read for the alerts a client is currently showing.
+ *
+ * Client-supplied keys, never a server-side scan: `SCAN fw:alert:*` on every
+ * connect is exactly the unbounded read the design forbids
+ * (websocket-server.md §3).
+ */
+async function handleAlertQuery(conn, frame, send) {
+  const verdict = validateAlertQuery(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  let hashes;
+  try {
+    hashes = await reader.readAcks(verdict.keys.map(ackAlertKey));
+  } catch (err) {
+    log.warn('ack state read failed', { err: String(err) });
+    send(JSON.stringify({ op: 'error', code: 'alerts_failed', message: 'could not read ack state' }));
+    return;
+  }
+
+  const out = [];
+  verdict.keys.forEach((key, i) => {
+    const ack = normaliseAck(hashes[i]);
+    if (ack) out.push({ key, ack });
+  });
+  send(JSON.stringify({ op: 'alerts', alerts: out }));
+}
+
 function handleEventMessage(raw) {
   let parsed;
   try {
@@ -225,6 +339,17 @@ function handleAlertMessage(raw) {
     return;
   }
   if (!parsed || !parsed.key) return;
+
+  // An ack change is broadcast as its own frame, so every pod's clients see the
+  // new state without a re-read (docs/acknowledge.md §5).
+  if (parsed.kind === 'ack') {
+    const frame = ackFrame(parsed.key, parsed.ack);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
   const frame = alertFrame(parsed.key, parsed.applied);
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);

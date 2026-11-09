@@ -91,7 +91,11 @@ The script reads one file, so the Dragonfly password the pods get and the passwo
 
 Rotation notes — including the extra Sentinel step that a Dragonfly password change needs — are in `.env`.
 
-### 2. Workloads
+### 2. Build images (on demand)
+
+Each service has its own workflow and every one is **manual** — nothing builds on push. Run the one you changed from the Actions tab ("Run workflow"), and it pushes `ghcr.io/cucumberone/fire-watch/<service>`. See [docs/images.md](docs/images.md).
+
+### 3. Workloads
 
 ```bash
 kubectl kustomize k8s/base | less                     # review production shape
@@ -105,6 +109,7 @@ kubectl delete -k k8s/overlays/lab/kubernetes        # then delete the PVCs too
 
 See [docs/kustomize.md](docs/kustomize.md) §3 for what the lab changes, how the two flavours differ, and what the lab **cannot** test.
 
+
 ## Status
 
 **Manifests implemented.** `k8s/base` renders 48 objects. The lab renders 30 (OpenShift flavour) or 28 (Kubernetes flavour) — 1 replica each, no PDBs, no HPA, no monitoring. `k8s/overlays/ghcr` renders the same 48 with every service image repointed at GHCR. All verified with `kubectl kustomize`.
@@ -113,7 +118,7 @@ Still needed before a real deploy:
 
 | Item | Why |
 |---|---|
-| ~~Build images: `worker`, `ws-gateway`, `frontend`, `http-ingress`, `sentinel-bridge`~~ | done — GitHub Actions pushes all five to GHCR ([docs/images.md](docs/images.md)) |
+| ~~Build images: `worker`, `ws-gateway`, `frontend`, `http-ingress`, `sentinel-bridge`~~ | done — run the per-service workflow on demand; it pushes to GHCR ([docs/images.md](docs/images.md)) |
 | Pin real image digests | base uses tags; production requires digests |
 | ~~Create the two Secrets~~ | done — `./scripts/create-secrets.sh` reads `.env`, or use the Deploy workflow |
 | Set Variables + Secrets for both Environments | only if deploying from CI; `lab` and `prod` each need their own copy — see §1 option B |

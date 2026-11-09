@@ -1,27 +1,37 @@
 name: http-ingress image
 
-# Builds and pushes ONLY the http-ingress image.
+# Builds and pushes ONLY the worker image.
 #
 #   ghcr.io/cucumberone/fire-watch/http-ingress:<tag>
 #
-# Path-filtered, so an unrelated change does not rebuild it. See worker.yaml for
-# the full rationale on path filters, tags and the absence of
-# `pull_request_target`.
+# MANUAL ONLY — `workflow_dispatch`, no push and no pull_request trigger.
+# Nothing publishes as a side effect of a merge; an image moves only when a
+# human asks for it. One workflow per service, so a build here never touches
+# another service's image.
+#
+# Tags are derived from the dispatch, because there is no push/PR ref to name
+# the build after:
+#   `sha-<short>`             always — the commit the image was built from
+#   `manual-<yyyyMMdd-HHmmss>` always — distinguishes two runs of the same commit
+#   `latest`                  opt-in via the input
+#
+# No `pull_request_target` exists here at all, so a PR can never reach the
+# registry credential.
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*.*.*']
-    paths:
-      - 'services/http-ingress/**'
-      - '.github/workflows/http-ingress.yaml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'services/http-ingress/**'
-      - '.github/workflows/http-ingress.yaml'
   workflow_dispatch:
+    inputs:
+      push_latest:
+        description: Also tag this build `latest`
+        type: boolean
+        # Opt-in rather than automatic. "latest" is a claim that this is the
+        # current good build, and a manual run is not automatically that. The
+        # sha and timestamp tags are always produced, so every run stays
+        # addressable either way.
+        default: true
 
+# Scoped per service, not per ref. A shared group would make the worker build
+# cancel the frontend build.
 concurrency:
   group: image-http-ingress-${{ github.ref }}
   cancel-in-progress: true
@@ -32,6 +42,9 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # Hard-coded: OCI registry paths must be lowercase and the repository casing is
+  # `cucumberone/fire-watch`. If the repo is renamed, this is one of the places
+  # to change (the other is k8s/overlays/ghcr/kustomization.yaml).
   IMAGE: ghcr.io/cucumberone/fire-watch/http-ingress
 
 jobs:
@@ -46,13 +59,14 @@ jobs:
           cache: npm
           cache-dependency-path: services/http-ingress/package-lock.json
 
+      # `npm ci`, not `npm install`: the lockfile is committed and a build must
+      # not resolve a different dependency tree than the one tested.
       - name: Install
         working-directory: services/http-ingress
         run: npm ci --no-audit --no-fund
 
-      # Two of these tests are live-broker end-to-end tests that auto-skip when
-      # no RabbitMQ is reachable. They skip in CI, so the unit coverage is what
-      # gates the push — recorded here so the green check is not over-read.
+      # Tests gate the push. Publishing a broken image is worse than publishing
+      # nothing.
       - name: Test
         working-directory: services/http-ingress
         run: npm test
@@ -60,7 +74,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -72,12 +85,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # No type=ref,event=pr / event=branch / type=semver: those only fire on
+          # push and pull_request events, which this workflow no longer has.
+          # Leaving them in would be dead configuration that reads as working.
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
+            type=raw,value=manual-{{date 'yyyyMMdd-HHmmss'}}
+            type=raw,value=latest,enable=${{ inputs.push_latest }}
           labels: |
             org.opencontainers.image.title=fire-watch http-ingress
             org.opencontainers.image.description=fire-watch event server — HTTP to AMQP ingress
@@ -89,12 +103,30 @@ jobs:
         with:
           context: services/http-ingress
           file: services/http-ingress/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          # Always push: a manual build that did not publish would be pointless.
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # linux/amd64 only: the target is x86 OpenShift. Add arm64 here when
+          # there is an arm64 cluster to run it on.
           platforms: linux/amd64
           cache-from: type=gha,scope=http-ingress
           cache-to: type=gha,scope=http-ingress,mode=max
           provenance: true
           sbom: true
           pull: true
+
+      # A manual run has no PR page to look at, so the tag just produced is the
+      # only record of what to deploy. Put it where a human will see it.
+      - name: Summary
+        run: |
+          {
+            echo "### http-ingress image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ env.IMAGE }}\` |"
+            echo "| Tags | \`${{ steps.meta.outputs.version }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| latest moved | \`${{ inputs.push_latest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

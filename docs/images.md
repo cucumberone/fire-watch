@@ -4,45 +4,64 @@ How the five service images are built and published, and how the manifests consu
 
 ## 1. What CI does
 
-One workflow per service, each with a `paths` filter:
+**Every workflow is manual — `workflow_dispatch` only.** No `push`, no
+`pull_request`. Nothing publishes as a side effect of a merge; an image moves only
+when a human asks for it.
 
-| Workflow | Builds | Triggers on changes to |
+| Workflow | Builds | Trigger |
 |---|---|---|
-| `worker.yaml` | `worker` | `services/worker/**`, itself |
-| `ws-gateway.yaml` | `ws-gateway` | `services/ws-gateway/**`, itself |
-| `frontend.yaml` | `frontend` | `services/frontend/**`, itself |
-| `http-ingress.yaml` | `http-ingress` | `services/http-ingress/**`, itself |
-| `sentinel-bridge.yaml` | `sentinel-bridge` | `services/sentinel-bridge/**`, itself |
+| `worker.yaml` | `worker` | manual |
+| `ws-gateway.yaml` | `ws-gateway` | manual |
+| `frontend.yaml` | `frontend` | manual |
+| `http-ingress.yaml` | `http-ingress` | manual |
+| `sentinel-bridge.yaml` | `sentinel-bridge` | manual |
+| `deploy.yaml` | — | manual, picks a GitHub Environment (`lab`/`prod`) |
 
 ```mermaid
 flowchart LR
-  A[change in services/worker] --> W[worker.yaml]
-  B[change in services/frontend] --> F[frontend.yaml]
-  C[unrelated change] --> X[nothing builds]
-  W --> T[test] --> P[push ghcr.io/.../worker]
-  F --> T2[test] --> P2[push ghcr.io/.../frontend]
+  H[human clicks Run workflow] --> W[<service>.yaml]
+  W --> T[test]
+  T -->|pass| P[push ghcr.io/.../&lt;service&gt;]
+  T -->|fail| X[nothing published]
+  P --> S[Summary: the tag to deploy]
 ```
 
-Why split rather than a matrix: the images share no code. A matrix rebuilt all five for a one-line frontend tweak, which is wasted runner minutes, and it moved every `latest` tag on every push even when an image was byte-identical. Splitting means a change builds and publishes exactly the thing that changed.
+One workflow per service so a build touches exactly one image. Test and build are
+steps in the **same job** — with one service per workflow there is nothing to gate
+across services, and a `needs:` would just add a second runner start-up. The test
+step still runs before the build step, so a failing test still blocks the push.
 
-Test and build are steps in the **same job**, not separate jobs. With one service per workflow there is nothing to gate across services, and a `needs:` would just add a second runner start-up for no benefit. The test step still runs before the build step, so a failing test still blocks the push.
+### 1.1 Tags
 
-### 1.1 Path filters and tags
+Manual dispatch has no branch, PR or tag ref, so the tags cannot come from the
+event:
 
-`paths` filters are **not evaluated for tag pushes** ([GitHub docs](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore)). That is the behaviour we want: pushing `v1.2.3` builds all five images, because a release is a release of the whole system.
+| Tag | Always? | Purpose |
+|---|---|---|
+| `sha-<short>` | yes | the commit the image was built from |
+| `manual-<yyyyMMdd-HHmmss>` | yes | distinguishes two runs of the same commit |
+| `latest` | **opt-in** (`push_latest` input, default `true`) | the "current good build" claim |
 
-### 1.2 The path-filter trap on pull requests
+`latest` is opt-in rather than automatic because it is a promise that this build
+is the one to run, and a manual run is not automatically that. The other two tags
+are always produced, so every run stays addressable regardless.
 
-A workflow skipped by a path filter leaves its check in a **Pending** state, and a PR that requires that check cannot merge. With five path-filtered workflows, a required-checks rule listing all five will deadlock any PR that does not touch all five services.
+**This replaced a silently broken configuration.** The previous version used
+`type=ref,event=branch`, `type=ref,event=pr`, `type=semver`, plus
+`flavor: latest=auto`. Under `workflow_dispatch` those produce nothing:
+`latest=auto` only fires for tag/semver/pep440/match events, so leaving them in
+would have produced images tagged **only** with a sha and never `latest` — while
+the workflow still read as though it did.
 
-Two workable policies:
+### 1.2 Why no push trigger
 
-| Policy | Consequence |
-|---|---|
-| require only `worker image / build` etc. for services a PR touches | correct, but the ruleset must be maintained per PR (not practical) |
-| require **no** image checks on PRs; rely on branch protection for review | simplest, and the right default here — PR builds are feedback, not a gate |
+Deploying or publishing on every push makes an image tag and a cluster mutation
+the same event. A merge that only fixes a typo in the docs would rebuild and
+re-tag images nobody changed. Manual dispatch keeps that decision explicit.
 
-Do **not** solve it by adding a dummy job that always runs: a matrix job with a path filter still reports skipped, and a separate always-running "path check" workflow reintroduces the all-five build you just removed.
+The cost is that a stale image is possible if someone forgets to run the build.
+The mitigation is that `deploy.yaml` is manual too, and the image tag it deploys
+is printed in the step summary — so what is running is always a tag a human chose.
 
 ## 2. Images and contexts
 
@@ -69,18 +88,13 @@ The explicit `test -f` is deliberate: if the build ever changes its output direc
 
 It is done in the workflow rather than the Dockerfile to keep the shipped image nginx-only — no Node toolchain in a runtime that serves static files.
 
-## 3. Tags
+## 3. Concurrency
 
-| Trigger | Tags produced |
-|---|---|
-| push to `main` (matching paths) | `main`, `sha-<short>`, and **`latest`** |
-| pull request (matching paths) | `pr-<n>`, `sha-<short>` — **never `latest`**, and nothing is pushed |
-| tag `v1.2.3` | `1.2.3`, `1.2`, `sha-<short>`, `latest` — for **all five** services |
-| manual dispatch | same as a branch push for the selected ref |
-
-`latest` only moves on a default-branch push. A PR builds the image to prove it compiles but has no credential to push with (`docker/login-action` is skipped on `pull_request`), because `pull_request_target` would hand a write token and repository secrets to unreviewed code.
-
-Each workflow has its own concurrency group (`image-<service>-<ref>`). A shared group would make the worker build cancel the frontend build when both are pushed in the same commit.
+Each workflow has its own group (`image-<service>-<ref>`) with
+`cancel-in-progress: true`. A shared group would make the worker build cancel the
+frontend build. `deploy.yaml` uses `deploy-fire-watch-<environment>` with
+`cancel-in-progress: false`, because two interleaved applies would leave a cluster
+between two desired states.
 
 ## 4. Registry path
 
@@ -133,9 +147,9 @@ Verified: `kubectl kustomize k8s/overlays/ghcr` renders 5 `ghcr.io` image refere
 
 ## 7. Pinning for production
 
-The overlay uses `latest` for convenience. That is fine for a lab and wrong for production: a pod restarted after a new push silently changes version.
+The overlay uses `latest` for convenience. That is fine for a lab and wrong for production: anything that moves `latest` silently changes what a restarted pod runs.
 
-Pin per environment by editing the overlay's `newTag`, preferring the `sha-<short>` tag each CI run prints, or the digest:
+Pin per environment by editing the overlay's `newTag`, preferring the `sha-<short>` tag (or the `manual-<timestamp>` tag) that each build prints in its step summary, or the digest:
 
 ```yaml
 images:
@@ -150,9 +164,10 @@ The base manifests already carry the same warning: production requires digests, 
 
 | Omitted | Why |
 |---|---|
-| a single matrix workflow | rebuilds all five for a one-service change and moves every `latest` tag needlessly; see §1 |
-| `pull_request_target` | runs with secrets on unreviewed code; a PR editing a Dockerfile would get the registry credential |
-| a "run on everything" job for required checks | reintroduces the all-five build. See §1.2 — use branch protection instead of required image checks on PRs |
+| any `push` / `pull_request` trigger | makes publishing a side effect of a merge; see §1.2 |
+| a single matrix workflow | one build would touch all five images for a one-service change; see §1 |
+| `pull_request_target` | runs with secrets on unreviewed code. Not reachable here, but the rule stands if a PR trigger is ever added |
+| `flavor: latest=auto` | produces no `latest` under `workflow_dispatch`; `latest` is an explicit `type=raw` input instead, see §1.1 |
 | `arm64` | the target is x86 OpenShift; a second platform doubles build time for an image nothing runs. Add it in the `platforms:` field when there is an arm64 cluster |
 | Trivy / SCA scan | worth adding, but it needs a policy decision on what fails a build. Not invented here |
 | Auto-commit of new digests back to the overlay | turns every build into a commit and a rebuild loop; pin by hand per environment |

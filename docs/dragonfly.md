@@ -143,9 +143,52 @@ affinity:
 
 | Probe | Command | Notes |
 |---|---|---|
-| startup | `redis-cli -p 6379 ping` every 5s, `failureThreshold: 60` | full-sync of a ~30 GiB dataset takes well under a minute; 60 is generous |
+| startup | `ping` asserted on output, every 5s, `failureThreshold: 60` | full-sync of a ~30 GiB dataset takes well under a minute; 60 is generous |
 | readiness | `ping` **and**, on replicas, `INFO replication` showing `master_link_status:up` | a replica mid-full-sync must not count as healthy |
 | liveness | `ping`, `initialDelaySeconds: 60`, `failureThreshold: 6` | never assert `ROLE` — a legitimate failover would restart the pod |
+
+### 5.1 Two probe defects that made all three probes meaningless
+
+Both were found on the lab cluster. Neither is visible by reading the YAML, and
+together they produced a pod that was `2/2 Running` with **0 restarts** while
+every authenticated client was being rejected.
+
+**`redis-cli` exits 0 even when AUTH fails.** It prints `NOAUTH Authentication
+required.` (or `Warning: AUTH failed`) and still returns success:
+
+```
+$ redis-cli -p 6379 --no-auth-warning -a WRONGPASS ping
+NOAUTH Authentication required.
+$ echo $?
+0
+```
+
+So `redis-cli ... ping` as a probe passes with the wrong password. The assertion
+has to be on the output:
+
+```yaml
+exec:
+  command:
+    - /bin/sh
+    - -c
+    - redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" ping | grep -qx PONG
+```
+
+`grep -qx PONG` is exact-match, so a `NOAUTH`/`Warning` line cannot satisfy it.
+
+**`$(VAR)` is not expanded inside a probe `exec.command`.** The kubelet expands
+`$(VAR)` only in `env[].value` and in the container's own `command`/`args`. A
+probe written as
+
+```yaml
+command: ["redis-cli", "-p", "6379", "-a", "$(DRAGONFLY_PASSWORD)", "ping"]
+```
+
+passes the **literal string** `$(DRAGONFLY_PASSWORD)` to `redis-cli`, guaranteeing
+an AUTH failure on every run. Combined with defect 1 it was invisible. Probes must
+route through `/bin/sh -c` so the shell expands the variable from the container
+environment. Diagnostic signature: `WRONGPASS` in the Dragonfly log at exactly
+`livenessProbe.periodSeconds` cadence (30s here), forever, with no restarts.
 
 ## 6. Storage and pruning
 

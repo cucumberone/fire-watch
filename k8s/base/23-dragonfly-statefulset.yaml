@@ -67,10 +67,32 @@ spec:
           # The flag file lives in the ConfigMap; the entrypoint reads it and
           # appends --requirepass before exec'ing the server.
           workingDir: /
+          # Probes.
+          #
+          # Two defects were found here the hard way, both worth stating because
+          # neither is obvious from the YAML:
+          #
+          # 1. redis-cli exits 0 EVEN WHEN AUTH FAILS. It prints
+          #    "NOAUTH Authentication required." to stdout and still returns
+          #    success. A probe of the form `redis-cli ... ping` therefore passes
+          #    with the wrong password, which is how a pod sat Ready for 37
+          #    minutes while every authenticated client was rejected.
+          #    The assertion has to be on the OUTPUT.
+          #
+          # 2. `$(VAR)` in a probe `exec.command` JSON array is NOT expanded by
+          #    the kubelet. Only the `env[].value` and `command`/`args` fields of
+          #    the container spec go through $(VAR) substitution. Here the old
+          #    probes passed the literal string "$(DRAGONFLY_PASSWORD)" to
+          #    redis-cli, which meant a guaranteed AUTH failure on every run —
+          #    silently invisible for the reason in (1). Probes must go through
+          #    /bin/sh -c so the shell expands it from the container environment.
           startupProbe:
             # A 36gb dataset replay can take a long time; 60 * 5s = 5 minutes.
             exec:
-              command: ["redis-cli", "-p", "6379", "--no-auth-warning", "-a", "$(DRAGONFLY_PASSWORD)", "ping"]
+              command:
+                - /bin/sh
+                - -c
+                - redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" ping | grep -qx PONG
             periodSeconds: 5
             failureThreshold: 60
             timeoutSeconds: 10
@@ -82,7 +104,7 @@ spec:
                 - /bin/sh
                 - -c
                 - |
-                  redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" ping >/dev/null || exit 1
+                  redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" ping | grep -qx PONG || exit 1
                   role=$(redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" --raw info replication | grep '^role:' | tr -d '\r' | cut -d: -f2)
                   if [ "$role" = "slave" ]; then
                     redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" --raw info replication \
@@ -94,11 +116,13 @@ spec:
           livenessProbe:
             # Never assert ROLE here: a legitimate failover would restart the pod.
             exec:
-              command: ["redis-cli", "-p", "6379", "--no-auth-warning", "-a", "$(DRAGONFLY_PASSWORD)", "ping"]
+              command:
+                - /bin/sh
+                - -c
+                - redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" ping | grep -qx PONG
             initialDelaySeconds: 60
             periodSeconds: 30
             failureThreshold: 6
-
             timeoutSeconds: 10
         # ------------------------------------------------- snapshot pruner
         - name: snapshot-pruner

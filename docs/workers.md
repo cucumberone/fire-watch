@@ -173,6 +173,38 @@ This also keeps the rule that the write target must come from the `dragonfly` Se
 
 `prefetch`: default 32. Higher raises throughput and re-delivery blast radius on restart; keep it modest until throughput requires otherwise.
 
+### 6.1 Dragonfly client: two bugs that made a healthy database look dead
+
+The worker reported `dragonfly connection ready` and then failed every one of its
+30 startup attempts with `dragonfly not reachable yet` — against a database that
+answered `PING` fine. Two independent defects, both in `connect()`:
+
+**`enableOfflineQueue: false` plus a non-lazy constructor is a lost race.** The
+flag is needed so a write fails loudly instead of queueing forever, but it also
+rejects *any* command issued before the socket is ready:
+
+```
+Error: Stream isn't writeable and enableOfflineQueue options is false
+```
+
+`new Redis(...)` starts dialling in the background, so the `ping()` on the next
+line raced it and lost on every cold start. The fix is `lazyConnect: true` plus an
+explicit `await client.connect()`, which resolves only once the connection is
+authenticated and ready. The same bug was present in the ws-gateway read and
+subscribe clients, where it surfaced as `subscribe failed, retrying in 3s` at boot.
+
+**A rejected in-flight promise was never cleared.** `connect()` memoised its work
+in `this._connecting` and cleared that field only on the success path. After a
+single transient failure every later call returned the same rejected promise, so
+the 30-attempt retry budget burned itself out against one error and then logged
+`could not reach dragonfly through sentinel` — a wrong diagnosis that would send
+an operator hunting a database outage. The `finally` block now clears the field on
+failure too, so each retry genuinely reconnects.
+
+Diagnostic signature: `resolved dragonfly master` and `dragonfly connection ready`
+followed immediately by an unbroken run of `dragonfly not reachable yet`, with the
+master resolving correctly throughout.
+
 ## 7. Probes
 
 | Probe | Endpoint | Notes |

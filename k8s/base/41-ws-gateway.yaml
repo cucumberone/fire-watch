@@ -36,7 +36,17 @@ spec:
       containers:
         - name: gateway
           image: image-registry.openshift-image-registry.svc:5000/fire-watch/ws-gateway:latest
-          imagePullPolicy: IfNotPresent
+          # Always, NOT IfNotPresent. The tag is `:latest`, which is mutable, so
+          # IfNotPresent silently keeps running whatever image happened to be
+          # cached on the node — a rebuild would never deploy. Observed here: the
+          # bridge ran sha256:1b8b9436 for ten minutes while the registry held
+          # 4710ad48, and nothing in the pod said so.
+          #
+          # Trade-off: an Always policy needs the registry on every restart. The
+          # alternative is pinning an immutable tag per environment, which is the
+          # right answer for production (docs/images.md §7). Always is correct
+          # for a lab on a mutable tag.
+          imagePullPolicy: Always
           ports:
             - { name: http, containerPort: 8080 }
           env:

@@ -64,10 +64,15 @@ export class DragonflyClient {
         host: master.host,
         port: master.port,
         password: this.cfg.dragonflyPassword,
-        lazyConnect: false,
+        // Connect explicitly instead of letting the constructor dial in the
+        // background. With enableOfflineQueue:false (below, which we need so a
+        // write fails loudly rather than queueing forever) any command issued
+        // before the socket is ready is rejected outright with
+        //   "Stream isn't writeable and enableOfflineQueue options is false"
+        // Calling ping() straight after `new Redis(...)` was therefore a race,
+        // and it lost every time on a cold start.
+        lazyConnect: true,
         maxRetriesPerRequest: 3,
-        // A write must fail loudly, not queue forever: the message stays
-        // unacked and is redelivered.
         enableOfflineQueue: false,
         retryStrategy: (times) => Math.min(times * 200, 3000),
       });
@@ -75,14 +80,32 @@ export class DragonflyClient {
       client.on('error', (err) => this.log.warn('dragonfly socket error', { err: String(err) }));
       client.on('ready', () => this.log.info('dragonfly connection ready', master));
 
-      await client.ping();
+      try {
+        // connect() resolves once the connection is authenticated and ready.
+        await client.connect();
+        await client.ping();
+      } catch (err) {
+        // Abandon this client; a rejected ioredis instance is not reusable.
+        try { client.disconnect(); } catch { /* ignore */ }
+        throw err;
+      }
+
       this.client = client;
       this.currentMaster = master;
-      this._connecting = null;
       return client;
     })();
 
-    return this._connecting;
+    try {
+      return await this._connecting;
+    } finally {
+      // Clear the in-flight promise whether we succeeded OR failed. Leaving a
+      // rejected promise in this field poisons every later call: connect() would
+      // keep handing back the same rejection, so the 30-attempt startup retry
+      // burned through its budget against one transient failure and then
+      // reported the database unreachable while it was in fact healthy. That is
+      // exactly what happened on this cluster.
+      this._connecting = null;
+    }
   }
 
   /**

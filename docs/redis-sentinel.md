@@ -83,6 +83,48 @@ Why a controller and not `--replicaof` in the manifest: a hard-coded `--replicao
 
 Alternative considered and rejected: giving each pod a startup script that asks Sentinel for the master. It works, but only at boot — it cannot fix the Service selector, and it re-introduces an ordering dependency on Sentinel readiness.
 
+### 4.1 Two lease defects that made leadership impossible
+
+`sentinel-bridge` was `1/1 Running` and serving `/readyz: ready` while holding **no
+lease at all**. Both causes are in `@kubernetes/client-node` interop, and both were
+masked by error handling that treated real faults as benign races.
+
+**Lease times are `MicroTime`, not millisecond RFC3339.** `spec.acquireTime` and
+`spec.renewTime` must carry **exactly six** fractional digits. `Date#toISOString()`
+emits three, and the API server rejects the body:
+
+```
+400 BadRequest: Lease in version "v1" cannot be handled as a Lease:
+    parsing time "...58.666Z" as "2006-01-02T15:04:05.000000Z07:00":
+    cannot parse ".666Z" as ".000000"
+```
+
+Format with `d.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z')`. JS has only
+millisecond resolution, so pad rather than imply finer precision.
+
+**`readNamespacedLease` resolves to an envelope, not the object.** In
+`@kubernetes/client-node` 0.22.x the call is positional
+(`readNamespacedLease(name, namespace, ...)`) *and* returns
+`{ response, body }`. Code that consumed the promise directly got an object with no
+`spec`, which reads as "another replica holds an expired lease", so every cycle took
+the takeover path and replaced the Lease with a metadata-less body:
+
+```
+400 BadRequest: the name of the object (… based on URL) was undeterminable: name must be provided
+```
+
+Return `res?.body ?? res` so a future client upgrade cannot silently break it.
+
+**Why it was invisible.** Every lease failure was logged at `debug` as
+`lease create race lost`, and `/readyz` reports readiness for a standby by design —
+so the process looked healthy and reported `ready`. Two rules follow:
+
+- Only an HTTP **409** is a lost race. Everything else is a fault and must be logged
+  at `error` and rethrown.
+- Readiness deliberately does **not** prove leadership (a standby is ready), so
+  leadership must be verified from the cluster: `kubectl get lease
+  sentinel-bridge-leader` must exist and name the current pod.
+
 ## 5. Client behaviour
 
 Workers and gateways connect through a Sentinel-aware client:

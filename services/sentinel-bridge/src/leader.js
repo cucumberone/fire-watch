@@ -10,6 +10,31 @@ import k8s from '@kubernetes/client-node';
 
 const { CoordinationV1Api } = k8s;
 
+/**
+ * Kubernetes MicroTime, NOT RFC3339-with-millis.
+ *
+ * Lease spec.acquireTime / spec.renewTime are MicroTime, whose required format
+ * is 2006-01-02T15:04:05.000000Z07:00 — EXACTLY six fractional digits. Plain
+ * Date#toISOString() emits three (.123Z), and the API server rejects it:
+ *
+ *   400 BadRequest: Lease in version "v1" cannot be handled as a Lease:
+ *   parsing time "...58.666Z" as "2006-01-02T15:04:05.000000Z07:00":
+ *   cannot parse ".666Z" as ".000000"
+ *
+ * That 400 made every lease write fail, so leadership was never acquired, and
+ * because the failure was logged as a lost create race it was invisible. JS has
+ * only millisecond resolution, so pad with three zeros rather than pretending
+ * to finer precision.
+ */
+function microTime(date = new Date()) {
+  return date.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
+}
+
+/** 409 means another replica really did create it first. */
+function isConflict(err) {
+  return err?.response?.statusCode === 409 || err?.statusCode === 409;
+}
+
 export class LeaderElector {
   constructor({ kc, namespace, leaseName, identity, leaseDurationMs, log }) {
     this.api = kc.makeApiClient(CoordinationV1Api);
@@ -26,14 +51,22 @@ export class LeaderElector {
       // POSITIONAL signature in @kubernetes/client-node 0.22.x:
       //   readNamespacedLease(name, namespace, pretty?, options?)
       // The v1.x object form leaves `namespace` undefined here, and every lease
-      // call then throws "Required parameter namespace was null or undefined" —
-      // which surfaced as a permanent 503 on /readyz because ready is only set
-      // after a successful reconcile.
+      // call then throws "Required parameter namespace was null or undefined".
+      //
+      // 0.22.x ALSO wraps the result: the promise resolves to
+      //   { response: IncomingMessage, body: V1Lease }
+      // Returning the envelope instead of `body` leaves `lease.spec` undefined,
+      // which reads as "someone else holds it and it is expired", so every cycle
+      // took the takeover path and replaced the Lease with an object that had no
+      // metadata. The API server answered:
+      //   400 the name of the object (… based on URL) was undeterminable:
+      //       name must be provided
+      // Accept either shape so a client upgrade cannot silently break this.
       const res = await this.api.readNamespacedLease(
         this.leaseName,
         this.namespace,
       );
-      return res;
+      return res?.body ?? res ?? null;
     } catch (err) {
       if (err?.response?.statusCode === 404 || err?.statusCode === 404) return null;
       throw err;
@@ -51,7 +84,7 @@ export class LeaderElector {
 
   /** Try to acquire or renew. Returns true when this replica holds the lease. */
   async tryAcquireOrRenew() {
-    const now = new Date().toISOString();
+    const now = microTime();
     let lease = await this._get();
 
     if (!lease) {
@@ -73,10 +106,20 @@ export class LeaderElector {
         this.log.info('lease acquired (created)', { lease: this.leaseName });
         return true;
       } catch (err) {
-        // Lost the create race to the other replica.
-        this.log.debug('lease create race lost', { err: String(err) });
         this.isLeader = false;
-        return false;
+        // Only a 409 is an actual race. Anything else (400 on a malformed
+        // MicroTime, 403, network) is a real fault and must not be swallowed at
+        // debug level — doing that is exactly how the timestamp bug hid.
+        if (isConflict(err)) {
+          this.log.debug('lease create race lost', { err: String(err) });
+          return false;
+        }
+        this.log.error('lease create failed', {
+          err: String(err),
+          status: err?.response?.statusCode,
+          body: err?.body,
+        });
+        throw err;
       }
     }
 
@@ -103,9 +146,17 @@ export class LeaderElector {
         this.log.warn('lease taken over (previous holder expired)', { previous: holder });
         return true;
       } catch (err) {
-        this.log.debug('lease takeover race lost', { err: String(err) });
         this.isLeader = false;
-        return false;
+        if (isConflict(err)) {
+          this.log.debug('lease takeover race lost', { err: String(err) });
+          return false;
+        }
+        this.log.error('lease takeover failed', {
+          err: String(err),
+          status: err?.response?.statusCode,
+          body: err?.body,
+        });
+        throw err;
       }
     }
 
@@ -125,7 +176,7 @@ export class LeaderElector {
     try {
       const lease = await this._get();
       if (lease?.spec?.holderIdentity === this.identity) {
-        lease.spec.renewTime = new Date(Date.now() - this.leaseDurationMs * 2).toISOString();
+        lease.spec.renewTime = microTime(new Date(Date.now() - this.leaseDurationMs * 2));
         await this.api.replaceNamespacedLease(this.leaseName, this.namespace, lease);
         this.log.info('lease released');
       }

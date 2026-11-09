@@ -183,9 +183,9 @@ The base points at the OpenShift internal registry, so a normal `kubectl apply -
 kubectl apply -k k8s/overlays/ghcr
 ```
 
-That overlay rewrites all five image references and attaches `imagePullSecrets: [{name: ghcr-pull}]` to the five Deployments. RabbitMQ, Dragonfly and Redis are pulled from `docker.io` and need no credential, so they are not patched.
+That overlay rewrites all five image references. RabbitMQ, Dragonfly and Redis are pulled from `docker.io` and need no credential, so they are not patched.
 
-Verified: `kubectl kustomize k8s/overlays/ghcr` renders 5 `ghcr.io` image references and 5 `imagePullSecrets`, and the base plus both lab overlays still render unchanged.
+Verified: `kubectl kustomize k8s/overlays/ghcr` renders 5 `ghcr.io` image references, and the base plus both lab overlays still render unchanged.
 
 ## 7. Pinning for production
 
@@ -201,6 +201,20 @@ images:
 ```
 
 The base manifests already carry the same warning: production requires digests, not tags.
+
+### 7.1 `imagePullPolicy: Always` is required on a mutable tag
+
+All five GHCR Deployments set `imagePullPolicy: Always`. This is not tuning, it is
+correctness: with `IfNotPresent` and a mutable tag the kubelet keeps whatever image
+the node already cached, so **a rebuild never deploys**. Observed on the lab
+cluster — `sentinel-bridge` ran `sha256:1b8b9436…` for ten minutes while GHCR held
+`sha256:4710ad48…`, and nothing in the pod reported the mismatch. Two restarts
+were needed before the fix took effect, which is exactly the kind of silent drift
+that makes an operator distrust a deploy.
+
+Trade-off: `Always` needs the registry reachable on every container start. Once
+production pins an immutable tag or digest (§7), `IfNotPresent` becomes correct
+again, because the tag then *is* the identity. Until then, `Always`.
 
 ## 8. Deliberate omissions
 

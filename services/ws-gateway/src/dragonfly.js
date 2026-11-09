@@ -63,12 +63,19 @@ export class DragonflyReader {
       host: master.host,
       port: master.port,
       password: this.cfg.dragonflyPassword,
+      // lazyConnect + explicit connect(). With enableOfflineQueue:false any
+      // command sent before the socket is ready is rejected with
+      //   "Stream isn't writeable and enableOfflineQueue options is false"
+      // so issuing ping() right after the constructor was a race. The gateway
+      // lost it at boot and logged "subscribe failed, retrying in 3s".
+      lazyConnect: true,
       enableOfflineQueue: false,
       maxRetriesPerRequest: 2,
       retryStrategy: (times) => Math.min(times * 200, 3000),
     };
     this.client = new Redis(opts);
     this.client.on('error', (e) => this.log.warn('read socket error', { err: String(e) }));
+    await this.client.connect();
     await this.client.ping();
     return this.client;
   }
@@ -84,6 +91,8 @@ export class DragonflyReader {
       host: master.host,
       port: master.port,
       password: this.cfg.dragonflyPassword,
+      // Same race as connect(): connect explicitly before issuing commands.
+      lazyConnect: true,
       enableOfflineQueue: false,
       retryStrategy: (times) => Math.min(times * 200, 3000),
     });
@@ -91,6 +100,7 @@ export class DragonflyReader {
     this.subscriber.on('message', (ch, msg) => {
       if (ch === channel) onMessage(msg);
     });
+    await this.subscriber.connect();
     await this.subscriber.subscribe(channel);
     this.log.info('subscribed', { channel });
   }

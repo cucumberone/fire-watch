@@ -59,8 +59,11 @@ spec:
             - name: RABBITMQ_NODENAME
               value: "rabbit@$(POD_NAME).rabbitmq-headless.fire-watch.svc.cluster.local"
             - name: RABBITMQ_DEFAULT_USER
+              # Account NAME, not a credential — from the ConfigMap so it is
+              # readable and auditable. Must equal the Secret's `username`,
+              # because the broker creates its only account from this value.
               valueFrom:
-                secretKeyRef: { name: fire-watch-rabbitmq, key: username }
+                configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }
             - name: RABBITMQ_DEFAULT_PASS
               valueFrom:
                 secretKeyRef: { name: fire-watch-rabbitmq, key: password }

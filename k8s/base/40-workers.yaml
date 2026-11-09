@@ -47,7 +47,7 @@ spec:
               value: "5672"
             - name: AMQP_USER
               valueFrom:
-                secretKeyRef: { name: fire-watch-rabbitmq, key: username }
+                configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }
             - name: AMQP_PASS
               valueFrom:
                 secretKeyRef: { name: fire-watch-rabbitmq, key: password }

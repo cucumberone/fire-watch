@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fire-watch-rabbitmq-user
+  labels:
+    app.kubernetes.io/name: worker
+data:
+  # The broker account name. NOT a credential: it is worthless without the
+  # password, which stays in the Secret. Kept in a ConfigMap so it is readable
+  # with `kubectl get cm` and does not need a secret round-trip to inspect.
+  #
+  # This must equal `username` in Secret fire-watch-rabbitmq, because RabbitMQ
+  # creates its only account from RABBITMQ_DEFAULT_USER. If the two disagree the
+  # broker has account A and every client authenticates as B.
+  AMQP_USER: "fw"

@@ -2,7 +2,7 @@
 
 `k8s/` is a **Kustomize** tree, not a flat directory of YAML. One base describes the production-shaped deployment, overlays adjust it per environment.
 
-**Status: implemented and rendering.** `kubectl kustomize k8s/base` produces 48 objects, `k8s/overlays/ghcr` produces the same 48 with GHCR image references, and the lab produces 30 via `k8s/overlays/lab/openshift` and 28 via `k8s/overlays/lab/kubernetes` (the two Routes are deleted in the latter). `k8s/overlays/lab/common` also renders 30 on its own. The values below are verified against the rendered output, not aspirational.
+**Status: implemented and rendering.** `kubectl kustomize k8s/base` produces 49 objects, `k8s/overlays/ghcr` produces the same 49 with GHCR image references, and the lab produces 31 via `k8s/overlays/lab/openshift` and 29 via `k8s/overlays/lab/kubernetes` (the two Routes are deleted in the latter). `k8s/overlays/lab/common` also renders 31 on its own. The values below are verified against the rendered output, not aspirational.
 
 ```
 k8s/
@@ -139,7 +139,7 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 
 | | `lab/openshift` | `lab/kubernetes` |
 |---|---|---|
-| Objects rendered | 30 | 28 |
+| Objects rendered | 31 | 29 |
 | `Route` objects | 2 | **0** (deleted at render time) |
 | `ws-gateway` Service | ClusterIP | **NodePort 30300** |
 | `frontend` Service | ClusterIP | **NodePort 30800** |

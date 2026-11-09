@@ -64,38 +64,36 @@ All six workflows ask which environment to target. For `deploy.yaml` that is
 load-bearing: it selects the namespace, kubeconfig, and broker/Dragonfly
 credentials (§9).
 
-For the five image workflows it selects one thing: the registry path.
-
-> **`NAMESPACE` vs `IMAGE_REGISTRY_PATH`** — similar names, unrelated things.
-> `NAMESPACE` is a **Kubernetes** namespace (`fire-watch-lab`) and only
-> `deploy.yaml` reads it. `IMAGE_REGISTRY_PATH` is an **OCI registry path**
-> under `ghcr.io` (`cucumberone/fire-watch`) and only the image workflows read
-> it. Renamed from `IMAGE_NAMESPACE` precisely because the old name invited that
-> confusion.
+For the five image workflows it changes **nothing about the image path**. The
+image is hard-coded:
 
 ```yaml
 env:
-  IMAGE: ghcr.io/${{ vars.IMAGE_REGISTRY_PATH || 'cucumberone/fire-watch' }}/worker
+  IMAGE: ghcr.io/cucumberone/fire-watch/worker
 ```
 
-| `IMAGE_REGISTRY_PATH` set? | Result |
-|---|---|
-| unset in that environment | falls back to `cucumberone/fire-watch` — both environments publish to the same path, which is what `k8s/overlays/ghcr` expects |
-| set to e.g. `cucumberone/fire-watch-lab` | that environment's builds go to the separate path |
+Why hard-coded rather than `${{ github.repository }}`: OCI registry paths must be
+lowercase and the repository casing is `cucumberone/fire-watch`, so the context
+value cannot be used directly.
 
-The `||` is not decoration. An unset variable resolves to an empty string, so
-without the fallback the image name would become `ghcr.io//worker` and the push
-would fail at the registry with an error that does not mention the variable.
+Why hard-coded rather than a per-environment variable: it must equal `newName:`
+in `k8s/overlays/ghcr`. A variable could point the build somewhere the overlay
+does not pull from, which fails as `ImagePullBackOff` on every pod while the
+build reports success — the failure appears in the cluster, not in CI, and
+nothing points at the variable. One literal in two places (workflow and overlay)
+is easier to keep honest than an unused override that can silently disagree.
 
-**Deliberately no `environment`-scoped secrets are used by the image workflows.**
-They authenticate with `secrets.GITHUB_TOKEN`, which is per-run not per-environment.
-The environment binding exists so one variable can vary the destination, not to
-give builds environment credentials they do not need.
+**So what does the environment selection do for a build?** It binds the job to
+that environment, which resolves `vars.*` and `secrets.*` against it. Today the
+image workflows read neither, so choosing `lab` vs `prod` produces the same
+image. The binding is there for consistency with `deploy.yaml` and so
+environment-scoped configuration *can* be added later without another edit to
+five files. If that reads as pointless today: it is — deliberately, rather than
+a variable that looks useful and breaks deploys.
 
-**Prerequisite:** the Environments must exist in
-**Settings → Environments** before the first run. If you pick a name that does not
-exist yet, GitHub creates it with no protection and every variable is empty — the
-image would land on the fallback path and you would not notice.
+**Prerequisite:** the Environments must exist in **Settings → Environments**
+before the first run. If you pick a name that does not exist yet, GitHub creates
+it with no protection.
 
 ### 1.3 Why no push trigger
 
@@ -146,7 +144,7 @@ between two desired states.
 ghcr.io/cucumberone/fire-watch/<service>:<tag>
 ```
 
-`IMAGE_REGISTRY_PATH`/`IMAGE` is hard-coded rather than `${{ github.repository }}` because OCI registry paths must be lowercase and the repository casing is `cucumberone/fire-watch`. If the repo is renamed, the `IMAGE` env var in each of the five workflows and the `images:` block in the GHCR overlay are the places to change.
+`IMAGE` is hard-coded rather than `${{ github.repository }}` because OCI registry paths must be lowercase and the repository casing is `cucumberone/fire-watch`. If the repo or org is renamed, the `IMAGE` env var in each of the five workflows **and** the `newName:` entries in the GHCR overlay are the places to change — they must stay identical.
 
 ## 5. Permissions and authentication
 

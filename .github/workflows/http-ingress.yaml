@@ -15,10 +15,6 @@ name: http-ingress image
 #   `manual-<yyyyMMdd-HHmmss>` always — distinguishes two runs of the same commit
 #   `latest`                  opt-in via the input
 #
-# The run is bound to a GitHub Environment (`lab` or `prod`), so an environment
-# variable such as IMAGE_REGISTRY_PATH can point the build at a different registry
-# namespace per environment without a second workflow.
-#
 # No `pull_request_target` exists here at all, so a PR can never reach the
 # registry credential.
 
@@ -55,15 +51,13 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # Resolved from the environment's IMAGE_REGISTRY_PATH variable, falling back to the
-  # repository default. `||` matters: an unset variable yields an empty string,
-  # which would otherwise produce a bare `ghcr.io//http-ingress` and fail at push time
-  # with a confusing registry error.
-  #
-  # Override IMAGE_REGISTRY_PATH per environment only if lab and prod publish to
-  # different namespaces — the default keeps both on one, which is what the
-  # k8s/overlays/ghcr manifests expect.
-  IMAGE: ghcr.io/${{ vars.IMAGE_REGISTRY_PATH || 'cucumberone/fire-watch' }}/http-ingress
+  # Hard-coded on purpose. OCI registry paths must be lowercase and the repo
+  # casing is `cucumberone/fire-watch`, so `${{ github.repository }}` cannot be
+  # used directly. It must also match `newName:` in k8s/overlays/ghcr — if the
+  # push path and the pull path ever disagree, every pod fails ImagePullBackOff
+  # while the build reports success. One literal in two places is easier to
+  # keep honest than an unused variable that can silently override one of them.
+  IMAGE: ghcr.io/cucumberone/fire-watch/http-ingress
 
 jobs:
   build:

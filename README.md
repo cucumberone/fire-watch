@@ -85,7 +85,8 @@ The script reads one file, so the Dragonfly password the pods get and the passwo
 
 | Secret | Keys | Consumed by |
 |---|---|---|
-| `fire-watch-rabbitmq` | `username`, `password` | RabbitMQ, workers, http-ingress |
+| `fire-watch-rabbitmq` | `password` | RabbitMQ, workers, http-ingress |
+| ConfigMap `fire-watch-rabbitmq-user` | `AMQP_USER` | the broker's account *name* — not a secret, so it is a ConfigMap |
 | `fire-watch-dragonfly` | `password` | Dragonfly `--requirepass`, all 3 Sentinels, workers, ws-gateway, sentinel-bridge, redis-exporter |
 | `fire-watch-ingress` | `token` | http-ingress bearer auth |
 
@@ -95,7 +96,7 @@ Rotation notes — including the extra Sentinel step that a Dragonfly password c
 
 Each service has its own workflow and every one is **manual** — nothing builds on push. Run the one you changed from the Actions tab ("Run workflow"), pick the **`lab`** or **`prod`** environment, and it pushes `ghcr.io/cucumberone/fire-watch/<service>`.
 
-Both environments publish to the same registry path by default, so the `ghcr` overlay works for either. To split them, set an `IMAGE_REGISTRY_PATH` variable in each environment — note that is an OCI registry path under `ghcr.io`, unrelated to the Kubernetes `NAMESPACE`. See [docs/images.md](docs/images.md) §1.2.
+The image path is hard-coded (`ghcr.io/cucumberone/fire-watch/<service>`) and must match the `newName:` entries in `k8s/overlays/ghcr`. The environment selection binds the job to that Environment but does not change where the image is pushed. See [docs/images.md](docs/images.md) §1.2.
 
 ### 3. Workloads
 
@@ -114,7 +115,7 @@ See [docs/kustomize.md](docs/kustomize.md) §3 for what the lab changes, how the
 
 ## Status
 
-**Manifests implemented.** `k8s/base` renders 48 objects. The lab renders 30 (OpenShift flavour) or 28 (Kubernetes flavour) — 1 replica each, no PDBs, no HPA, no monitoring. `k8s/overlays/ghcr` renders the same 48 with every service image repointed at GHCR. All verified with `kubectl kustomize`.
+**Manifests implemented.** `k8s/base` renders 49 objects. The lab renders 31 (OpenShift flavour) or 29 (Kubernetes flavour) — 1 replica each, no PDBs, no HPA, no monitoring. `k8s/overlays/ghcr` renders the same 49 with every service image repointed at GHCR. All verified with `kubectl kustomize`.
 
 Still needed before a real deploy:
 

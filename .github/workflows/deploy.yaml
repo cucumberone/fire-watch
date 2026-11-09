@@ -195,6 +195,40 @@ jobs:
           fi
           echo "cluster reachable, namespace $NAMESPACE present"
 
+      # ---------------------------------------------------------------------
+      # The broker's account NAME lives in ConfigMap fire-watch-rabbitmq-user,
+      # not in a Secret: an account name is not a credential, and a Secret
+      # cannot be read back to audit it.
+      #
+      # RABBITMQ_DEFAULT_USER comes from that ConfigMap, so the broker creates
+      # exactly one account with that name. If the environment's AMQP_USER
+      # variable disagrees, the broker has account A and every client
+      # authenticates as B — surfacing as PLUGIN_AUTH_FAILURE in the worker
+      # logs, which points at the password and not the cause.
+      #
+      # Checked BEFORE any Secret is written, so a mismatch fails without
+      # leaving the cluster half-configured.
+      # ---------------------------------------------------------------------
+      - name: Check AMQP_USER matches the ConfigMap
+        run: |
+          set -eu
+          cm_file=$(find k8s/base -name '12-rabbitmq-user-config.yaml' | head -1)
+          if [ -z "$cm_file" ]; then
+            echo "::error::12-rabbitmq-user-config.yaml not found in k8s/base"
+            exit 1
+          fi
+          cm_user=$(sed -n 's/^  AMQP_USER: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$cm_file")
+          if [ "$cm_user" != "$AMQP_USER" ]; then
+            echo "::error::AMQP_USER mismatch for environment '$TARGET_ENV'"
+            echo "  $cm_file sets AMQP_USER=$cm_user"
+            echo "  the environment variable is AMQP_USER=$AMQP_USER"
+            echo
+            echo "The broker creates its only account from the ConfigMap value."
+            echo "Change the variable or the ConfigMap so they agree."
+            exit 1
+          fi
+          echo "AMQP_USER agrees with the ConfigMap: $cm_user"
+
       # Secrets before workloads. Order matters on a FIRST install: Dragonfly
       # reads --requirepass from its Secret at start, and the Sentinels bake
       # DRAGONFLY_PASSWORD into sentinel.conf on first boot. Applying the
@@ -202,6 +236,9 @@ jobs:
       #
       # --from-env-file instead of --from-literal: a literal puts the value in
       # the process argument list, where it can surface in an error message.
+      #
+      # `password` only for RabbitMQ. AMQP_USER is NOT written here — it comes
+      # from the ConfigMap checked above.
       - name: Create or update Secrets
         run: |
           set -eu
@@ -216,7 +253,7 @@ jobs:
               | kubectl apply -f - >&2
           }
 
-          printf 'username=%s\npassword=%s\n' "$AMQP_USER" "$AMQP_PASS" > "$tmp/rabbitmq.env"
+          printf 'password=%s\n' "$AMQP_PASS" > "$tmp/rabbitmq.env"
           printf 'password=%s\n' "$DRAGONFLY_PASSWORD" > "$tmp/dragonfly.env"
           printf 'token=%s\n' "$FW_INGEST_TOKEN" > "$tmp/ingress.env"
 

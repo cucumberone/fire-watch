@@ -52,9 +52,11 @@ The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the t
 
 `k8s/` is a Kustomize tree. The base is the production shape (OpenShift). The lab has two flavours — pick the one that matches your lab cluster, both render the same deployment apart from networking.
 
-### 1. Secrets first
+### 1. Configuration first
 
-Secrets are **not** in the base manifests, so nothing secret can enter git. Generate them once:
+Secrets are **not** in the base manifests, so nothing secret can enter git. There are two ways to create the same three Secrets — pick one:
+
+**A. Locally (works today, any cluster you can reach)**
 
 ```bash
 cp .env.example .env                    # or use the generated .env already present
@@ -62,7 +64,24 @@ cp .env.example .env                    # or use the generated .env already pres
 ./scripts/create-secrets.sh             # create/update them in $NAMESPACE
 ```
 
-`.env` is git-ignored; `.env.example` is the committed template. The script reads `.env`, so the Dragonfly password the pods get and the password the Sentinels seed into `sentinel.conf` are provably the same string — the old commented-out snippet in `k8s/base/kustomization.yaml` regenerated a fresh password per invocation, which would have brought the cluster up with mismatched credentials.
+**B. From GitHub (`.github/workflows/deploy.yaml`, manual trigger)**
+
+The workflow takes an `environment` input — **`lab`** or **`prod`** — and uses that Environment's variables and secrets. Set them at **Settings → Environments → <lab|prod>**:
+
+| Store | Names |
+|---|---|
+| Variables (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `DFLY_MASTER_NAME`, `AMQP_USER` |
+| Secrets (masked) | `AMQP_PASS`, `DRAGONFLY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` |
+
+`NAMESPACE` must match the namespace the overlay hard-codes: `fire-watch-lab` for the lab overlays, `fire-watch` for `k8s/base` and `k8s/overlays/ghcr`. The workflow refuses to run when they disagree.
+
+Then run the **Deploy** workflow, picking the environment and overlay. It defaults to `dry_run: true`, so a first run validates without changing anything.
+
+> A GitHub-hosted runner cannot reach a private LAN (e.g. MicroK8s on `192.168.50.x`). Path B needs a self-hosted runner or a publicly reachable API server — see [docs/images.md](docs/images.md) §9.4.
+
+Either path produces identical Kubernetes objects; pods read the Secret via `secretKeyRef` and never see `.env` or GitHub. `.env` is git-ignored, `.env.example` is the committed template.
+
+The script reads one file, so the Dragonfly password the pods get and the password the Sentinels seed into `sentinel.conf` are provably the same string — the old commented-out snippet in `k8s/base/kustomization.yaml` regenerated a fresh password per invocation, which would have brought the cluster up with mismatched credentials.
 
 | Secret | Keys | Consumed by |
 |---|---|---|
@@ -96,7 +115,8 @@ Still needed before a real deploy:
 |---|---|
 | ~~Build images: `worker`, `ws-gateway`, `frontend`, `http-ingress`, `sentinel-bridge`~~ | done — GitHub Actions pushes all five to GHCR ([docs/images.md](docs/images.md)) |
 | Pin real image digests | base uses tags; production requires digests |
-| ~~Create the two Secrets~~ | done — `./scripts/create-secrets.sh` reads `.env` |
+| ~~Create the two Secrets~~ | done — `./scripts/create-secrets.sh` reads `.env`, or use the Deploy workflow |
+| Set Variables + Secrets for both Environments | only if deploying from CI; `lab` and `prod` each need their own copy — see §1 option B |
 | Confirm node size | 48Gi Dragonfly limit needs 128 GiB nodes to reschedule ([docs/sizing.md](docs/sizing.md) §3.3) |
 | `ghcr-pull` pull secret | only if deploying via `k8s/overlays/ghcr` and the packages stay private ([docs/images.md](docs/images.md) §5) |
 

@@ -1,0 +1,269 @@
+name: Deploy
+
+# Deploys fire-watch to a cluster, into one of two GitHub Environments.
+#
+#   Environment: lab  |  prod
+#
+# Each environment owns its OWN variables and secrets. GitHub resolves
+# `vars.X` / `secrets.X` against the job's Environment first, then the
+# repository defaults — so one workflow serves both without a single branch.
+#
+# Set them in: Settings → Environments → <lab|prod> → Environment variables /
+# Environment secrets.
+#
+# Per environment:
+#   Variables:  NAMESPACE  AMQP_HOST  AMQP_PORT  DFLY_MASTER_NAME  AMQP_USER
+#   Secrets:    AMQP_PASS  DRAGONFLY_PASSWORD  FW_INGEST_TOKEN  KUBECONFIG_B64
+#
+# AMQP_USER is a variable, not a secret: it is an account name, not a
+# credential. GitHub secrets cannot be read back after saving, which makes them
+# painful to verify, and it is worthless without AMQP_PASS.
+#
+# WHY TWO ENVIRONMENTS INSTEAD OF TWO WORKFLOWS. The deploy logic is identical;
+# only the values differ. Two workflows would be two places to fix the same bug,
+# and the day someone patches only one of them the environments silently
+# diverge. Environment-scoped configuration keeps one code path.
+#
+# WHY MANUAL ONLY. Deploying on every push to main would make an image tag and a
+# cluster mutation the same event. A merge that only fixes a typo in the docs
+# would still re-apply the cluster. `workflow_dispatch` keeps that decision
+# explicit. For CD later, add a `push: tags: ['v*.*.*']` trigger that hard-codes
+# `environment: prod`, plus required reviewers — never a branch trigger.
+#
+# REACHABILITY — READ THIS BEFORE ENABLING.
+# A GitHub-hosted runner runs on the public internet. It CANNOT reach a cluster
+# on a private LAN (e.g. MicroK8s at 192.168.50.x). Options, in order of
+# preference:
+#   1. a self-hosted runner inside the network (`runs-on: [self-hosted, ...]`)
+#   2. a publicly reachable API server (not recommended without an allow-list)
+#   3. run the same commands locally with `scripts/create-secrets.sh`
+# Point 3 is what works today; this workflow is for a reachable cluster. The
+# `lab` environment is the realistic candidate for a self-hosted runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target GitHub Environment (picks its vars and secrets)
+        type: choice
+        required: true
+        # No default. A deploy should never land somewhere because a form was
+        # submitted without reading it.
+        options:
+          - lab
+          - prod
+      overlay:
+        description: Kustomize overlay to apply
+        type: choice
+        default: k8s/overlays/ghcr
+        options:
+          - k8s/overlays/ghcr
+          - k8s/base
+          - k8s/overlays/lab/openshift
+          - k8s/overlays/lab/kubernetes
+      dry_run:
+        description: Render only (server-side dry run) — change nothing
+        type: boolean
+        # Defaults to true on purpose. A mistaken click should not mutate a
+        # cluster; the operator has to consciously untick this.
+        default: true
+
+# Scoped per environment AND never cancelling. Two interleaved applies would
+# update Secrets and objects out of step, leaving the cluster between two
+# desired states. Separate groups so a lab deploy never queues behind prod.
+concurrency:
+  group: deploy-fire-watch-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    # This is what binds the run to one environment's variables and secrets.
+    # If the environment does not exist, GitHub creates it with no protection —
+    # add required reviewers on `prod` before relying on it.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.DEPLOY_URL || '' }}
+
+    # Every value the run needs, declared once. Secrets cannot be referenced in
+    # an `if:` conditional, so they are surfaced as environment variables here
+    # and validated by name in the first step.
+    env:
+      # ---- environment variables (non-secret)
+      NAMESPACE: ${{ vars.NAMESPACE }}
+      AMQP_HOST: ${{ vars.AMQP_HOST }}
+      AMQP_PORT: ${{ vars.AMQP_PORT }}
+      DFLY_MASTER_NAME: ${{ vars.DFLY_MASTER_NAME }}
+      AMQP_USER: ${{ vars.AMQP_USER }}
+      # ---- environment secrets
+      AMQP_PASS: ${{ secrets.AMQP_PASS }}
+      DRAGONFLY_PASSWORD: ${{ secrets.DRAGONFLY_PASSWORD }}
+      FW_INGEST_TOKEN: ${{ secrets.FW_INGEST_TOKEN }}
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      # ---- inputs
+      TARGET_ENV: ${{ inputs.environment }}
+      OVERLAY: ${{ inputs.overlay }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail before touching a cluster. An empty DRAGONFLY_PASSWORD would create
+      # a Secret with an empty key and come up as a cluster where every Sentinel
+      # reports the master as down — a confusing failure far from its cause.
+      # Printing only the variable NAME is safe: GitHub masks secret values.
+      - name: Validate configuration
+        run: |
+          set -eu
+          missing=0
+          for v in NAMESPACE AMQP_HOST AMQP_PORT DFLY_MASTER_NAME AMQP_USER; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::missing VARIABLE for environment '$TARGET_ENV': $v"
+              missing=1
+            fi
+          done
+          for v in AMQP_PASS DRAGONFLY_PASSWORD FW_INGEST_TOKEN KUBECONFIG_B64; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::missing SECRET for environment '$TARGET_ENV': $v"
+              missing=1
+            fi
+          done
+          if [ -z "${OVERLAY:-}" ]; then
+            echo "::error::missing overlay input"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Set them in Settings → Environments → $TARGET_ENV."
+            exit 1
+          fi
+          echo "configuration present for '$TARGET_ENV' (values are never echoed)"
+
+      # The overlays hard-code their own `namespace:` — `k8s/overlays/lab/*` says
+      # `fire-watch-lab`, `k8s/base` says `fire-watch`. That namespace, not
+      # $NAMESPACE, is where `kubectl apply -k` will actually write.
+      #
+      # If the two disagree, the Secrets land in one namespace and the workloads
+      # in another: every pod comes up with an unresolvable secretKeyRef, and the
+      # error points at the pod rather than at this mismatch. Catch it here.
+      - name: Reconcile overlay namespace with $NAMESPACE
+        run: |
+          set -eu
+          overlay_ns="$(kubectl kustomize "$OVERLAY" | awk '/^  namespace: /{print $2; exit}')"
+          if [ -z "$overlay_ns" ]; then
+            echo "::error::could not read a namespace from $OVERLAY"
+            exit 1
+          fi
+          if [ "$overlay_ns" != "$NAMESPACE" ]; then
+            echo "::error::namespace mismatch for environment '$TARGET_ENV'"
+            echo "  $OVERLAY sets namespace: $overlay_ns"
+            echo "  NAMESPACE variable is:        $NAMESPACE"
+            echo
+            echo "Secrets would go to '$NAMESPACE' while the workloads go to"
+            echo "'$overlay_ns'. Fix the environment variable or pick a different"
+            echo "overlay — do not let this through."
+            exit 1
+          fi
+          echo "namespace agrees: $overlay_ns"
+
+      - name: Write kubeconfig
+        run: |
+          set -eu
+          umask 077
+          kc="$RUNNER_TEMP/kubeconfig"
+          # Base64 so a multi-line YAML kubeconfig survives the secret field.
+          # Written 0600 outside the workspace so it is never picked up by a
+          # later `git add` or uploaded as an artifact.
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$kc"
+          chmod 0600 "$kc"
+          echo "KUBECONFIG=$kc" >> "$GITHUB_ENV"
+          kubectl version --client=true
+
+      - name: Verify cluster access
+        run: |
+          set -eu
+          kubectl cluster-info >/dev/null
+          if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+            # Deliberate: k8s/base does not own the namespace (it is shared), so
+            # creating it here would be this workflow making a policy decision
+            # it has no business making.
+            echo "::error::namespace '$NAMESPACE' does not exist. Create it first:"
+            echo "  kubectl create namespace $NAMESPACE"
+            exit 1
+          fi
+          echo "cluster reachable, namespace $NAMESPACE present"
+
+      # Secrets before workloads. Order matters on a FIRST install: Dragonfly
+      # reads --requirepass from its Secret at start, and the Sentinels bake
+      # DRAGONFLY_PASSWORD into sentinel.conf on first boot. Applying the
+      # workloads first would start them against missing credentials.
+      #
+      # --from-env-file instead of --from-literal: a literal puts the value in
+      # the process argument list, where it can surface in an error message.
+      - name: Create or update Secrets
+        run: |
+          set -eu
+          umask 077
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          apply_secret() {
+            name="$1"; file="$2"
+            kubectl -n "$NAMESPACE" create secret generic "$name" \
+              --from-env-file="$file" --dry-run=client -o yaml \
+              | kubectl apply -f - >&2
+          }
+
+          printf 'username=%s\npassword=%s\n' "$AMQP_USER" "$AMQP_PASS" > "$tmp/rabbitmq.env"
+          printf 'password=%s\n' "$DRAGONFLY_PASSWORD" > "$tmp/dragonfly.env"
+          printf 'token=%s\n' "$FW_INGEST_TOKEN" > "$tmp/ingress.env"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: Secrets NOT applied"
+          else
+            apply_secret fire-watch-rabbitmq "$tmp/rabbitmq.env"
+            apply_secret fire-watch-dragonfly "$tmp/dragonfly.env"
+            apply_secret fire-watch-ingress "$tmp/ingress.env"
+          fi
+
+      - name: Apply manifests
+        run: |
+          set -eu
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: rendering and validating $OVERLAY"
+            kubectl kustomize "$OVERLAY" > /dev/null
+            kubectl apply -k "$OVERLAY" --dry-run=server
+          else
+            kubectl apply -k "$OVERLAY"
+          fi
+
+      - name: Rollout status
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -eu
+          # Only the workloads this workflow owns. RabbitMQ and Dragonfly are
+          # StatefulSets with their own (slow) readiness semantics; waiting on
+          # them here would make a deploy job look hung during a normal
+          # single-node reboot.
+          for d in worker ws-gateway frontend http-ingress sentinel-bridge; do
+            if kubectl -n "$NAMESPACE" get deployment "$d" >/dev/null 2>&1; then
+              kubectl -n "$NAMESPACE" rollout status "deployment/$d" --timeout=180s
+            fi
+          done
+
+      - name: Summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Deploy — $TARGET_ENV"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Environment | \`$TARGET_ENV\` |"
+            echo "| Overlay | \`$OVERLAY\` |"
+            echo "| Namespace | \`${NAMESPACE:-<unset>}\` |"
+            echo "| Dry run | \`${DRY_RUN:-<unset>}\` |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

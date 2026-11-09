@@ -1,6 +1,6 @@
 # Images
 
-How the five service images are built and published, and how the manifests consume them.
+How the five service images are built and published, and how the manifests consume them. Deployment configuration is in §9.
 
 ## 1. What CI does
 
@@ -159,3 +159,110 @@ The base manifests already carry the same warning: production requires digests, 
 | `npm test` inside the image build | tests run before the build step in the same workflow, so the image build stays a packaging step |
 
 `provenance: true` and `sbom: true` are enabled on the image builds, so each pushed image carries an SBOM and a signed provenance attestation at no extra configuration cost.
+
+## 9. Deployment configuration
+
+Deployment configuration lives in **two GitHub Environments**, `lab` and `prod`. Which store owns a value is decided by whether it is a credential.
+
+### 9.0 Two environments, one workflow
+
+`.github/workflows/deploy.yaml` takes an `environment` input (`lab` or `prod`) and binds the run to that Environment. GitHub resolves `vars.X` and `secrets.X` against the job's Environment before the repository defaults, so one workflow deploys to either target with no branching.
+
+| | `lab` | `prod` |
+|---|---|---|
+| `NAMESPACE` | `fire-watch-lab` | `fire-watch` |
+| Overlay | `k8s/overlays/lab/openshift` or `…/kubernetes` | `k8s/base` or `k8s/overlays/ghcr` |
+| Reviewers | none | **add required reviewers** |
+| `KUBECONFIG_B64` | lab cluster | prod cluster |
+
+**The `NAMESPACE` variable must match the namespace the chosen overlay hard-codes.** The overlays set their own `namespace:` — `k8s/overlays/lab/*` says `fire-watch-lab`, `k8s/base` and `k8s/overlays/ghcr` say `fire-watch`. If the variable disagrees, the Secrets land in one namespace and the workloads in another, and every pod then fails to resolve its `secretKeyRef`.
+
+The workflow refuses to run when they disagree (`Reconcile overlay namespace with $NAMESPACE`), printing both values. That check exists because the failure it prevents surfaces on the pod, far from the actual mistake.
+
+Why two environments rather than two workflows: the deploy logic is identical and only the values differ. Two workflows would be two places to fix the same bug, and the day only one is patched the environments silently diverge.
+
+### 9.1 Which store owns what
+
+Set per environment at **Settings → Environments → <lab|prod>**.
+
+| GitHub store | Values | Why there |
+|---|---|---|
+| **Variables** (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `DFLY_MASTER_NAME`, `AMQP_USER` | not credentials. Readable by anyone with repo read access, and printed unmasked in logs — which is fine for a hostname and a namespace |
+| **Secrets** (masked) | `AMQP_PASS`, `DRAGONFLY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` | credentials. Masked in logs and not readable back through the API |
+
+`AMQP_USER` is a variable rather than a secret: it is an account name, not a credential, and a GitHub secret cannot be read back after saving, which makes it painful to verify. It is worthless without `AMQP_PASS`, which is a secret.
+
+`AMQP_PASS` is deliberately its own value per environment. Sharing a broker password between lab and prod means a lab mistake can authenticate against production.
+
+An environment-scoped value overrides the repository default of the same name, so a repo-level `NAMESPACE` will NOT be used once the job binds to an Environment — each environment needs its own copy.
+
+`KUBECONFIG_B64` is the base64 of a kubeconfig. Base64 so a multi-line YAML file survives the secret field intact; the workflow decodes it to a `0600` file outside the workspace so it is never picked up by a later `git add` or uploaded as an artifact.
+
+Set them at **Settings → Secrets and variables → Actions**.
+
+### 9.2 The chain: store → Secret → pod
+
+```mermaid
+flowchart LR
+  V[repo variables] --> W[deploy.yaml]
+  S[repo secrets] --> W
+  W -->|kubectl create secret| K[(k8s Secret)]
+  K -->|secretKeyRef| P[pods]
+  E[.env + create-secrets.sh] -.->|local path, same result| K
+```
+
+Pods never see GitHub and never see `.env`. They read a Kubernetes Secret injected as an env var by `secretKeyRef`, in eight manifests: RabbitMQ, Dragonfly, the three Sentinels, sentinel-bridge, redis-exporter, http-ingress, workers and ws-gateway.
+
+`.env` and the GitHub store are two **ways to create the same Secret**, not two layers. Use whichever is convenient; both produce identical objects.
+
+### 9.3 Why deploy is manual only
+
+`workflow_dispatch`, not a push trigger. Deploying on every push to `main` would make an image tag and a cluster mutation the same event, so a docs-only merge would re-apply the cluster. For CD later, add a `push: tags: ['v*.*.*']` trigger that hard-codes `environment: prod`, plus required reviewers — never a branch trigger.
+
+`dry_run` defaults to **true**. A mistaken click renders and server-side-validates without mutating anything; the operator has to consciously untick it.
+
+The `environment` input has **no default**. A deploy should not land in production because a form was submitted without being read.
+
+Concurrency is `deploy-fire-watch-<environment>` with `cancel-in-progress: false`: separate groups so a lab deploy never blocks prod, and never cancelling because two interleaved applies would leave a cluster between two desired states.
+
+### 9.4 Reachability
+
+A GitHub-hosted runner is on the public internet and **cannot reach a cluster on a private LAN** — a MicroK8s node at `192.168.50.x` is unreachable. Options in order of preference:
+
+| Option | Note |
+|---|---|
+| self-hosted runner inside the network | `runs-on: [self-hosted, ...]`; the correct answer for a homelab or on-prem cluster |
+| publicly reachable API server | needs an IP allow-list; not recommended |
+| run locally | `./scripts/create-secrets.sh && kubectl apply -k ...` — what works today |
+
+The workflow is written for the first or second case. Nothing about it is wrong for a homelab; it simply will not work until the runner or the API server is reachable.
+
+### 9.5 Ordering and failure behaviour
+
+| Step | Reason |
+|---|---|
+| validate config first | an empty `DRAGONFLY_PASSWORD` would create a Secret with an empty key, and every Sentinel would report the master as down — a failure far from its cause. Only variable *names* are printed, never values |
+| reconcile the overlay namespace | the overlays hard-code `namespace:`; a mismatch with `$NAMESPACE` puts Secrets and workloads in different namespaces (§9.0) |
+| Secrets before workloads | on a first install Dragonfly needs `--requirepass` at start, and the Sentinels bake the password into `sentinel.conf` on first boot |
+| `--from-env-file`, not `--from-literal` | a literal puts the value in the process argument list, where it can surface in an error message |
+| namespace must pre-exist | `k8s/base` deliberately does not own the namespace (it is shared), so creating it here would be the workflow making a policy decision it has no business making |
+| rollout waits only on Deployments | RabbitMQ and Dragonfly are StatefulSets with slow readiness; waiting on them would make a deploy look hung during a normal single-node reboot |
+| `Summary` runs `always()` | a failed deploy is exactly when you want the step summary, so it cannot be gated on success |
+
+### 9.6 First-time setup per environment
+
+```bash
+# 1. Namespace (the manifests do not own it)
+kubectl create namespace fire-watch-lab        # for lab
+kubectl create namespace fire-watch           # for prod
+
+# 2. Generate the values
+openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32   # DRAGONFLY_PASSWORD, AMQP_PASS
+openssl rand -hex 32                                        # FW_INGEST_TOKEN
+
+# 3. Kubeconfig for the environment's cluster
+base64 -w0 < ~/.kube/config     # Linux      -> KUBECONFIG_B64
+base64 -i ~/.kube/config        # macOS
+```
+
+Then in **Settings → Environments → lab** (and again for `prod`): add the five variables and four secrets from §9.1, and set `NAMESPACE` to `fire-watch-lab` for lab / `fire-watch` for prod. On `prod`, add required reviewers.

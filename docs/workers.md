@@ -141,6 +141,39 @@ absorbed — so the live tail showed "Nothing yet" while alerts were open. `appl
 is what stops the client double-counting it, since the `occurrence` frame follows
 and carries the fold's own count.
 
+**The fold takes TWO ids, and aliasing them loses counts.** `ARGV[2]` is the
+*owner* — the id written to `last_id`, which must name a record that exists.
+`ARGV[6]` is the *arrival* — the id the `(ts, id)` ordering guard and the watermark
+compare against.
+
+Passing the owner as both made every absorbed copy after the first look like a
+redelivery *whenever it landed in the same millisecond as the original*: the guard
+saw the same timestamp and an id equal to the stored watermark and returned `0`.
+Measured on the lab with five identical events in one batch, across five trials:
+
+```
+count = 2, 2, 2, 4        <- never 5, while exactly one record was stored
+```
+
+Storage was right and the counter was lossy, which is the worse of the two: one
+record per condition is the design, but "how many times did this happen" silently
+undercounting is exactly the number an operator is reading.
+
+With the two ids separated, `count` reaches the true number of arrivals while a
+genuine redelivery — same timestamp **and** same id — is still dropped. Verified
+against the running fold script:
+
+| Case | Result |
+|---|---|
+| same ts, different arrival id | `1` — counted |
+| same ts, same id (redelivery) | `0` — dropped |
+| older ts | `0` — dropped |
+
+`alert-fold-checksum` is bumped to `3` for this; the ConfigMap volume update means
+an already-running worker picks up the new script, and `ARGV[6]` defaults to
+`ARGV[2]` when an older worker calls with five args, so the two can roll
+independently.
+
 
 ### 4.1 Index pruning is mandatory
 

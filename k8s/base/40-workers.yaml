@@ -30,7 +30,7 @@ spec:
         # This is not hypothetical. A worker that passed four keys to a three-key
         # script retired alerts silently and wrote no closed index, so the Closed
         # tab read "nothing has closed" with no error anywhere.
-        fire-watch/alert-fold-checksum: "2"
+        fire-watch/alert-fold-checksum: "3"
     spec:
       terminationGracePeriodSeconds: 60
       securityContext:

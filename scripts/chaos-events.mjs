@@ -10,29 +10,38 @@
  *
  * What it is actually testing
  * ---------------------------
- * Dedup is the fold's (timestamp, id) watermark: a redelivered event returns 0
- * and is dropped, so it changes neither `count` nor `last_seen`.
+ * Dedup happens at TWO levels, and they are worth separating because they answer
+ * different questions and fail differently.
  *
- *   applied = 0  duplicate / stale     -> dropped, nothing changes
- *   applied = 1  applied               -> count += 1, last_seen moves
- *   applied = 3  closed                -> alert retired
+ * 1. TRANSPORT dedup — keyed on the event id (`SET fw:evt:{id} NX`). The same
+ *    MESSAGE delivered twice is idempotent: nothing changes.
  *
- * This script sends exact COPIES of some events: same id, same source, same
- * type, but each copy gets a NEW broker timestamp (it is a new message). Those
- * are therefore NOT duplicates by the fold's definition — they are distinct
- * events and will be counted. That is the point of the exercise: a duplicate is
- * identified by event id, not by "it looks the same as the last one", so a
- * producer that re-sends the same payload under fresh ids is counted N times.
+ * 2. CONTENT dedup — keyed on a fingerprint of
+ *    `{source, type, severity, payload}` (services/worker/src/event.js). The same
+ *    CONDITION reported again under a NEW id must not create a second record: the
+ *    original absorbs it, `count` increments and `last_seen` moves.
  *
- * To exercise the real dedup path, `--same-id` is provided: it re-sends copies
- * with the ORIGINAL id, which the fold cannot tell from a redelivery, and those
- * must be dropped.
+ * That split is why this script has three distinct dials, and it matters that
+ * `EVT_Identifier` is NOT part of the fingerprint while `EVT_Summary` (which lands
+ * in `payload.msg`) IS:
+ *
+ *   --copies N            identical content, NEW id
+ *                         -> absorbed. 1 record, Count reaches N.
+ *   --copies N --same-id  identical content, SAME id
+ *                         -> dropped as a redelivery. 1 record, Count stays 1.
+ *   --mutate N            same type, DIFFERENT EVT_Summary
+ *                         -> a genuinely different report. N+1 records, Count N+1.
+ *
+ * The third case is the control. Without it, a run where every copy were absorbed
+ * would look like a pass even if the gate had been widened to "same type = same
+ * event", which would silently lose every genuinely repeated report of an
+ * incident.
  *
  * Two design constraints worth knowing before editing this file
  * ------------------------------------------------------------
  * 1. The alert key is `source:type` (services/worker/src/config.js). Two events
  *    with the same pair are the SAME alert, not two alerts. To get N distinct
- *    alerts the script therefore gives every opening event a unique type.
+ *    alerts the script therefore gives every alert a unique type.
  * 2. `CLEAR` and `HARMLESS` retire an alert (the ingress maps both onto the
  *    internal CLOSE severity). They must NOT be used in phase 1, or alerts close
  *    the moment they open.
@@ -40,9 +49,9 @@
  * Usage
  * -----
  *   node scripts/chaos-events.mjs                        # defaults
- *   node scripts/chaos-events.mjs --count 50              # quicker smoke test
- *   node scripts/chaos-events.mjs --pause 5               # auto-continue after 5s
- *   node scripts/chaos-events.mjs --no-wait               # no pause at all
+ *   node scripts/chaos-events.mjs --count 3 --copies 5 --no-wait
+ *   node scripts/chaos-events.mjs --count 2 --copies 3 --mutate 2 --no-wait --seed 1
+ *   node scripts/chaos-events.mjs --count 2 --copies 5 --same-id --no-wait   # dropped
  *   node scripts/chaos-events.mjs --dry-run               # print, send nothing
  *
  * The wait is interactive by default: ingestion of phase 1 finishes, then the
@@ -80,6 +89,16 @@ const DEFAULTS = {
   pauseSec: null,      // null = wait for a keypress; a number = auto-continue after N s
   duplicates: 0.10,    // fraction of phase-1 events re-sent verbatim
   closeDuplicates: 0.10, // fraction of CLOSE events sent 2-6 times
+  // How many IDENTICAL events to send for each opened alert. This is the
+  // same-type dedup drill: `--copies 5` sends the same content five times, so the
+  // alert must show Count 5 while only ONE event record exists.
+  copies: 1,
+  // How many DIFFERENT-content events to send for each opened alert. Deliberately
+  // the opposite of `copies`: same (source, type) but a different fingerprint, so
+  // the gate must LET IT THROUGH — one alert, several records. Existing to prove
+  // dedup keys on content and not merely on "this looks like that other one".
+  mutate: 0,
+  closeCopies: 1,      // identical CLEAR events per alert (idempotency)
   minRepeats: 2,
   maxRepeats: 6,
   // Left null so it can be discovered from the cluster. A hardcoded localhost
@@ -90,7 +109,7 @@ const DEFAULTS = {
   seed: null,
   dryRun: false,
   // When false (default) re-sent copies get a fresh id and are therefore counted
-  // as distinct events. --same-id keeps the original id so the fold drops them.
+  // as distinct events. --same-id keeps the original id, so the fold drops them.
   sameId: false,
 };
 
@@ -209,6 +228,9 @@ function parseArgs(argv) {
       case '--no-wait': cfg.pauseSec = 0; break;
       case '--duplicates': cfg.duplicates = Number(next()); break;
       case '--close-duplicates': cfg.closeDuplicates = Number(next()); break;
+      case '--copies': cfg.copies = Number(next()); break;
+      case '--mutate': cfg.mutate = Number(next()); break;
+      case '--close-copies': cfg.closeCopies = Number(next()); break;
       case '--url': cfg.url = next(); break;
       case '--token': cfg.token = next(); break;
       case '--seed': cfg.seed = Number(next()); break;
@@ -223,6 +245,14 @@ function parseArgs(argv) {
   if (cfg.pauseSec !== null && !(cfg.pauseSec >= 0)) fail('--pause must be >= 0');
   if (!(cfg.duplicates >= 0 && cfg.duplicates <= 1)) fail('--duplicates must be 0..1');
   if (!(cfg.closeDuplicates >= 0 && cfg.closeDuplicates <= 1)) fail('--close-duplicates must be 0..1');
+  for (const [flag, v] of [['--copies', cfg.copies], ['--close-copies', cfg.closeCopies]]) {
+    if (!Number.isInteger(v) || v < 1) fail(`${flag} must be a positive integer (at least 1)`);
+  }
+  // Zero is meaningful for --mutate: it turns the control case OFF, which is the
+  // pure "identical copies only" drill.
+  if (!Number.isInteger(cfg.mutate) || cfg.mutate < 0) {
+    fail('--mutate must be 0 or a positive integer (0 = no distinct-content events)');
+  }
   return cfg;
 }
 
@@ -234,13 +264,23 @@ function usage() {
     '  --no-wait             send the close phase immediately\n' +
     '  --duplicates F        fraction of phase-1 events re-sent verbatim (default 0.10)\n' +
     '  --close-duplicates F  fraction of CLOSE events sent 2-6 times (default 0.10)\n' +
-    '  --url URL             ingest endpoint (default $INGEST_URL or http://localhost:30900/events)\n' +
+    '  --copies N            send N IDENTICAL events per alert (same type, same\n' +
+    '                        content, new id). Count must reach N while only ONE\n' +
+    '                        record is stored -- this is the dedup drill.\n' +
+    '  --mutate N            send N DIFFERENT-content events per alert (same type).\n' +
+    '                        Count reaches N+1 AND N+1 records exist: dedup keys on\n' +
+    '                        content, not on type.\n' +
+    '  --close-copies N      send N identical CLEAR events per alert (default 1)\n' +
+    '  --url URL             ingest endpoint (default $INGEST_URL or discovered from kubectl)\n' +
     '  --token T             ingest token (default $FW_INGEST_TOKEN)\n' +
     '  --seed N              reproduce a previous run exactly\n' +
-    '  --same-id             re-sent copies keep the original id, so the fold\n' +
-    '                        DROPS them (Count does not move). Without it the\n' +
-    '                        copies are new events and ARE counted.\n' +
+    '  --same-id             re-sent copies keep the original event id, so the fold\n' +
+    '                        drops them as a redelivery (Count does NOT move)\n' +
     '  --dry-run             build and print, send nothing\n\n' +
+    'The three dedup cases, in order of what they prove:\n' +
+    '  1. --copies N          identical content, NEW id   -> absorbed: 1 record, Count N\n' +
+    '  2. --copies N --same-id identical content, SAME id -> dropped: 1 record, Count 1\n' +
+    '  3. --mutate N          different content, same type -> stored: N+1 records\n\n' +
     'Default behaviour is interactive: after phase 1 is ingested the script waits\n' +
     'for any keypress, so you can inspect the board before the CLOSE storm.\n',
   );
@@ -255,31 +295,77 @@ function fail(msg) {
 /**
  * Build the opening events.
  *
- * Every event gets a UNIQUE type, because the alert key is `source:type`. Without
- * that, N events sharing a pair would fold into one alert and the drill would
- * prove nothing.
+ * Every alert gets a UNIQUE type, because the alert key is `source:type`. Without
+ * that, N alerts sharing a pair would fold into one and the drill would prove
+ * nothing.
+ *
+ * Each alert contributes `copies + mutate` events, all with the SAME
+ * (device, event key) — which is the whole point. The group is what tests dedup:
+ *
+ *   `copies`  identical content, fresh EVT_Identifier  -> absorbed by the first
+ *   `mutate`  same type, different EVT_Summary         -> a DIFFERENT fingerprint
+ *
+ * `EVT_Summary` is the lever for the mutate case, and it is not arbitrary: the
+ * fingerprint is `{source, type, severity, payload}`, and `EVT_Summary` lands in
+ * `payload.msg`, while `EVT_Identifier` becomes the envelope `id` and is NOT
+ * hashed (services/worker/src/event.js). So changing the summary changes the
+ * fingerprint; changing only the identifier does not.
+ *
+ * Returns `[{ event, alertIndex, kind }]` — `alertIndex` lets the CLOSE phase send
+ * exactly one retirement per alert rather than one per event.
  */
 function buildOpenEvents(cfg, random) {
-  const events = [];
+  const out = [];
   for (let i = 0; i < cfg.count; i += 1) {
     const n = String(i + 1).padStart(3, '0');
     const severity = OPEN_SEVERITIES[Math.floor(random() * OPEN_SEVERITIES.length)];
     const device = SOURCES[Math.floor(random() * SOURCES.length)];
-    events.push({
+    const base = {
       // The upstream schema. The alert key is `EVT_Device:EVT_EventKey`, so a
-      // unique EVT_EventKey per event is what gives N distinct alerts.
+      // unique EVT_EventKey per alert is what gives N distinct alerts.
       EVT_Device: device,
       EVT_EventKey: `check-${n}`,
-      EVT_Identifier: `chaos-open-${n}`,
       EVT_Severity: severity,
       EVT_Summary: `Chaos drill ${n}/${cfg.count}: ${device} check-${n} reports ${severity}`,
       EVT_Details: `Chaos drill opening event ${i + 1} of ${cfg.count}`,
       EVT_Agent: 'ChaosDrill',
       EVT_AgentOwner: 'AM-000001',
       EVT_Environment: 'development',
-    });
+    };
+
+    for (let c = 0; c < cfg.copies; c += 1) {
+      out.push({
+        alertIndex: i,
+        kind: 'base',
+        event: {
+          ...base,
+          // First copy keeps the plain identifier; later copies get a suffix.
+          // The id is NOT part of the fingerprint, so this cannot turn an
+          // identical copy into a distinct one.
+          EVT_Identifier: c === 0
+            ? `chaos-open-${n}`
+            : `chaos-open-${n}-c${c + 1}`,
+        },
+      });
+    }
+
+    for (let m = 0; m < cfg.mutate; m += 1) {
+      out.push({
+        alertIndex: i,
+        kind: 'mutate',
+        event: {
+          ...base,
+          EVT_Identifier: `chaos-open-${n}-m${m + 1}`,
+          // Different `payload.msg` -> different fingerprint -> the gate lets it
+          // through and it becomes its own record. This is the control case: if
+          // this were absorbed too, dedup would be keyed on the alert rather than
+          // on the content, and two genuinely different reports would be lost.
+          EVT_Summary: `${base.EVT_Summary} (report ${m + 2} — different detail)`,
+        },
+      });
+    }
   }
-  return events;
+  return out;
 }
 
 /**
@@ -294,27 +380,44 @@ function buildOpenEvents(cfg, random) {
  *                flag is retained only to demonstrate that the message id is not
  *                what dedup keys on.
  */
+/**
+ * Pick a fraction of the opening events and re-send them verbatim.
+ *
+ * This is the original random-sampling mode, kept because it produces a messy,
+ * realistic board — copies scattered across alerts rather than a uniform N of
+ * each. `--copies` is the deterministic version when you want an exact Count to
+ * assert against.
+ *
+ * Both modes rely on the same rule: the CONTENT must match exactly, including
+ * `EVT_Summary`, or the copy becomes a different condition and is stored as its
+ * own record. Only `EVT_Identifier` may vary, because it is the envelope id and is
+ * not part of the fingerprint.
+ */
 function buildOpenDuplicates(events, cfg, random) {
   const picks = [];
-  for (const evt of events) {
-    if (random() < cfg.duplicates) picks.push(evt);
+  for (const item of events) {
+    if (random() < cfg.duplicates) picks.push(item);
   }
   // Guarantee at least one copy in a non-empty run, otherwise the drill
   // silently stops testing the thing it exists to test.
   if (events.length > 0 && picks.length === 0) {
     picks.push(events[Math.floor(random() * events.length)]);
   }
-  return picks.map((evt, i) => ({
-    ...evt,
-    // A fresh identifier makes this a new MESSAGE carrying the same content;
-    // keeping it makes it the same message. Either way the content matches, so
-    // the original record absorbs it.
-    EVT_Identifier: cfg.sameId
-      ? evt.EVT_Identifier
-      : `${evt.EVT_Identifier}-copy${i + 1}`,
-    // NOTE: EVT_Summary is part of the fingerprint, so it must stay IDENTICAL or
-    // the copy becomes a different condition and gets its own record — which
-    // would make the drill test the wrong thing.
+  return picks.map((item, i) => ({
+    ...item,
+    kind: 'random',
+    event: {
+      ...item.event,
+      // A fresh identifier makes this a new MESSAGE carrying the same content;
+      // keeping it makes it the same message. Either way the content matches, so
+      // the original record absorbs it.
+      EVT_Identifier: cfg.sameId
+        ? item.event.EVT_Identifier
+        : `${item.event.EVT_Identifier}-copy${i + 1}`,
+      // NOTE: EVT_Summary is part of the fingerprint, so it must stay IDENTICAL
+      // or the copy becomes a different condition and gets its own record —
+      // which would make the drill test the wrong thing.
+    },
   }));
 }
 
@@ -325,18 +428,33 @@ function buildOpenDuplicates(events, cfg, random) {
  * `CLEAR` is the upstream schema's resolution signal; the ingress maps it onto
  * the internal CLOSE severity.
  */
-function buildCloseEvents(openEvents) {
-  return openEvents.map((evt) => ({
-    EVT_Device: evt.EVT_Device,
-    EVT_EventKey: evt.EVT_EventKey,
-    EVT_Identifier: `chaos-clear-${evt.EVT_EventKey.replace('check-', '')}`,
-    EVT_Severity: 'CLEAR',
-    EVT_Summary: `Resolved: ${evt.EVT_Device} check ${evt.EVT_EventKey} recovered`,
-    EVT_Details: 'Chaos drill resolution',
-    EVT_Agent: 'ChaosDrill',
-    EVT_AgentOwner: 'AM-000001',
-    EVT_Environment: 'development',
-  }));
+function buildCloseEvents(openEvents, copies) {
+  // One retirement per ALERT, not per event: N occurrences of one alert are one
+  // alert, and sending N CLEARs would only test CLOSE idempotency — which
+  // `--close-copies` does explicitly and deliberately.
+  const seen = new Set();
+  const out = [];
+  for (const item of openEvents) {
+    if (seen.has(item.alertIndex)) continue;
+    seen.add(item.alertIndex);
+    const evt = item.event;
+    for (let c = 0; c < copies; c += 1) {
+      out.push({
+        EVT_Device: evt.EVT_Device,
+        EVT_EventKey: evt.EVT_EventKey,
+        EVT_Identifier: c === 0
+          ? `chaos-clear-${evt.EVT_EventKey.replace('check-', '')}`
+          : `chaos-clear-${evt.EVT_EventKey.replace('check-', '')}-c${c + 1}`,
+        EVT_Severity: 'CLEAR',
+        EVT_Summary: `Resolved: ${evt.EVT_Device} check ${evt.EVT_EventKey} recovered`,
+        EVT_Details: 'Chaos drill resolution',
+        EVT_Agent: 'ChaosDrill',
+        EVT_AgentOwner: 'AM-000001',
+        EVT_Environment: 'development',
+      });
+    }
+  }
+  return out;
 }
 
 /** Duplicate a fraction of the CLEAR events, each 2-6 times. */
@@ -502,35 +620,54 @@ async function main() {
   process.stdout.write(`chaos-events: endpoint=${cfg.url}${cfg.dryRun ? '  [DRY RUN]' : ''}\n`);
 
   // ---- phase 1: open ------------------------------------------------------
-  const openEvents = buildOpenEvents(cfg, random);
-  const openDupes = buildOpenDuplicates(openEvents, cfg, random);
-  const phase1 = [...openEvents, ...openDupes];
+  const openItems = buildOpenEvents(cfg, random);
+  const openDupes = buildOpenDuplicates(openItems, cfg, random);
+  const phase1 = [...openItems, ...openDupes].map((it) => it.event);
+
+  const alertsOpened = new Set(openItems.map((it) => it.alertIndex)).size;
+  const identicalCopies = cfg.count * (cfg.copies - 1);
+  const mutated = cfg.count * cfg.mutate;
+  // One record per alert for the base content, plus one per DISTINCT mutation.
+  // The identical copies add none: they are absorbed by the base record.
+  const expectedRecords = alertsOpened * (1 + cfg.mutate);
+  const expectedCountMax = cfg.copies + cfg.mutate;
 
   process.stdout.write(
-    `\nphase 1: opening ${openEvents.length} alerts ` +
-    `(${openDupes.length} of them re-sent as duplicates) -> ${phase1.length} events\n`,
+    `\nphase 1: ${alertsOpened} alerts <- ${phase1.length} events\n` +
+    `  per alert: ${cfg.copies} identical + ${cfg.mutate} mutated\n` +
+    `  identical copies beyond the first: ${identicalCopies}` +
+      (cfg.sameId ? ' (SAME id: dropped as a redelivery, Count stays 1)\n'
+        : ' (new id: ABSORBED, Count reaches ' + expectedCountMax + ')\n') +
+    `  mutated (different EVT_Summary): ${mutated} -> ${expectedRecords} records stored` +
+      ` (${alertsOpened} base + ${mutated} mutated)\n` +
+    (openDupes.length ? `  random extra copies: ${openDupes.length} (also absorbed)\n` : ''),
   );
   const a1 = await post(cfg.url, cfg.token, phase1, { dryRun: cfg.dryRun });
   process.stdout.write(`phase 1: accepted ${a1}/${phase1.length}\n`);
 
   process.stdout.write(
-    `\nEvery event above has a unique (source, type) pair, so the board should show\n` +
-    `${openEvents.length} open alerts and no more. A duplicate must NOT add an alert\n` +
-    `and must NOT increment Count: the fold coalesces it and only last_seen moves.\n`,
+    `\nexpected on the board now:\n` +
+    `  Open alerts           ${alertsOpened}\n` +
+    `  Count on every row    ${cfg.sameId ? 1 : cfg.copies + cfg.mutate}` +
+      (cfg.sameId ? '   (copies were dropped, not counted)\n' : '\n') +
+    `  fw:evt:* records      ${expectedRecords}` +
+      `   <- identical copies must NOT add records\n` +
+    `  All events rows       ${expectedRecords}   <- same set, read from the global index\n`,
   );
 
   // ---- wait for the operator ----------------------------------------------
   await waitForContinue(cfg.pauseSec);
 
   // ---- phase 2: close -----------------------------------------------------
-  const closeEvents = buildCloseEvents(openEvents);
+  const closeEvents = buildCloseEvents(openItems, cfg.closeCopies);
   const { events: closeDupes, repeats } = buildCloseDuplicates(closeEvents, cfg, random);
   const phase2 = [...closeEvents, ...closeDupes];
 
+  const closeAlerts = new Set(closeEvents.map((e) => `${e.EVT_Device}:${e.EVT_EventKey}`)).size;
   process.stdout.write(
-    `\nphase 2: closing ${closeEvents.length} alerts ` +
-    `(${repeats.length} closed 2-${cfg.maxRepeats} times, ${closeDupes.length} extra events) ` +
-    `-> ${phase2.length} events\n`,
+    `\nphase 2: closing ${closeAlerts} alerts ` +
+    `(${cfg.closeCopies} CLEAR per alert; ${repeats.length} sent an extra 2-${cfg.maxRepeats} times, ` +
+    `+${closeDupes.length} events) -> ${phase2.length} events\n`,
   );
   const a2 = await post(cfg.url, cfg.token, phase2, { dryRun: cfg.dryRun });
   process.stdout.write(`phase 2: accepted ${a2}/${phase2.length}\n`);
@@ -539,20 +676,29 @@ async function main() {
   process.stdout.write(
     `\n${'-'.repeat(70)}\n` +
     `expected final state\n` +
-    `  alerts opened      ${openEvents.length}\n` +
-    `  copies of opens    ${openDupes.length}  ` +
-      (cfg.sameId
-        ? '(same id: dropped by the fold, Count unchanged)\n'
-        : '(new id: counted as distinct events, Count moves)\n') +
-    `  alerts closed      ${closeEvents.length}\n` +
-    `  repeated closes    ${closeDupes.length}\n` +
-    `  fully closed total ${openEvents.length}\n` +
+    `  alerts opened        ${alertsOpened}\n` +
+    `  alerts closed        ${closeAlerts}\n` +
+    `  records stored       ${expectedRecords}` +
+      (cfg.mutate ? '   (one per DISTINCT content)\n' : '   (one per alert)\n') +
+    `  repeated CLEARs      ${closeDupes.length} ` +
+      '  (a repeat retirement must not close twice or reopen anything)\n' +
     `\nrepeated CLOSE events (idempotency check):\n` +
     (repeats.length ? repeats.map((r) => `  ${r.id} x${r.times}`).join('\n') : '  (none)') +
-    `\n\nverify with:\n` +
-    `  kubectl -n fire-watch-lab exec dragonfly-0 -c dragonfly -- \\\n` +
-    `    sh -c 'redis-cli -p 6379 --no-auth-warning -a "$DRAGONFLY_PASSWORD" --scan --pattern "fw:alert:open:*" | wc -l'\n` +
-    `  # expect 0 — every alert retired\n`,
+    `\n\nverify — counts first, they are the actual assertions:\n` +
+    `  PW=$(kubectl -n fire-watch-lab get secret fire-watch-dragonfly -o jsonpath='{.data.password}' | base64 -d)\n` +
+    `  R() { kubectl -n fire-watch-lab exec dragonfly-0 -c dragonfly -- \\\n` +
+    `         redis-cli -a "$PW" --no-auth-warning "$@"; }\n` +
+    `\n  # 1. every alert retired\n` +
+    `  R ZCARD fw:idx:alert:open                  # 0\n` +
+    `\n  # 2. dedup: one record per DISTINCT content, NOT one per delivery\n` +
+    `  R --scan --pattern 'fw:evt:chaos-open-*' | wc -l   # ${expectedRecords}\n` +
+    `  #    with --copies 5 and no --mutate this stays ${alertsOpened}, not ${alertsOpened * 5}:\n` +
+    `  #    the extra four are absorbed by the first record of each alert.\n` +
+    `\n  # 3. the live Count reached ${expectedCountMax}, so the copies were COUNTED even though\n` +
+    `  #    they were not STORED. That asymmetry is the design, not a bug:\n` +
+    `  #    Count is how often the condition was reported; a record is one stored event.\n` +
+    `\n  # 4. the audit trail still holds every delivery\n` +
+    `  R --scan --pattern 'fw:audit*' | head\n`,
   );
 }
 

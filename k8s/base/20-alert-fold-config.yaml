@@ -23,12 +23,29 @@
 # the same key in two tabs.
 #
 # ARGV[1] = broker_ts_ms
-# ARGV[2] = event id
+# ARGV[2] = event id  — the record that REPRESENTS this condition, written as `last_id`
 # ARGV[3] = severity
 # ARGV[4] = dedup window in ms  (UNUSED since the coalescing window was removed;
 #           kept in the signature so an older worker calling with 4 args still
 #           works during a rolling update)
 # ARGV[5] = alert key (source:type), used as the index member
+# ARGV[6] = ARRIVAL id — optional; the id used ONLY for the ordering guard and the
+#           watermark. Defaults to ARGV[2] when absent.
+#
+#           Why these two ids differ. A CONTENT duplicate (the same condition
+#           reported again under a new message id) is absorbed by the original
+#           record, so ARGV[2] is the OWNER's id: `last_id` must name a record that
+#           exists, or everything resolving a summary from it renders nothing. But
+#           the ordering guard below compares `(ts, id)`, and the owner's id is
+#           already the watermark from the first arrival — so with the id aliased,
+#           every absorbed copy arriving in the SAME MILLISECOND looked like a
+#           redelivery and was silently dropped instead of counted.
+#
+#           Measured before the fix: five identical events in one batch produced
+#           count = 2, 2, 2, 4 across five trials — never 5. One record each, so
+#           storage was right; the counter lost the arrivals. With ARGV[6] the
+#           guard distinguishes them, while a genuine REDELIVERY (same ts, same
+#           id) is still dropped.
 #
 # Returns: 0 stale/duplicate | 1 applied | 3 closed
 #
@@ -62,10 +79,16 @@ data:
     local id     = ARGV[2]
     local sev    = ARGV[3]
     local window = tonumber(ARGV[4])
+    -- The id the ordering guard sees. For a new event this IS the event id. For an
+    -- absorbed content duplicate ARGV[2] is the OWNER's id (so `last_id` names a
+    -- record that exists), and using that here made every copy after the first look
+    -- like a redelivery whenever it landed in the same millisecond.
+    local arrival_id = ARGV[6] or id
 
     -- 1. ordering guard: (timestamp, id) lexicographic.
-    --    Stops a redelivered old CLOSE from retiring a newer CRITICAL.
-    if ts < wm_ts or (ts == wm_ts and id <= wm_id) then
+    --    Stops a redelivered old CLOSE from retiring a newer CRITICAL, and stops a
+    --    genuine redelivery (same ts, same id) from being counted twice.
+    if ts < wm_ts or (ts == wm_ts and arrival_id <= wm_id) then
       return 0
     end
 
@@ -105,7 +128,10 @@ data:
         'closed_by', id,
         'closed_at', ts,
         'watermark', ts,
-        'watermark_id', id)
+        -- arrival_id, not id: an absorbed CLOSE arrives with the OWNER's id in
+        -- ARGV[2], so using `id` here would leave the watermark at a value the next
+        -- same-millisecond arrival compares equal-or-less against and drops.
+        'watermark_id', arrival_id)
       redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
       redis.call('PEXPIRE', KEYS[1], 604800000)
       return 3
@@ -153,7 +179,10 @@ data:
       'last_seen', ts,
       'count', count,
       'watermark', ts,
-      'watermark_id', id)
+      -- arrival_id, not id: last_id must name a stored record, but the ordering
+      -- guard has to see THIS arrival, or a content duplicate landing in the same
+      -- millisecond is discarded instead of counted.
+      'watermark_id', arrival_id)
 
     -- An acknowledgement belongs to one EPISODE, not one event. It is cleared
     -- when the alert was not already open (a re-fire after retirement) and left

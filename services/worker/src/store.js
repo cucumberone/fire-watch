@@ -122,6 +122,13 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
           evt.severity,
           String(cfg.alertDedupWindow),
           key,
+          // ARGV[6]: the id the ordering guard must see. It differs from ARGV[2]
+          // (the owner) only here, on the absorb path. Passing the owner twice made
+          // every copy after the first look like a redelivery whenever it landed in
+          // the same millisecond, so it was dropped instead of counted — measured
+          // as Count 2/2/2/4 for five identical copies. `last_id` still records
+          // `ownerId`, because that names a record that exists.
+          evt.id,
         ),
       );
       // The stored record is NOT rewritten: it keeps its original id, original
@@ -173,6 +180,9 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
         evt.severity,
         String(cfg.alertDedupWindow),
         key,
+        // ARGV[6]: arrival id, same as `evt.id` here, so the guard and the
+        // watermark keep working for this path too.
+        evt.id,
       ),
     );
     log.debug('existing record absorbed a repeat (fingerprint was absent)', {
@@ -221,6 +231,8 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
       evt.severity,
       String(cfg.alertDedupWindow),
       key,
+      // ARGV[6]: on the happy path the owner and the arrival are the same event.
+      evt.id,
     ),
   );
 

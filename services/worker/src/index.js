@@ -111,7 +111,7 @@ async function handleMessage(msg) {
     });
 
     // ---- write + fold. Throws on transient failure -> requeue.
-    const { applied, duplicate, contentDuplicate } = await persistEvent({
+    const { applied, duplicate, contentDuplicate, ownerId } = await persistEvent({
       dfl, evt, storedPayload, brokerTs, cfg, fold, log,
     });
     lastWriteOk = true;
@@ -141,6 +141,30 @@ async function handleMessage(msg) {
     // tells it this is an occurrence, not a stale frame.
     if (contentDuplicate) {
       log.debug('content duplicate absorbed, copy discarded', { id: evt.id });
+      // The live tail still needs to show it.
+      //
+      // The copy is not STORED (the original record owns the condition), but it
+      // still arrived and still moved the rollup, so an operator watching the
+      // tail should see it. Omitting it left the tail empty for any producer that
+      // only ever repeats one event — every delivery after the first was absorbed,
+      // so nothing was ever broadcast, and the drawer read "Nothing yet" while
+      // alerts were open.
+      //
+      // `applied: 0` is deliberate: the client must not treat this as a new
+      // occurrence, or it would double-count against the `occurrence` frame that
+      // follows. 0 means "render the row, change no state".
+      try {
+        await dfl.publish(
+          keys.channelEvents,
+          JSON.stringify({
+            event: { ...evt, payload: storedPayload, brokerTs, absorbedBy: ownerId },
+            applied: 0,
+          }),
+        );
+      } catch (err) {
+        // Best effort: the tail is diagnostic, and the rollup is already durable.
+        log.warn('absorbed event fan-out failed', { id: evt.id, err: String(err) });
+      }
       try {
         await dfl.publish(
           keys.channelAlerts,

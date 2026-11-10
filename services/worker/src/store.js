@@ -103,6 +103,12 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
     } else {
       // The original record absorbs this arrival. `brokerTs` is the new event's
       // arrival time, which is what "Last occurrence" must show.
+      //
+      // The fold is given the OWNER's id, not this copy's. The copy is discarded
+      // and never stored, so recording its id as `last_id` leaves the alert
+      // pointing at a record that does not exist — and everything that resolves a
+      // summary from that record then renders nothing (docs/websocket-server.md
+      // §3.2). The owner is the record that actually represents this condition.
       const applied = await dfl.write((c) =>
         c.eval(
           fold.get(),
@@ -111,7 +117,7 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
           keys.alertOpen(key),
           keys.alertOpenIndex,
           String(brokerTs),
-          evt.id,
+          ownerId,
           evt.severity,
           String(cfg.alertDedupWindow),
           key,
@@ -159,6 +165,8 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
         keys.alertOpen(key),
         keys.alertOpenIndex,
         String(brokerTs),
+        // The existing record IS the owner here, so its id is what represents
+        // this condition. `evt.id` names a record that was never stored.
         evt.id,
         evt.severity,
         String(cfg.alertDedupWindow),

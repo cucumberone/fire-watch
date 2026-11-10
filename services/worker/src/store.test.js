@@ -228,3 +228,45 @@ test('absorbing a fingerprint-less repeat repairs the fingerprint', async () => 
   assert.equal(fpKeys.length, 1, 'the fingerprint exists again');
   assert.equal(dfl.store.get(fpKeys[0]), silent.id, 'and points at the record');
 });
+
+// --------------------------- the fold must be told about a record that EXISTS
+test('an absorb records the OWNER id in the fold, not the discarded copy', async () => {
+  // Regression: `last_id` was set to the copy's id, but the copy is never stored.
+  // The alert then pointed at a record that does not exist, so anything resolving
+  // a summary from it rendered an empty cell (the blank Summary column and the
+  // "Live events: Nothing yet" report share this cause).
+  const dfl = makeDfl();
+  const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
+
+  await persistEvent({ ...args, evt: silent });
+  await persistEvent({ ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000 });
+
+  // `eval` is called as (script, numKeys, ...keys, ...argv), so `args` is
+  // [3 keys, brokerTs, id, severity, window, bareKey] — the id is index 4.
+  const last = dfl.calls.eval[dfl.calls.eval.length - 1];
+  const idGiven = last.args[4];
+  assert.equal(idGiven, silent.id, 'the owner id, which has a stored record');
+  assert.notEqual(idGiven, 'evt-2', 'not the id of the copy that was discarded');
+
+  // And that id really does resolve, i.e. it matches the stored record's id.
+  const stored = eventSets(dfl).map((s) => JSON.parse(dfl.store.get(s.key)));
+  const ids = stored.map((e) => e.id);
+  assert.ok(ids.includes(idGiven), `fold id ${idGiven} must exist in the store`);
+});
+
+test('the fold id on the fingerprint-absent path also names a real record', async () => {
+  // The other absorb branch: record present, fingerprint missing.
+  const dfl = makeDfl();
+  const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
+
+  await persistEvent({ ...args, evt: silent });
+  // Remove just the fingerprint, simulating an expired/never-written one.
+  for (const k of [...dfl.store.keys()]) if (k.startsWith('fw:fp:')) dfl.store.delete(k);
+
+  await persistEvent({ ...args, evt: { ...silent, id: 'evt-3' }, brokerTs: 3000 });
+
+  const last = dfl.calls.eval[dfl.calls.eval.length - 1];
+  const idGiven = last.args[4];
+  const ids = eventSets(dfl).map((s) => JSON.parse(dfl.store.get(s.key)).id);
+  assert.ok(ids.includes(idGiven), `fold id ${idGiven} must exist in the store`);
+});

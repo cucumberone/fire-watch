@@ -119,6 +119,29 @@ Fold return codes, forwarded as `applied`:
 
 Duplicate processing produces no duplicate state. The one non-idempotent step is `PUBLISH` (a duplicate would double-render in the UI). Mitigation: each gateway keeps an in-process LRU of the last 10 000 event ids and drops repeats. It is deliberately **not** a Dragonfly write — gateways have no write access ([websocket-server.md](websocket-server.md) §5).
 
+## 3.1 Absorbed duplicates
+
+When the content fingerprint is already claimed, the arrival is **absorbed**: the
+copy is never stored, and only the original record's rollup moves. Two rules on
+that path are load-bearing, and both were wrong at first:
+
+**The fold is given the OWNER's id, not the copy's.** `last_id` is how everything
+finds the record behind an alert — the snapshot read, and the occurrence frame the
+gateway enriches ([websocket-server.md](websocket-server.md) §3.2). Recording the
+discarded copy's id left `last_id` pointing at a key that does not exist, so the
+Summary column rendered `—` and the alert was technically open but unrenderable.
+The owner is the record that represents the condition; the copy has no record at
+all.
+
+**The absorbed event is still published to `fw:ch:events`, with `applied: 0`.** It
+is not stored, but it did arrive and did move the rollup, so an operator watching
+the live tail should see it. Omitting it meant a producer that only ever repeats
+one event produced *no* tail frames at all — every delivery after the first was
+absorbed — so the drawer showed "Nothing yet" while alerts were open. `applied: 0`
+is what stops the client double-counting it, since the `occurrence` frame follows
+and carries the fold's own count.
+
+
 ### 4.1 Index pruning is mandatory
 
 `fw:evt:{id}` expires on its own TTL, but a sorted-set member never does. Without pruning the index grows forever and the working set becomes unbounded regardless of TTL — which would break the capacity model in [sizing.md](sizing.md) §2 entirely.

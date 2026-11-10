@@ -334,21 +334,6 @@ main.color-rows tr.row-selected td { background:rgba(127,127,127,.25); }
    cell's full value is read anyway. */
 .tbody { user-select:none; -webkit-user-select:none; }
 tbody tr { cursor:default; }
-/* The selection bar. Sits above the table and only exists while something is
-   selected, so the normal view has no extra chrome. */
-.selbar { display:flex; align-items:center; gap:.6rem; font-size:.78rem;
-          padding:.35rem .6rem; margin:.25rem 0 .5rem;
-          border:1px solid var(--accent); border-radius:.375rem;
-          background:var(--pre-bg); }
-.selbar-count { font-weight:600; }
-.selbar-btn { font:inherit; font-size:.75rem; cursor:pointer; padding:.2rem .6rem;
-              border-radius:.25rem; border:1px solid var(--line);
-              background:var(--bg); color:var(--fg); white-space:nowrap; }
-.selbar-btn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
-.selbar-btn:disabled { opacity:.5; cursor:not-allowed; }
-/* Closing is destructive to the row, so it is styled apart from ack. It is not
-   red: the operator is retiring a known condition, not making an error. */
-.selbar-close { font-weight:600; }
 
 /* Acknowledgement. Acked rows stay visible — silencing an alert is not the
    same as resolving it, and hiding it would let real trouble disappear. The row

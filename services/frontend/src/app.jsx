@@ -955,8 +955,6 @@ function App() {
   );
 
   const selectedAlertKeys = liveSelection;
-  const selectedAckable = selectedAlertKeys.filter((k) => !acks.has(k));
-  const selectedUnacked = selectedAckable.length;
 
   if (error) {
     return <main><h1>Fire-Watch</h1><p className="error">Cannot load config.json: {error}</p></main>;
@@ -1014,39 +1012,11 @@ function App() {
           Click to select, Shift+click for a range, Ctrl/Cmd+click to toggle.
           Right-click for Acknowledge, Close or Information. Drag a column edge to widen it.
         </p>
-        {/* Bulk actions. Appears only when something is selected, so the normal
-            case has no extra chrome; the count is stated because a range select
-            can grab far more rows than the operator counted. */}
-        {selectedAlertKeys.length > 0 ? (
-          <div className="selbar" role="region" aria-label="Selection actions">
-            <span className="selbar-count">
-              {selectedAlertKeys.length} selected
-              {selectedUnacked > 0 && selectedUnacked !== selectedAlertKeys.length
-                ? ` · ${selectedUnacked} unacknowledged`
-                : ''}
-            </span>
-            <button
-              className="selbar-btn"
-              onClick={() => bulk('ack', selectedAckable)}
-              disabled={selectedAckable.length === 0}
-              title={selectedAckable.length === 0
-                ? 'Every selected alert is already acknowledged'
-                : `Acknowledge ${selectedAckable.length} alert(s)`}
-            >
-              Acknowledge{selectedAckable.length > 1 ? ` ${selectedAckable.length}` : ''}
-            </button>
-            <button
-              className="selbar-btn selbar-close"
-              onClick={() => bulk('close', selectedAlertKeys)}
-              title={`Close ${selectedAlertKeys.length} alert(s)`}
-            >
-              Close{selectedAlertKeys.length > 1 ? ` ${selectedAlertKeys.length}` : ''}
-            </button>
-            <button className="link" onClick={clearSelection} title="Clear the selection (Esc)">
-              clear
-            </button>
-          </div>
-        ) : null}
+        {/* No selection banner by design. Selecting rows is purely a pointer
+            state; every action lives in the right-click menu, which is where the
+            operator already goes for a single row. A toolbar that appears on
+            selection duplicates those actions and shifts the table down the page
+            at the exact moment the operator is aiming at it. */}
         {sortedAlerts.length === 0
           ? <p className="dim">No open alerts.</p>
           : (

@@ -327,13 +327,44 @@ make a busy week look smaller than it is.
 
 | Limit | Default | Reason |
 |---|---|---|
-| Max frames/sec from a client | 10 | prevents a chatty client from consuming the pod |
-| Max subscriptions per connection | 20 | bounds the matcher cost |
-| Max outbound queue per connection | 1000 messages | drop with `error: slow_consumer` instead of unbounded growth |
-| Idle timeout | 5 min without pong | frees sockets from vanished clients |
-| Max connections per pod | 5000 | see sizing; HPA scales on this |
+| Max frames/sec from a client | `FW_MAX_FRAMES_PER_SEC` = 50 | prevents a chatty client from consuming the pod |
+| Max subscriptions per connection | `FW_MAX_SUBSCRIPTIONS` = 20 | bounds the matcher cost |
+| Max outbound queue per connection | `FW_MAX_OUTBOUND_QUEUE` = 1000 messages | drop with `error: slow_consumer` instead of unbounded growth |
+| Heartbeat | `FW_HEARTBEAT_MS` = 20000 | cadence of the liveness ping |
+| Pong timeout | `FW_PONG_TIMEOUT_MS` = 10000 | how long a socket has to answer before it is terminated |
+| Max connections per pod | `FW_MAX_CONNS` = 5000 | see sizing; HPA scales on this |
 
 Backpressure policy is explicit: a slow consumer is disconnected, not buffered. Buffering turns one slow browser into a memory incident that takes down every client on the pod.
+
+### 4.1 Liveness: ONE flag
+
+The heartbeat is a single property per socket, `ws.__awaitingPong`:
+
+| Who | What they do |
+|---|---|
+| the loop, every `FW_HEARTBEAT_MS` | if the flag is already set → `terminate()`; else set it and `ping()` |
+| `ws.on('pong')` — the protocol-level reply | `ws.__awaitingPong = false` |
+| the `{"op":"pong"}` JSON frame | `ws.__awaitingPong = false` |
+| a `FW_PONG_TIMEOUT_MS` timer | if the flag is still set → `terminate()` |
+
+**This was broken, and it is worth recording how.** The pong handler set
+`conn.alive`, which nothing ever read, while the loop tested and set
+`ws.__awaitingPong`, which nothing ever cleared. Every socket was therefore
+terminated one `PONG_TIMEOUT` after its first heartbeat — measured at **14.97 s,
+close code 1006** — and because the client resets its backoff counter on `onopen`,
+it reconnected about 500 ms later and died again. Forever. From the UI that looked
+like a status chip flickering `open → reconnecting → open`, with the data
+resilient because every `onopen` re-subscribes and resyncs.
+
+Two lessons are encoded as tests in `subscription.test.js`:
+
+- a liveness property that is written and never read is indistinguishable from a
+  working one, so the loop and both pong paths must be shown to use the **same**
+  name
+- **terminating a connection is logged at `warn`, not `debug`.** At the default
+  `info` level the bug produced no log output whatsoever — which is why the log
+  looked like a healthy idle gateway while every socket died every 15 seconds
+
 
 ## 5. Dragonfly access
 

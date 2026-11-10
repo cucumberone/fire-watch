@@ -223,3 +223,54 @@ test('an identical frame is still suppressed', () => {
   assert.equal(r.add('p1|1000|0'), true);
   assert.equal(r.add('p1|1000|0'), false, 'a true redelivery is dropped');
 });
+
+// ---------------------------------------------- heartbeat liveness contract
+/**
+ * The heartbeat loop reads and writes `ws.__awaitingPong`; the pong handlers must
+ * clear exactly that flag.
+ *
+ * This is a contract test rather than an integration test because the bug it
+ * guards was one of NAMING, not logic: the pong handler set `conn.alive` while the
+ * loop tested `ws.__awaitingPong`, so every socket was terminated one
+ * `pongTimeoutMs` after its first heartbeat — measured at 14.97 s with close code
+ * 1006 — and every client reconnected in a 15-second cycle. Nothing failed, no
+ * error was raised, and at the default log level nothing was even logged.
+ *
+ * So the source is asserted directly: the loop must test the same property the
+ * handler clears, and the handler must not maintain a second, unread one.
+ */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const SRC = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), 'index.js'), 'utf8',
+);
+
+test('both pong paths clear __awaitingPong', () => {
+  // The protocol-level handler and the JSON `{"op":"pong"}` frame.
+  const clears = SRC.match(/__awaitingPong\s*=\s*false/g) || [];
+  assert.ok(clears.length >= 2,
+    `expected the heartbeat flag to be cleared in both pong paths, found ${clears.length}`);
+});
+
+test('the heartbeat loop sets and tests the same flag it clears', () => {
+  assert.match(SRC, /if\s*\(ws\.__awaitingPong\)/, 'loop must TEST __awaitingPong');
+  assert.match(SRC, /ws\.__awaitingPong\s*=\s*true/, 'loop must SET __awaitingPong');
+});
+
+test('no second, unread liveness flag exists', () => {
+  // `conn.alive` was the unread half. It must not come back: a property that is
+  // written and never read is indistinguishable from a working heartbeat.
+  assert.doesNotMatch(SRC, /conn\.alive\s*=\s*true/);
+});
+
+test('terminating a socket for liveness is logged above debug', () => {
+  // At `debug` (with the default `info` level) a heartbeat bug that dropped every
+  // connection produced no log output at all.
+  const terminatelines = SRC.split('\n').filter((l) => l.includes('ws.terminate()'));
+  const logged = SRC.split('\n').filter((l) => /log\.(warn|error|info)\(/.test(l));
+  assert.ok(terminatelines.length >= 1, 'sockets are still terminated on timeout');
+  assert.ok(logged.some((l) => /unresponsive|no pong/i.test(l)),
+    'the termination must be logged at warn or above');
+});

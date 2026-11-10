@@ -86,7 +86,6 @@ wss.on('connection', (ws, req) => {
 
   const conn = {
     subscriptions: [],
-    alive: true,
     framesThisSecond: 0,
     frameWindow: Date.now(),
     outbound: 0,
@@ -97,7 +96,21 @@ wss.on('connection', (ws, req) => {
   ws.__subscriptions = conn.subscriptions;
   ws.__send = (payload) => send(payload);
 
-  ws.on('pong', () => { conn.alive = true; });
+  /**
+   * Liveness. ONE flag, on the socket, cleared by the pong and set by the loop.
+   *
+   * This used to be two half-finished implementations: the pong handler set
+   * `conn.alive`, which nothing ever read, while the heartbeat loop tested and
+   * set `ws.__awaitingPong`, which nothing ever cleared. The result was that every
+   * socket was terminated one `pongTimeoutMs` after its first heartbeat — measured
+   * at 14.97 s, close code 1006 — so each client reconnected forever in a
+   * 15-second cycle and the status chip flickered `open → reconnecting → open`.
+   *
+   * The flag lives on the socket, not on `conn`, because the heartbeat loop only
+   * has access to `wss.clients`.
+   */
+  ws.__awaitingPong = false;
+  ws.on('pong', () => { ws.__awaitingPong = false; });
 
   // Outbound backpressure: a slow consumer is disconnected, never buffered.
   // Buffering turns one slow browser into a memory incident for every client on
@@ -136,7 +149,10 @@ wss.on('connection', (ws, req) => {
     }
 
     if (frame.op === 'pong') {
-      conn.alive = true;
+      // The application-level pong, for a client that answers heartbeats as JSON
+      // rather than with a protocol-level frame. Both must clear the same flag or
+      // the connection is killed one heartbeat later.
+      ws.__awaitingPong = false;
       return;
     }
 
@@ -760,18 +776,32 @@ async function handleAlertMessage(raw) {
 }
 
 // ---------------------------------------------------------------------- heartbeat
+//
+// One flag per socket: `ws.__awaitingPong`. Set here, cleared by either pong path
+// (protocol-level and the `{"op":"pong"}` JSON frame). A socket that fails to clear
+// it within `FW_PONG_TIMEOUT_MS` is terminated.
+//
+// The log line is `warn`, not `debug`. This condition means a client is about to be
+// disconnected, and at `debug` — the default level is `info` — a heartbeat bug that
+// killed every connection every 15 seconds produced NO log output at all. An
+// operation that drops connections must be visible without raising the log level.
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState !== ws.OPEN) continue;
+
     if (ws.__awaitingPong) {
-      log.debug('closing unresponsive socket');
+      log.warn('closing unresponsive socket', { awaitingFor: cfg.pongTimeoutMs });
       ws.terminate();
       continue;
     }
+
     ws.__awaitingPong = true;
     ws.ping();
     setTimeout(() => {
-      if (ws.readyState === ws.OPEN && ws.__awaitingPong) ws.terminate();
+      if (ws.readyState === ws.OPEN && ws.__awaitingPong) {
+        log.warn('no pong before timeout, terminating', { timeoutMs: cfg.pongTimeoutMs });
+        ws.terminate();
+      }
     }, cfg.pongTimeoutMs).unref();
   }
 }, cfg.heartbeatMs).unref();

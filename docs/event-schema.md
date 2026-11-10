@@ -181,3 +181,18 @@ curl -sS -X POST "http://<ingress>/events" -H "X-Ingest-Token: $FW_INGEST_TOKEN"
 #   send CRITICAL, note the open row, then send CLEAR with the same device+key
 #   expect the row to disappear from the board
 ```
+
+The two canned scripts do exactly that pair, and are the fastest way to confirm
+the whole path end to end:
+
+```bash
+node scripts/send-same-event.mjs     # opens the alert  (EVT_Severity: WARNING)
+node scripts/send-clear-event.mjs    # retires it       (EVT_Severity: CLEAR)
+```
+
+Both use `EVT_Device: probe-device` / `EVT_EventKey: static.probe`, so the second
+lands on the row the first created. The CLEAR script uses a **different**
+`EVT_Identifier` on purpose: reusing the probe's id would collide with the existing
+record, and the delivery would be absorbed as a duplicate instead of being stored —
+the alert would still retire, but the history would hold no record of why. A
+retirement event is a real event with its own identity.

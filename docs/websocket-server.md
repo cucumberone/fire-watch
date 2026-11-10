@@ -380,6 +380,27 @@ There is no general write surface. `dragonfly.js` has no `set`, `del` or generic
 
 Because no event write is possible, de-duplication is an in-process LRU of recent event ids (`FW_DEDUPE_LRU`, default 10 000), not a Dragonfly `SET`.
 
+### 5.0 Fan-out must not echo to its own publisher
+
+`ack` and `close` are confirmed **directly** to the client that asked, and then
+broadcast on `fw:ch:alerts` so other pods' clients learn about it. Pub/sub has no
+sender filtering, so that broadcast comes back to the publishing pod — which
+fanned it out **again**, delivering the same frame twice to the originator.
+
+For `close` that meant one operator close arrived as two `applied: 3` frames and
+the client counted the Closed badge twice: the tab said 2, the list showed one
+event with `count` 2.
+
+The broadcasts therefore carry `origin: POD_NAME`, and each handler runs
+`shouldFanOut(parsed, POD_NAME)` (exported from `subscription.js` so it is testable
+without a live cluster). An **untagged** frame is still delivered: a peer on an
+older build sends no origin, and a duplicate is recoverable while a missed close
+leaves a row nobody can clear.
+
+The client is defensive as well — it counts a retirement once per key per session,
+forgetting the key when it is seen open again, so a genuine second episode still
+counts while a duplicated frame does not.
+
 ### 5.1 Acknowledgement writes
 
 An operator ack is the one client-initiated mutation, and it is deliberately narrow:

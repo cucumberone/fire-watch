@@ -145,3 +145,29 @@ export function alertFrame(key, applied, row) {
   if (!row) return JSON.stringify({ op: 'alert', key, applied });
   return JSON.stringify({ op: 'alert', key, applied, row });
 }
+
+/**
+ * Should this broadcast be re-sent to local clients?
+ *
+ * Pub/sub has no sender filtering: a frame published to `fw:ch:alerts` comes back
+ * to the pod that published it. Any handler that ALSO replies to the requesting
+ * client directly will therefore deliver twice unless it recognises its own echo.
+ *
+ * That is exactly what happened for `close` and `ack`: `handleClose` sent
+ * `closeFrame` directly, then broadcast, then the same pod's subscriber fanned the
+ * broadcast back out to every client including the originator. One operator close
+ * arrived as two `applied: 3` frames, and the client counted the Closed badge twice.
+ *
+ * Pure and exported so the rule can be tested without a live cluster — the bug was
+ * invisible locally because it needed the publisher's own subscriber to be working.
+ *
+ * @param {object} parsed   the decoded pub/sub payload
+ * @param {string} podName  this pod's identity
+ */
+export function shouldFanOut(parsed, podName) {
+  if (!parsed || typeof parsed !== 'object') return false;
+  // No origin means a frame from a peer that predates this tag (a rolling update),
+  // so it must still be delivered: duplicate is recoverable, a missed frame is not.
+  if (!parsed.origin) return true;
+  return parsed.origin !== podName;
+}

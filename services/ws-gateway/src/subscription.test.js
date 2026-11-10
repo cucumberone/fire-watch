@@ -12,6 +12,7 @@ import {
   backfillPlan,
   eventFrame,
   alertFrame,
+  shouldFanOut,
 } from './subscription.js';
 
 const limits = { maxSubscriptions: 20, existing: 0 };
@@ -273,4 +274,49 @@ test('terminating a socket for liveness is logged above debug', () => {
   assert.ok(terminatelines.length >= 1, 'sockets are still terminated on timeout');
   assert.ok(logged.some((l) => /unresponsive|no pong/i.test(l)),
     'the termination must be logged at warn or above');
+});
+
+// ---------------------- a fan-out must not echo back to its own publisher
+/**
+ * `close` and `ack` are confirmed DIRECTLY to the requesting client, then
+ * broadcast. The broadcast comes back to the publishing pod, so without an origin
+ * tag that pod delivers the same frame twice — which made one operator close count
+ * as two closures on the Closed badge.
+ *
+ * Asserted on the source because it is a property of the wiring, not of a pure
+ * function: the handler must compare the frame's origin with this pod's name.
+ */
+test('the ack and close fan-outs skip their own broadcast', () => {
+  // Both broadcasts must be origin-tagged...
+  const tags = SRC.match(/origin: POD_NAME/g) || [];
+  assert.ok(tags.length >= 2,
+    `ack and close broadcasts must be origin-tagged, found ${tags.length}`);
+  // ...and both handlers must consult the shared rule rather than re-deriving it.
+  const uses = SRC.match(/if \(!shouldFanOut\(parsed, POD_NAME\)\) return;/g) || [];
+  assert.ok(uses.length >= 2,
+    `both fan-outs must use shouldFanOut, found ${uses.length}`);
+});
+
+test('shouldFanOut drops our own echo and keeps everyone else\'s', () => {
+  assert.equal(shouldFanOut({ kind: 'close', origin: 'pod-a' }, 'pod-a'), false,
+    'own broadcast must not be re-delivered');
+  assert.equal(shouldFanOut({ kind: 'close', origin: 'pod-b' }, 'pod-a'), true,
+    "a peer's broadcast must be delivered");
+});
+
+test('an untagged frame is still delivered', () => {
+  // A peer running an older build sends no origin. Duplicate is recoverable; a
+  // missed close would leave a row on screen that nobody can clear.
+  assert.equal(shouldFanOut({ kind: 'close' }, 'pod-a'), true);
+});
+
+test('a malformed payload is not fanned out', () => {
+  assert.equal(shouldFanOut(null, 'pod-a'), false);
+  assert.equal(shouldFanOut('nonsense', 'pod-a'), false);
+});
+
+test('POD_NAME is defined once and used by the hello frame too', () => {
+  assert.match(SRC, /const POD_NAME = process\.env\.POD_NAME \|\| 'local'/);
+  assert.doesNotMatch(SRC, /process\.env\.POD_NAME \|\| 'local'\}`/,
+    'the hello frame must reuse the constant, not re-read the env var');
 });

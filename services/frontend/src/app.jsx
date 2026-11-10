@@ -418,6 +418,12 @@ function useSocket(config) {
   const timerRef = useRef(null);
   const lastTsRef = useRef(null);
   const closedByUsRef = useRef(false);
+  // Alert keys already counted toward the Closed badge. Prevents a duplicate
+  // retirement frame — two pods delivering the same close, or a snapshot after a
+  // reconnect — from inflating the count. A key that re-fires and retires again is
+  // a genuinely new closure and is re-added by `applyAlert` handling, so the set is
+  // cleared for a key when it is seen OPEN again.
+  const closedCountedRef = useRef(new Set());
   // Set when the gateway rejects `resync` as an unknown op — i.e. the deployed
   // ws-gateway predates this bundle. Stops the client from asking every interval
   // for an op that can only work after a redeploy.
@@ -434,9 +440,16 @@ function useSocket(config) {
       const decorated = toViewEvent({ ...evt, payload });
       setEvents((prev) => insertEvent(prev, decorated, EVENT_LIMIT));
       if (frame.applied !== null && frame.applied !== undefined) {
+        const alertKey = `${evt.source}:${evt.type}`;
+        // Re-opening forgets the "already counted" marker, so the NEXT retirement
+        // of this key is counted as a genuinely new closure. Without this, an alert
+        // that closed and re-fired would never raise the badge again.
+        if (frame.applied === 1 || frame.applied === 2) {
+          closedCountedRef.current.delete(alertKey);
+        }
         setAlerts((prev) =>
           applyAlert(prev, {
-            key: `${evt.source}:${evt.type}`,
+            key: alertKey,
             applied: frame.applied,
             event: decorated,
           }),
@@ -453,6 +466,11 @@ function useSocket(config) {
       // repeat after a CLEAR needed a browser refresh to appear.
       const row = frame.row;
       const rowEvent = row?.event ? toViewEvent(row.event) : undefined;
+      // Re-opening forgets the "already counted" marker (see the retirement
+      // handling below), so a later retirement of this key counts as a new closure.
+      if (frame.applied === 1 || frame.applied === 2) {
+        closedCountedRef.current.delete(frame.key);
+      }
       setAlerts((prev) => applyAlert(prev, {
         key: frame.key,
         applied: frame.applied,
@@ -492,15 +510,20 @@ function useSocket(config) {
       // themselves are not appended here because the frame does not carry the
       // closure metadata (closedAt / closedBy) the tab needs, and inventing it
       // would show a row that disagrees with the server.
+      //
+      // Counted ONCE PER KEY. A duplicated frame must not inflate the badge, and
+      // duplicates do happen: two pods can each deliver a retirement, and a
+      // client that reconnects receives a snapshot of the same closures again.
+      // The set of keys already counted is therefore kept for the session — a key
+      // that retires, is counted, and later re-fires and retires again is a
+      // second closure, but the same frame arriving twice is not.
       if (frame.applied === 3) {
-        setClosedState((prev) => ({
-          ...prev,
-          // Only count it if we know the closure is new to us. An alert that was
-          // never in the loaded set still increments: the badge tracks closures
-          // observed, not closures that happen to be on screen.
-          count: prev.count + 1,
-          loadedAt: null,
-        }));
+        if (!closedCountedRef.current.has(frame.key)) {
+          closedCountedRef.current.add(frame.key);
+          setClosedState((prev) => ({ ...prev, count: prev.count + 1, loadedAt: null }));
+        } else {
+          setClosedState((prev) => (prev.loadedAt ? { ...prev, loadedAt: null } : prev));
+        }
       }
       return;
     }

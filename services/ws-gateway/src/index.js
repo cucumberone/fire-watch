@@ -24,6 +24,7 @@ import {
   backfillPlan,
   eventFrame,
   alertFrame,
+  shouldFanOut,
 } from './subscription.js';
 import {
   validateAck,
@@ -40,6 +41,16 @@ import {
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
+
+/**
+ * This pod's identity, used to recognise our own pub/sub broadcasts.
+ *
+ * A fan-out published on `fw:ch:alerts` comes back to the pod that published it,
+ * because pub/sub has no sender filtering. Any handler that ALSO replies to the
+ * caller directly will therefore deliver twice unless it can tell its own echo
+ * apart — which is exactly the bug that made one operator close count as two.
+ */
+const POD_NAME = process.env.POD_NAME || 'local';
 
 const reader = new DragonflyReader(cfg, log);
 const recent = new RecentIds(cfg.dedupeLru);
@@ -243,7 +254,7 @@ wss.on('connection', (ws, req) => {
 
     send(JSON.stringify({
       op: 'hello',
-      server: `ws-gateway-${process.env.POD_NAME || 'local'}`,
+      server: `ws-gateway-${POD_NAME}`,
       backfill: backfilled,
       truncated,
     }));
@@ -311,6 +322,9 @@ async function handleAck(conn, frame, send) {
         kind: 'ack',
         key: verdict.key,
         ack: result.ack,
+        // Same reason as the close broadcast: the originator was already sent
+        // `ackFrame` directly, and this pod's own echo would deliver it twice.
+        origin: POD_NAME,
       }));
     } catch (err) {
       // The write is durable already. Other pods will not see this frame, so
@@ -420,6 +434,12 @@ async function handleClose(conn, frame, send) {
   try {
     await reader.publish(cfg.channelAlerts, JSON.stringify({
       kind: 'close',
+      // Tagged with this pod so the subscriber can skip re-sending it to clients
+      // this pod ALREADY confirmed above. Without the tag the originator got the
+      // frame twice: once from `send(closeFrame(...))` and once from its own
+      // pub/sub echo, which made the Closed tab's badge count one closure
+      // twice.
+      origin: POD_NAME,
       key: verdict.key,
     }));
   } catch (err) {
@@ -712,6 +732,9 @@ async function handleAlertMessage(raw) {
   // An ack change is broadcast as its own frame, so every pod's clients see the
   // new state without a re-read (docs/acknowledge.md §5).
   if (parsed.kind === 'ack') {
+    // Skip our own broadcast: this pod already sent `ackFrame` to the client that
+    // made the request, so re-delivering it here would double-send.
+    if (!shouldFanOut(parsed, POD_NAME)) return;
     const frame = ackFrame(parsed.key, parsed.ack);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
@@ -722,6 +745,11 @@ async function handleAlertMessage(raw) {
   // An operator close travels on the same channel and fans out as applied: 3,
   // so clients retire the row through the path they already have.
   if (parsed.kind === 'close') {
+    // The publishing pod has already confirmed this close directly to the client
+    // that requested it, so it must not deliver its own broadcast as well — that
+    // double delivery is what made one closure read as two. Every OTHER pod still
+    // fans it out, which is the point of broadcasting.
+    if (!shouldFanOut(parsed, POD_NAME)) return;
     const frame = closeFrame(parsed.key);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);

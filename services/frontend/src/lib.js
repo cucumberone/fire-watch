@@ -603,3 +603,31 @@ export function filterEvents(events, text) {
     return hay.includes(needle);
   });
 }
+
+/**
+ * The count shown in a tab's badge.
+ *
+ * Exists because this was a chain of ternaries ending in `: closed.count`, so when
+ * the All events tab was added it silently inherited the CLOSED count — the tab
+ * showed a number while its table was empty, which reads as a broken query rather
+ * than a wrong badge.
+ *
+ * Explicit per tab, and it THROWS on an unknown id: a new tab must decide what its
+ * badge means instead of quietly borrowing another tab's number.
+ *
+ * @param {string} tabId
+ * @param {{alerts:number, events:number, allEvents:number, closed:number}} counts
+ */
+export function tabBadgeCount(tabId, counts) {
+  switch (tabId) {
+    case 'alerts': return counts.alerts;
+    case 'events': return counts.events;
+    // Loaded rows, not a live total: this tab is a bounded query, so its badge is
+    // "how many I currently hold". The Closed tab is different — it tracks closures
+    // observed, because a closure happens without being fetched.
+    case 'all': return counts.allEvents;
+    case 'closed': return counts.closed;
+    default:
+      throw new Error(`tabBadgeCount: unknown tab "${tabId}" — give it an explicit count`);
+  }
+}

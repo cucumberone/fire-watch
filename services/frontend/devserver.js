@@ -96,7 +96,9 @@ function mkEvent(i, overrides = {}) {
       ][i % 6],
       FirstOccurrence: new Date(first).toISOString(),
       LastOccurrence: new Date(first + 30_000).toISOString(),
-      Count: (i % 5) + 1,
+      // No `Count`. The real ingress never emits one, and the mock fabricating
+      // 1-5 made a dead field look meaningful — the harness has to show the same
+      // shape production does or it hides exactly this kind of problem.
       ...ENRICH[i % ENRICH.length],
       ...(i % 3 === 0
         ? {

@@ -27,6 +27,7 @@ import {
   closedSeverities,
   isTimeField,
   filterEvents,
+  tabBadgeCount,
   formatTimeValue,
 } from './lib.js';
 
@@ -858,4 +859,28 @@ test('filterEvents searches the producer severity as well as the internal one', 
   const list = [{ id: 'e1', severity: 'CLOSE', displaySeverity: 'CLEAR' }];
   assert.equal(filterEvents(list, 'clear').length, 1);
   assert.equal(filterEvents(list, 'close').length, 1);
+});
+
+// ------------------------------------------- tab badges are per-tab, never shared
+test('each tab reports its OWN count', () => {
+  const counts = { alerts: 1, events: 2, allEvents: 3, closed: 4 };
+  assert.equal(tabBadgeCount('alerts', counts), 1);
+  assert.equal(tabBadgeCount('events', counts), 2);
+  assert.equal(tabBadgeCount('all', counts), 3);
+  assert.equal(tabBadgeCount('closed', counts), 4);
+});
+
+test('an unknown tab throws instead of borrowing another tab count', () => {
+  // Regression: the badge was a ternary chain ending in `: closed.count`, so the
+  // All events tab silently showed the CLOSED count — a number beside an empty
+  // table, which reads as a broken query rather than a wrong badge.
+  assert.throws(() => tabBadgeCount('nope', { alerts: 1, events: 2, allEvents: 3, closed: 4 }),
+    /unknown tab/);
+});
+
+test('the All events badge is 0 when its own list is empty, whatever Closed holds', () => {
+  // The exact reported symptom.
+  const counts = { alerts: 5, events: 77, allEvents: 0, closed: 2 };
+  assert.equal(tabBadgeCount('all', counts), 0);
+  assert.equal(tabBadgeCount('closed', counts), 2);
 });

@@ -41,6 +41,7 @@ import {
   filterClosedAlerts,
   closedSeverities,
   filterEvents,
+  tabBadgeCount,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -72,15 +73,16 @@ const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 
 const CLOSED_COLS = ['Severity', 'Closed at', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Key'];
 const CLOSED_DEFAULT_W = [96, 172, 172, 172, 64, 340, 240];
 
-// The enriched columns are fixed-width labels, so only the leading five are
+// The enriched columns are fixed-width labels, so only the leading four are
 // user-resizable; ENRICHED_FIELDS is appended after them.
-// The live tail shows ARRIVALS, one row per delivery. Its Count column is the
-// producer's own `Count` field carried in the payload — a per-MESSAGE field, not
-// an occurrence rollup. It is labelled "Msg count" so it cannot be misread as the
-// alert's Count: an absorbed repeat is a distinct arrival with its own row, but
-// it has no occurrence number of its own, so showing 1 next to the alert's 2 is
-// correct rather than a bug. The alert table owns the occurrence count.
-const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Msg count', 'Summary'];
+//
+// No Count column. There used to be one labelled "Msg count", carrying the
+// producer's own `Count` payload field — a per-MESSAGE value that no producer in
+// this system sends, so it rendered a constant 1 on every row. The number an
+// operator cares about is the alert's occurrence rollup, which lives on the alert
+// hash and is the alert table's Count. A column that always reads 1 is noise that
+// invites the reader to look for meaning in it.
+const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Summary'];
 
 /**
  * Default widths, in px, for every real column.
@@ -96,7 +98,7 @@ const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Msg coun
  * they are wider. Without the spacer, `width: 100%` redistributes again.
  */
 const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
-const EVENT_DEFAULT_W = [96, 172, 172, 64, 340];
+const EVENT_DEFAULT_W = [96, 172, 172, 340];
 
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
@@ -1339,8 +1341,7 @@ function EventRow({ evt, onContextMenu }) {
       <tr className={rowClass} onContextMenu={onContextMenu}>
         <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
         <td className="mono">{formatClock(evt.firstOccurrence)}</td>
-        <td className="mont">{formatClock(evt.lastOccurrence)}</td>
-        <td className="num">{evt.count}</td>
+        <td className="mono">{formatClock(evt.lastOccurrence)}</td>
         <td className="summary">
           {summary || <span className="dim">—</span>}
           {/*
@@ -1370,8 +1371,11 @@ function EventRow({ evt, onContextMenu }) {
       </tr>
       {open && detailText ? (
         <tr className={rowClass}>
-          {/* +1 for the spacer column, or the expanded row stops short. */}
-          <td className="detailcell" colSpan={6 + ENRICHED_FIELDS.length}>
+          {/* +1 for the spacer column, or the expanded row stops short. Counted
+              from EVENT_COLS so removing a column cannot silently leave the
+              detail row spanning past the table — which showed as a horizontal
+              scrollbar and a truncated detail body. */}
+          <td className="detailcell" colSpan={EVENT_COLS.length + ENRICHED_FIELDS.length + 1}>
             <pre className="detail">{detailText}</pre>
           </td>
         </tr>
@@ -1663,9 +1667,17 @@ function App() {
               // count moves the moment something closes, while the rows only
               // catch up on the next fetch. Using the row count made the badge
               // look frozen until the tab was opened.
-              const count = t.id === 'alerts' ? sortedAlerts.length
-                : t.id === 'events' ? shownEvents.length
-                : closed.count;
+              //
+              // Every tab has its own branch. The old form was a chain of ternaries
+              // ending in `closed.count`, so a NEW tab silently inherited the Closed
+              // count — which is why "All events" showed a number with an empty
+              // table: the badge was reporting the wrong tab's data.
+              const count = tabBadgeCount(t.id, {
+                alerts: sortedAlerts.length,
+                events: shownEvents.length,
+                allEvents: allEvents.events.length,
+                closed: closed.count,
+              });
               return (
                 <Tab
                   key={t.id}

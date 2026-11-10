@@ -136,7 +136,7 @@ The UI shows four fields that the workers add to `payload` before the event reac
 |---|---|---|
 | `FirstOccurrence`, `firstOccurrence`, `first_occurrence` | First occurrence | epoch ms or ISO 8601 |
 | `LastOccurrence`, `lastOccurrence`, `last_occurrence` | Last occurrence | falls back to the event's broker timestamp |
-| `Count`, `count` | Count | falls back to `1`; a zero, negative or non-numeric value is rejected rather than rendered as `NaN` |
+| `Count`, `count` | *(no column)* | parsed for the alert rollup's sake but **no longer displayed**: the `EVT_*` schema has no such field and the ingress never adds one, so it was a constant `1` in every event row. Removed for that reason — see §5.6 |
 | `CIF` | CIF | acronym, arrives uppercase |
 | `AlarmIDKey` | Alarm ID key | `ID` stays uppercase; all four other casings accepted |
 | `AlarmOwner` | Alarm owner | |
@@ -151,15 +151,19 @@ Accepted spellings are listed explicitly rather than matched case-insensitively:
 
 Both tables lead with identity and status, then time, then volume, then the human-readable text, then enrichment. Keeping the two tables in the same order means an operator's eye lands in the same place after switching views.
 
-| Open alerts | Live events |
+| Open alerts | Live events / All events |
 |---|---|
 | Severity | Severity |
 | First occurrence | First occurrence |
 | Last occurrence | Last occurrence |
-| Count | Count |
+| **Count** | *(removed — always 1)* |
 | Summary | Summary |
 | Ack | CIF, Alarm ID key, Alarm owner, Auto close, Support group |
 | **Key** | |
+
+The Count column exists only on the alert table, where it is the fold's occurrence
+rollup. The event tables had one too, carrying a per-message `Count` field that no
+producer sends; it was a constant `1` and has been removed (§5.6).
 
 `Key` is deliberately **last** in the alert table. It is a stable identifier you read once when you need it, not something scanned down the column on every glance — putting it first pushed the signal (severity, recency, count) off to the right. Ack sits immediately before it because both are "about this specific row" rather than about the condition.
 
@@ -444,7 +448,7 @@ loop. The panel waits for the next state change or a reload.
 This was verified by forcing a render throw in the alert table and confirming the
 header, the other pane and the socket all stayed functional.
 
-### 5.5 Three tabs: Open alerts, Live events, Closed
+### 5.5 Four tabs: Open alerts, Live events, All events, Closed
 
 The drawer is gone. It was a primary view with an accessory bolted underneath: it
 could only be expanded or invisible, it competed with the alert table for vertical
@@ -460,6 +464,12 @@ already finished" are parallel questions rather than a hierarchy:
 | **Live events** | what did we actually receive, and when | `op: event` frames, arrival order |
 | **All events** | what happened in the last N, searchable | `op: allEvents`, a windowed query |
 | **Closed** | what ended in the last 7 days | `op: closed`, a windowed query |
+
+Badges come from `tabBadgeCount(tabId, counts)` in `lib.js`, which switches
+explicitly per tab and **throws on an unknown id**. It used to be a ternary chain
+ending in `: closed.count`, so adding the All events tab silently gave it the
+Closed count — a number beside an empty table, which reads as a broken query rather
+than a wrong badge. A new tab must now decide what its badge counts.
 
 **All events vs Live events** is the distinction worth stating, because they look
 alike: the live tail is an in-memory buffer of **arrivals since this page loaded**,
@@ -489,6 +499,17 @@ when", which is what you need when the two disagree. Concretely:
   place its arrival is visible
 - see events that never reached the alert fold at all (`applied: 0`)
 - inspect the full record, including fields the tables do not show
+
+**There is no Count column.** It used to be labelled "Msg count" and carried the
+producer's own `Count` payload field — except the `EVT_*` schema has no such field
+and the ingress never adds one, so it rendered a constant **1** on every row. The
+occurrence number an operator cares about is the alert's rollup, which lives on the
+alert hash and is the alert table's `Count`. A column that always reads 1 is worse
+than a blank one: it invites the reader to look for meaning in it.
+
+The dev harness used to fabricate `Count: (i % 5) + 1`, which made the dead field
+look meaningful and hid the problem for as long as it existed. It now emits no
+`Count`, so the mock has the same shape production does.
 
 ### 5.7 Closed tab
 

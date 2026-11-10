@@ -18,6 +18,12 @@
  * so the timeline order matches what the reader expects. Running it twice is safe:
  * ZADD on an existing member only updates its score.
  *
+ * THE WORKER NOW DOES THIS AT STARTUP. `reconcileEventIndex` in
+ * services/worker/src/store.js runs before consuming, bounded by
+ * `FW_INDEX_RECONCILE_MAX`, and logs what it repaired. This script remains for the
+ * cases that path cannot cover: a full history larger than the startup cap, and
+ * running the repair without restarting a worker that is happily serving.
+ *
  * USAGE
  *   node scripts/backfill-event-index.mjs --dry-run
  *   node scripts/backfill-event-index.mjs

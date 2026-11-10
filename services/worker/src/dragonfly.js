@@ -109,8 +109,12 @@ export class DragonflyClient {
   }
 
   /**
-   * Run a write. On READONLY we are pointed at a demoted node: re-resolve and
-   * retry exactly once, then let the caller requeue.
+   * Run a command (or a batch) against the master, retrying once on a demoted node.
+   *
+   * Named `write` for historical reasons — the first caller was one — but it is the
+   * single place that acquires a client and handles READONLY re-resolution, so reads
+   * use it too (e.g. the startup index reconcile). On READONLY we are pointed at a
+   * demoted node: re-resolve and retry exactly once, then let the caller decide.
    */
   async write(fn) {
     for (let attempt = 0; attempt < 2; attempt += 1) {

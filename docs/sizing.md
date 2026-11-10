@@ -26,6 +26,26 @@ events retained      = 1 000/min × 1 440 min/day × 7 = 10 080 000
 
 **The number that matters is the 7-day total, not the instantaneous rate.** With a 7-day TTL, Dragonfly holds everything written in the last rolling week. Peak/s only matters for storm headroom (§2.3); the sustained/min figure determines the baseline working set.
 
+### 1.1 Duplicate factor — the multiplier these numbers assume is 1.0
+
+Every figure below assumes **one stored record per delivered event**. That is only true for a feed that never repeats itself.
+
+The worker keeps the **alert rollup** deduplicated — one alert, `count` per arrival, `last_id` pointing at the owner — but it stores **every arrival** under its own id ([workers.md](workers.md) §3.1). That was a deliberate reversal: the All events tab reads the global event index, so discarding arrivals made it show one row for three delivered events while the live tail showed three.
+
+```text
+records = events delivered × duplicate factor
+```
+
+| Feed | Factor | Effect on §2 |
+|---|---|---|
+| Each condition reported once | 1.0 | the numbers below apply as written |
+| Same condition repeated 3× | 3.0 | triple the working set |
+| Producer retry storms (5×) | 5.0 | 24.5 → 122 GiB per pod |
+
+**Measure it; do not assume it.** The ratio is `ZCARD fw:evt:*` divided by distinct `(source, type, fingerprint)` conditions — or more practically, compare delivery count against `count` in the alert table for a representative hour. `scripts/chaos-events.mjs --copies N` reproduces a known factor exactly.
+
+If the factor is above ~2, shortening `FW_EVENT_TTL` is usually cheaper than buying RAM: cost is linear in retention, and the index prune already handles a shorter window.
+
 ## 2. Working set
 
 ### 2.1 Per-event memory footprint

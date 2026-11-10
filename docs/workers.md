@@ -119,32 +119,39 @@ Fold return codes, forwarded as `applied`:
 
 Duplicate processing produces no duplicate state. The one non-idempotent step is `PUBLISH` (a duplicate would double-render in the UI). Mitigation: each gateway keeps an in-process LRU of the last 10 000 event ids and drops repeats. It is deliberately **not** a Dragonfly write — gateways have no write access ([websocket-server.md](websocket-server.md) §5).
 
-## 3.1 Absorbed duplicates
+## 3.1 Repeated conditions: the rollup dedups, storage does not
 
-When the content fingerprint is already claimed, the arrival is **absorbed**: the
-copy is never stored, and only the original record's rollup moves. Two rules on
-that path are load-bearing, and both were wrong at first:
+When the content fingerprint is already claimed, the SAME CONDITION has been reported
+before. What happens next is the one place this design was reversed after
+measurement, so it is worth stating precisely.
 
-**The fold is given the OWNER's id, not the copy's.** `last_id` is how everything
-finds the record behind an alert — the snapshot read, and the occurrence frame the
-gateway enriches ([websocket-server.md](websocket-server.md) §3.2). Recording the
-discarded copy's id left `last_id` pointing at a key that does not exist, so the
-Summary column rendered `—` and the alert was technically open but unrenderable.
-The owner is the record that represents the condition; the copy has no record at
-all.
+**The alert rollup is deduplicated.** One alert per `source:type`. `count` increments
+once per arrival, `last_seen` moves to the newest arrival, and `last_id` keeps naming
+the **owner** — the first record for that condition.
 
-**The absorbed event is still published to `fw:ch:events`, with `applied: 0`.** It
-is not stored, but it did arrive and did move the rollup, so an operator watching
-the live tail should see it. Omitting it meant a producer that only ever repeats
-one event produced *no* tail frames at all — every delivery after the first was
-absorbed — so the live tail showed "Nothing yet" while alerts were open. `applied: 0`
-is what stops the client double-counting it, since the `occurrence` frame follows
-and carries the fold's own count.
+**The arrival itself IS stored**, under its own id, and indexed in both timelines.
 
-**The fold takes TWO ids, and aliasing them loses counts.** `ARGV[2]` is the
-*owner* — the id written to `last_id`, which must name a record that exists.
-`ARGV[6]` is the *arrival* — the id the `(ts, id)` ordering guard and the watermark
-compare against.
+That second sentence used to read "the copy is never stored". It was changed because
+of what it did to the All events tab: that tab reads the global event index, so a
+discarded copy was invisible to it. Three identical deliveries produced three rows in
+the live tail and **one** row in All events. Two tabs over the same traffic disagreeing
+is not something an operator can reconcile — "all events" that omits events is simply
+wrong, and it was reported as exactly that.
+
+So dedup now owns the rollup, not whether a delivery exists. The cost is real and is
+carried in [sizing.md](sizing.md) §1.1: storage grows with **deliveries**, not with
+distinct conditions.
+
+### What is still load-bearing on this path
+
+**The fold is given the OWNER's id as `last_id`.** That field is how everything finds
+the record behind an alert — the snapshot read and the occurrence frame the gateway
+enriches ([websocket-server.md](websocket-server.md) §3.2). It must name a record that
+exists, and the owner always does.
+
+**The fold takes TWO ids, and aliasing them loses counts.** `ARGV[2]` is the *owner*
+— the id written to `last_id`. `ARGV[6]` is the *arrival* — the id the `(ts, id)`
+ordering guard and the watermark compare against.
 
 Passing the owner as both made every absorbed copy after the first look like a
 redelivery *whenever it landed in the same millisecond as the original*: the guard
@@ -176,8 +183,44 @@ independently.
 
 
 ### 4.1 Index pruning is mandatory
-
 `fw:evt:{id}` expires on its own TTL, but a sorted-set member never does. Without pruning the index grows forever and the working set becomes unbounded regardless of TTL — which would break the capacity model in [sizing.md](sizing.md) §2 entirely.
+
+### 4.2 Index repair at startup
+
+The record write and both index writes happen in one pipelined step, so they cannot
+normally diverge. They *can* diverge across a version boundary: records written before
+`fw:idx:evt:all` existed are in storage and absent from the index, and nothing in the
+read path can detect that. A query over an incomplete index is not a query bug — it is
+missing data, and the symptom is "All events is empty" while the live tail has rows.
+
+Measured on the lab: **3 index members for 7 stored records.** Four events existed and
+were unlistable.
+
+`reconcileEventIndex` runs at startup, before consuming:
+
+1. load `fw:idx:evt:all` as a set
+2. `SCAN fw:idx:src:*` — never `KEYS`, which blocks the whole keyspace and would stall
+   every reader on the node
+3. for each source index, `missingFromGlobal` (a pure, tested function)
+4. `MGET` each candidate for its `brokerTs` and `ZADD` it at that score
+
+Score is the **record's** broker arrival time, never "now": scoring now would put a
+week-old event at the top of the All events list, which is worse than leaving it out.
+A record that has already expired, or carries no usable timestamp, is counted as
+skipped rather than given an invented position.
+
+| Property | Value |
+|---|---|
+| Runs before consuming | yes — so the tab is correct the moment the worker is up |
+| Skipped when the gap is zero | yes — the normal case after the first run |
+| Bounded | `FW_INDEX_RECONCILE_MAX` (50 000 default); reports `capped` |
+| Fatal on failure | no — ingestion must not depend on it |
+| Disabled by | `FW_INDEX_RECONCILE=0` |
+
+A partial reconcile is still progress: the next restart compares the same two sets
+again. `scripts/backfill-event-index.mjs` does the same work from outside the cluster,
+for a history larger than the startup cap or to repair without a restart.
+
 
 Every `FW_INDEX_PRUNE_EVERY` writes per source (default `1000` — confirmed as the agreed cadence), the worker also issues:
 

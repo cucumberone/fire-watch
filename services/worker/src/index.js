@@ -22,7 +22,7 @@ import {
   brokerTsMs,
 } from './event.js';
 import { DragonflyClient } from './dragonfly.js';
-import { FoldScript, persistEvent } from './store.js';
+import { FoldScript, persistEvent, reconcileEventIndex } from './store.js';
 import { AmqpConsumer } from './amqp.js';
 
 const cfg = loadConfig();
@@ -254,6 +254,26 @@ async function main() {
     log.error('could not reach dragonfly through sentinel; starting anyway with readiness false');
   }
   lastWriteOk = connected;
+
+  // Repair a global event index that is missing records.
+  //
+  // Runs BEFORE consuming, so the All events tab is correct from the first moment
+  // this worker is up rather than only after some later event happens to re-index.
+  // Non-fatal by design: a reconcile failure must not stop event ingestion, and a
+  // partial reconcile is still progress because the next restart re-compares the
+  // same two sets.
+  if (connected && cfg.indexReconcile) {
+    try {
+      const res = await reconcileEventIndex(dfl, cfg, log, {
+        maxToAdd: cfg.indexReconcileMax,
+      });
+      if (res.added > 0) {
+        log.warn('global event index repaired at startup', res);
+      }
+    } catch (err) {
+      log.warn('index reconcile failed; ingestion continues', { err: String(err) });
+    }
+  }
 
   // Keep probing so readiness recovers without a restart.
   setInterval(async () => {

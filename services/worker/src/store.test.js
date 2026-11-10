@@ -12,7 +12,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { persistEvent } from './store.js';
+import { persistEvent, missingFromGlobal, reconcileEventIndex } from './store.js';
 
 /**
  * Minimal Dragonfly stub. `set` returns null on a second call for the same key,
@@ -295,4 +295,127 @@ test('the fold receives the closed index as its fourth key', async () => {
   assert.equal(last.numKeys, 4, 'numKeys must match the 4 keys passed');
   assert.equal(last.args[0], 'fw:alert:' + `${silent.source}:${silent.type}`);
   assert.equal(last.args[3], 'fw:idx:alert:closed', 'fourth key is the closed index');
+});
+
+// ------------------------------------------------------------ index reconcile
+// These pin the repair for "All events is empty while the live tail has rows":
+// the global index was missing records that storage held, and nothing in the read
+// path can detect that.
+
+test('missingFromGlobal reports only ids the global index lacks', () => {
+  assert.deepEqual(
+    missingFromGlobal(['a', 'b', 'c'], new Set(['a', 'c'])),
+    ['b'],
+  );
+  // Complete index: nothing to do, which is the normal case after one run.
+  assert.deepEqual(missingFromGlobal(['a', 'b'], new Set(['a', 'b'])), []);
+  // Empty index: everything is missing.
+  assert.deepEqual(missingFromGlobal(['a', 'b'], []), ['a', 'b']);
+});
+
+test('missingFromGlobal ignores blanks, duplicates and non-strings', () => {
+  // These come from a zset read, so a blank or a null would be a corrupt member
+  // rather than a real id. Writing one into the index creates an entry that can
+  // never resolve to a record.
+  assert.deepEqual(
+    missingFromGlobal(['a', '', null, undefined, 'a', 'b'], new Set()),
+    ['a', 'b'],
+  );
+  assert.deepEqual(missingFromGlobal(null, new Set()), []);
+  assert.deepEqual(missingFromGlobal([], new Set()), []);
+});
+
+test('missingFromGlobal accepts an array for the global set', () => {
+  // The caller may hand back an array from a pipeline rather than a Set.
+  assert.deepEqual(missingFromGlobal(['a', 'b', 'c'], ['a', 'b']), ['c']);
+});
+
+/** A client stub good enough for the reconcile: an in-memory key/value store. */
+function makeReconcileDfl(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  const indexes = new Map();   // key -> Map(member -> score)
+  const dfl = {
+    store,
+    indexes,
+    async write(fn) {
+      const c = {
+        scan: async (_cursor, _m, pattern) => {
+          // One page, everything that matches the prefix.
+          const prefix = pattern.replace('*', '');
+          const keys = [...indexes.keys()].filter((k) => k.startsWith(prefix));
+          return ['0', keys];
+        },
+        zrange: async (key) => [...(indexes.get(key)?.keys() ?? [])],
+        mget: async (keys) => keys.map((k) => store.get(k) ?? null),
+        zadd: (key, score, member) => {
+          if (!indexes.has(key)) indexes.set(key, new Map());
+          indexes.get(key).set(member, Number(score));
+          return 1;
+        },
+      };
+      return fn(c);
+    },
+  };
+  return dfl;
+}
+
+test('reconcile adds unindexed records and scores them by brokerTs', async () => {
+  const dfl = makeReconcileDfl({
+    'fw:evt:a': JSON.stringify({ id: 'a', brokerTs: 1000 }),
+    'fw:evt:b': JSON.stringify({ id: 'b', brokerTs: 2000 }),
+  });
+  dfl.indexes.set('fw:idx:src:shop', new Map([['a', 1000], ['b', 2000]]));
+  dfl.indexes.set('fw:idx:evt:all', new Map([['a', 1000]]));
+
+  const res = await reconcileEventIndex(dfl, {}, { info() {}, warn() {} });
+  assert.equal(res.missing, 1);
+  assert.equal(res.added, 1);
+  // Scored by the RECORD's brokerTs, not by "now": scoring now would put a week-old
+  // event at the top of the All events list.
+  assert.equal(dfl.indexes.get('fw:idx:evt:all').get('b'), 2000);
+  assert.equal(dfl.indexes.get('fw:idx:evt:all').get('a'), 1000, 'existing member untouched');
+});
+
+test('reconcile does nothing when the index is already complete', async () => {
+  const dfl = makeReconcileDfl({
+    'fw:evt:a': JSON.stringify({ id: 'a', brokerTs: 1000 }),
+  });
+  dfl.indexes.set('fw:idx:src:shop', new Map([['a', 1000]]));
+  dfl.indexes.set('fw:idx:evt:all', new Map([['a', 1000]]));
+
+  const res = await reconcileEventIndex(dfl, {}, { info() {}, warn() {} });
+  assert.equal(res.missing, 0);
+  assert.equal(res.added, 0);
+});
+
+test('reconcile skips a missing or timestamp-less record instead of inventing a score', async () => {
+  const dfl = makeReconcileDfl({
+    // 'gone' is in the index but its record has expired
+    'fw:evt:nots': JSON.stringify({ id: 'nots' }),
+    'fw:evt:bad': 'not json',
+  });
+  dfl.indexes.set('fw:idx:src:shop', new Map([['gone', 1], ['nots', 2], ['bad', 3]]));
+  dfl.indexes.set('fw:idx:evt:all', new Map());
+
+  const res = await reconcileEventIndex(dfl, {}, { info() {}, warn() {} });
+  assert.equal(res.added, 0);
+  assert.equal(res.skipped, 3, 'all three are unplaceable on a timeline');
+});
+
+test('reconcile is capped and reports that it was capped', async () => {
+  // A pathological history must not stall startup. A partial reconcile is progress:
+  // the next restart compares the same two sets again.
+  const initial = {};
+  const src = new Map();
+  for (let i = 0; i < 10; i += 1) {
+    initial[`fw:evt:e${i}`] = JSON.stringify({ id: `e${i}`, brokerTs: 1000 + i });
+    src.set(`e${i}`, 1000 + i);
+  }
+  const dfl = makeReconcileDfl(initial);
+  dfl.indexes.set('fw:idx:src:shop', src);
+  dfl.indexes.set('fw:idx:evt:all', new Map());
+
+  const res = await reconcileEventIndex(dfl, {}, { info() {}, warn() {} }, { maxToAdd: 3 });
+  assert.equal(res.added, 3);
+  assert.equal(res.capped, true);
 });

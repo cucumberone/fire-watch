@@ -328,3 +328,147 @@ export async function maybePruneIndex(dfl, source, cfg, log, force = false) {
 export function recordLooksValid(buf) {
   return Buffer.isBuffer(buf) && buf.length > 0 && (buf[0] === 0x7b /* { */ || isGzip(buf));
 }
+
+/**
+ * Find ids in the SOURCE index that are missing from the GLOBAL index.
+ *
+ * Pure, so the arithmetic is testable without a database. The two sets are both
+ * membership lists over the same records, and the global one is written in the
+ * same step as the source one — so any id present in one and absent from the
+ * other is evidence of a gap, not of two different populations.
+ *
+ * Used by the startup reconcile below and by scripts/backfill-event-index.mjs.
+ *
+ * @param {string[]} sourceIds  ids from a source index (e.g. fw:idx:src:shop)
+ * @param {Iterable<string>} globalIds  ids from fw:idx:evt:all
+ * @returns {string[]} ids that need to be added to the global index
+ */
+export function missingFromGlobal(sourceIds, globalIds) {
+  const have = globalIds instanceof Set ? globalIds : new Set(globalIds || []);
+  const out = [];
+  const seen = new Set();
+  for (const id of sourceIds || []) {
+    if (typeof id !== 'string' || id === '') continue;
+    if (have.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Reconcile `fw:idx:evt:all` against the per-source indexes.
+ *
+ * WHY THIS RUNS AT STARTUP. The All events tab reads ONE zset. Events written
+ * before that zset existed were stored but not indexed, so the tab could never
+ * list them — measured on the lab as 3 index members for 7 stored records, and
+ * the symptom the operator saw was "All events is empty" with rows sitting in the
+ * live tail. A query over an incomplete index is not a query bug; it is missing
+ * data, and nothing in the read path can detect it.
+ *
+ * WHY ALL SOURCES. The global index is shared, so a gap is not per-source, but
+ * there is no way to enumerate its intended members without reading the sources
+ * that were supposed to write them. SCAN over `fw:idx:src:*` is bounded by the
+ * number of DEVICES (hundreds), not by the number of events (millions). The ids
+ * inside each index are bounded by the retention window, and only the members
+ * after the global set has been loaded need checking.
+ *
+ * WHY IT IS BOUNDED AND OPTIONAL. On a large history this is a lot of reads at
+ * boot, and it competes with consuming. It is skipped entirely when the gap is
+ * already zero, which is the normal case after the first run, and it is capped so
+ * a pathological history cannot stall startup indefinitely. A partial reconcile is
+ * still progress: the next restart continues from the same set comparison.
+ *
+ * @param {object} dfl       DragonflyClient
+ * @param {object} cfg       worker config
+ * @param {object} log       logger
+ * @param {object} [opts]    { maxToAdd } — cap, mostly for tests
+ * @returns {Promise<{scanned:number, missing:number, added:number, skipped:number, capped:boolean}>}
+ */
+export async function reconcileEventIndex(dfl, cfg, log, opts = {}) {
+  const maxToAdd = Number.isInteger(opts.maxToAdd) ? opts.maxToAdd : 50000;
+
+  // ---- 1. the global index, as a Set.
+  //
+  // Read whole rather than per-id: ZSCORE per candidate would be one round trip
+  // per event. At 1 000/min over 7 days that set is ~10 M members, which is too
+  // big for this to be free — hence the cap and the startup-only timing.
+  const globalIds = new Set(await dfl.write((c) => c.zrange(keys.eventAllIndex, 0, -1)));
+  log.info('index reconcile: global index loaded', { members: globalIds.size });
+
+  // ---- 2. every source index, compared against it.
+  //
+  // SCAN, never KEYS. KEYS walks the whole keyspace in one blocking call, and this
+  // database holds millions of event records — it would stall every reader on the
+  // node, including the gateway serving the board. SCAN is incremental; the loop is
+  // bounded by the number of DEVICES (hundreds), not by the number of events.
+  const sourceKeys = [];
+  {
+    let cursor = '0';
+    do {
+      // eslint-disable-next-line no-await-in-loop
+      const [next, batch] = await dfl.write((c) => c.scan(cursor, 'MATCH', 'fw:idx:src:*', 'COUNT', 500));
+      cursor = next;
+      if (Array.isArray(batch)) sourceKeys.push(...batch);
+    } while (cursor !== '0');
+  }
+  if (sourceKeys.length === 0) {
+    return { scanned: 0, missing: 0, added: 0, skipped: 0, capped: false };
+  }
+
+  const candidates = [];
+  let scanned = 0;
+  let capped = false;
+  for (const sourceKey of sourceKeys) {
+    if (candidates.length >= maxToAdd) { capped = true; break; }
+    const ids = await dfl.write((c) => c.zrange(sourceKey, 0, -1));
+    scanned += ids.length;
+    const miss = missingFromGlobal(ids, globalIds);
+    for (const id of miss) {
+      if (candidates.length >= maxToAdd) { capped = true; break; }
+      candidates.push(id);
+    }
+  }
+
+  if (candidates.length === 0) {
+    log.info('index reconcile: global index is complete', { scanned });
+    return { scanned, missing: 0, added: 0, skipped: 0, capped: false };
+  }
+  log.warn('index reconcile: records missing from the global index', {
+    scanned, missing: candidates.length, capped,
+  });
+
+  // ---- 3. read each candidate's record for its brokerTs, then ZADD.
+  //
+  // The score must be the broker arrival time, not "now": scoring it now would put
+  // a week-old event at the top of the All events list, which is worse than leaving
+  // it out.
+  let added = 0;
+  let skipped = 0;
+  const CHUNK = 500;
+  for (let i = 0; i < candidates.length; i += CHUNK) {
+    const slice = candidates.slice(i, i + CHUNK);
+    const raws = await dfl.write((c) => c.mget(slice.map((id) => keys.event(id))));
+    const zadds = [];
+    for (let j = 0; j < slice.length; j += 1) {
+      const raw = raws[j];
+      if (!raw) { skipped += 1; continue; }
+      let rec;
+      try { rec = JSON.parse(raw); } catch { skipped += 1; continue; }
+      const score = Number(rec?.brokerTs ?? rec?.ts);
+      if (!Number.isFinite(score) || score <= 0) { skipped += 1; continue; }
+      zadds.push([score, slice[j]]);
+    }
+    if (zadds.length > 0) {
+      await dfl.write((c) => {
+        for (const [score, id] of zadds) c.zadd(keys.eventAllIndex, score, id);
+        return null;
+      });
+      added += zadds.length;
+      for (const [, id] of zadds) globalIds.add(id);
+    }
+  }
+
+  log.info('index reconcile: done', { scanned, added, skipped, capped });
+  return { scanned, missing: candidates.length, added, skipped, capped };
+}

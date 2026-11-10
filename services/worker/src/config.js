@@ -42,6 +42,18 @@ export function loadConfig() {
     // ---- behaviour
     eventTtl: int('FW_EVENT_TTL', 604800),
     indexPruneEvery: int('FW_INDEX_PRUNE_EVERY', 1000),
+    // Reconcile fw:idx:evt:all against the per-source indexes at startup.
+    //
+    // Exists because events written before the global index existed were stored but
+    // never indexed, so the All events tab could not list them — measured on the lab
+    // as 3 index members for 7 stored records. Nothing in the read path can detect
+    // that: it is missing data, not a bad query.
+    //
+    // On by default, bounded by indexReconcileMax, and it costs only a set comparison
+    // when the gap is already zero (the normal case after the first run). Set
+    // FW_INDEX_RECONCILE=0 on a very large history where the boot read is not worth it.
+    indexReconcile: optional('FW_INDEX_RECONCILE', '1') !== '0',
+    indexReconcileMax: int('FW_INDEX_RECONCILE_MAX', 50000),
     alertDedupWindow: int('FW_ALERT_DEDUP_WINDOW', 300000),
     compressMin: int('FW_COMPRESS_MIN', 1024),
     compressLevel: int('FW_COMPRESS_LEVEL', 6),

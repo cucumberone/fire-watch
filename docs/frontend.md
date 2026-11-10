@@ -772,6 +772,40 @@ The `❚❚ Pause` button freezes the **render**, not the socket. The socket kee
 - the button is `aria-pressed` and changes to `▶ Resume` plus a `paused` marker, so a paused view is never mistaken for a quiet stream
 - the count in the handle shows the frozen length while paused; on resume it jumps to the true length, which is itself evidence that nothing was dropped
 
+### 5.8.1 Row selection
+
+Both the **Open alerts** and **All events** tables support multi-select, through one
+shared hook (`useRowSelection`) rather than two copies. The convention is the
+file-manager one:
+
+| Gesture | Effect |
+|---|---|
+| plain click | select only this row, and move the anchor |
+| shift+click | select the range from the anchor to this row |
+| ctrl/cmd+click | toggle this row, leaving the rest alone |
+| Escape | clear the selection |
+
+The **anchor** is what makes shift-click predictable. Without it, shift-click would
+range from whatever was selected last — which, after a shift-range, is the far end of
+that range rather than where the operator started.
+
+Two properties worth knowing:
+
+- **Shift ranges resolve against the rendered row order**, not the selection, so
+  "everything between these two on screen" is literally what gets selected.
+- **Only rows still on screen count.** The selection is filtered against the current
+  row keys on every render, so a bulk action cannot fire at a row that has been
+  retired, deleted, or filtered out from under the operator.
+
+Right-click respects the selection: inside a multi-row selection the menu acts on
+**all** of it and says so (`Delete 3 events`), and outside it the menu targets that
+one row. That is the same rule the alert table uses, and it exists because a menu that
+silently acts on less than the screen shows as selected is worse than no menu.
+
+The two selections are **independent**. Selecting alerts and selecting events are
+different intents, and a single set spanning two id spaces would make every consumer
+filter a mixed collection.
+
 ### 5.9 Record inspector
 
 Right-clicking a row in either table opens a **two-level menu**:

@@ -431,6 +431,95 @@ function writeWidths(table, widths) {
  */
 const MIN_COL_WIDTH = 48;
 
+/**
+ * Row selection for one table: plain / shift / ctrl-click, plus Escape to clear.
+ *
+ * Extracted because it is used by TWO tables now (Open alerts and All events) and
+ * a third copy would be a third chance to disagree about what shift-click means.
+ * The behaviour is the file-manager convention:
+ *
+ *   plain click   select only this row (and move the anchor)
+ *   shift+click   select the range from the anchor to this row
+ *   ctrl/cmd+click toggle this row, leaving the rest alone
+ *
+ * The anchor is what makes shift-click predictable. Without it, shift+click would
+ * select from whatever happened to be selected last, which after a shift-range is
+ * the far end of that range and not where the operator started.
+ *
+ * @param {string[]} orderedKeys  row keys in the order they are RENDERED. Shift
+ *   ranges are resolved against this, not against the selection, so the range means
+ *   "everything between these two on screen" — which is what an operator sees.
+ */
+function useRowSelection(orderedKeys) {
+  const [selected, setSelected] = useState(() => new Set());
+  // Anchor for shift-range selection: the last row clicked without shift.
+  const anchorRef = useRef(null);
+
+  // Keep the latest key order available to the click handler without making it a
+  // dependency of that handler: rebinding on every arriving event would re-create
+  // the callback on every frame, and the rows do not need to know.
+  const keysRef = useRef(orderedKeys);
+  keysRef.current = orderedKeys;
+
+  const selectRow = useCallback((key, e) => {
+    const additive = e.metaKey || e.ctrlKey;
+    const range = e.shiftKey;
+    const keys = keysRef.current;
+
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (range && anchorRef.current !== null) {
+        const from = keys.indexOf(anchorRef.current);
+        const to = keys.indexOf(key);
+        if (from === -1 || to === -1) {
+          next.clear();
+          next.add(key);
+          return next;
+        }
+        // An additive shift-range adds to the existing selection; a plain one
+        // replaces it. Both include the anchor and the clicked row.
+        if (!additive) next.clear();
+        const [lo, hi] = from <= to ? [from, to] : [to, from];
+        for (let i = lo; i <= hi; i += 1) next.add(keys[i]);
+        return next;
+      }
+      if (additive) {
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        anchorRef.current = key;
+        return next;
+      }
+      next.clear();
+      next.add(key);
+      anchorRef.current = key;
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    anchorRef.current = null;
+  }, []);
+
+  // Escape clears the selection, matching the convention that Escape backs out of
+  // a mode rather than leaving rows armed.
+  useEffect(() => {
+    if (selected.size === 0) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') clearSelection(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [selected.size, clearSelection]);
+
+  // Only rows still on screen, so a bulk action cannot fire at something that has
+  // been retired, deleted or filtered out from under the operator's selection.
+  const liveKeys = useMemo(() => {
+    const present = new Set(orderedKeys);
+    return [...selected].filter((k) => present.has(k));
+  }, [selected, orderedKeys]);
+
+  return { selected, selectRow, clearSelection, liveKeys };
+}
+
 function useColumnWidths(table, cols, defaults) {
   const [overrides, setOverrides] = useState(() => migrateWidths(table, cols));
 
@@ -1758,7 +1847,7 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   );
 }
 
-function EventRow({ evt, onContextMenu }) {
+function EventRow({ evt, selected, onSelect, onContextMenu }) {
   // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
   // and the worker-enriched fields are already mapped by toViewEvent().
   //
@@ -1780,7 +1869,15 @@ function EventRow({ evt, onContextMenu }) {
   const retirement = isRetirement(evt.severity);
   const rowClass = severityRowClass(evt.severity, retirement ? 'retirement' : '');
   return (
-    <tr className={rowClass} onContextMenu={onContextMenu}>
+    <tr
+      className={`${rowClass}${selected ? ' row-selected' : ''}`}
+      onClick={onSelect}
+      onContextMenu={onContextMenu}
+      // Selection is pointer state, so the row is not focusable and carries no
+      // button semantics: making a data row behave like a button breaks
+      // screen-reader table navigation. The same actions are on the context menu.
+      aria-selected={selected || undefined}
+    >
       <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
       <td className="mono">{formatClock(evt.firstOccurrence)}</td>
       <td className="mono">{formatClock(evt.lastOccurrence)}</td>
@@ -1955,81 +2052,23 @@ function App() {
   );
 
   // ------------------------------------------------------------- selection
-  // A Set of alert keys. Selection is deliberately client-side only: it is a
-  // transient pointer state, not a fact about the alert, so persisting it (or
-  // syncing it) would only create disagreement between operators.
-  const [selected, setSelected] = useState(() => new Set());
-  // Anchor for shift-range selection: the last row clicked without shift.
-  const anchorRef = useRef(null);
-
-  /**
-   * Click behaviour, the usual file-manager convention:
-   *
-   *   plain click   select only this row (and move the anchor)
-   *   shift+click   select the range from the anchor to this row
-   *   ctrl/cmd+click toggle this row, leaving the rest alone
-   *
-   * The anchor is what makes shift-click predictable. Without it, shift+click
-   * would select from whatever happened to be selected last, which after a
-   * shift-range is the far end of that range and not where the operator started.
-   */
-  const selectRow = useCallback((key, e) => {
-    const additive = e.metaKey || e.ctrlKey;
-    const range = e.shiftKey;
-
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (range && anchorRef.current !== null) {
-        const keys = sortedAlerts.map((a) => a.key);
-        const from = keys.indexOf(anchorRef.current);
-        const to = keys.indexOf(key);
-        if (from === -1 || to === -1) {
-          next.clear();
-          next.add(key);
-          return next;
-        }
-        // An additive shift-range adds to the existing selection; a plain one
-        // replaces it. Both include the anchor and the clicked row.
-        if (!additive) next.clear();
-        const [lo, hi] = from <= to ? [from, to] : [to, from];
-        for (let i = lo; i <= hi; i += 1) next.add(keys[i]);
-        return next;
-      }
-      if (additive) {
-        if (next.has(key)) next.delete(key);
-        else next.add(key);
-        anchorRef.current = key;
-        return next;
-      }
-      next.clear();
-      next.add(key);
-      anchorRef.current = key;
-      return next;
-    });
-  }, [sortedAlerts]);
-
-  const clearSelection = useCallback(() => {
-    setSelected(new Set());
-    anchorRef.current = null;
-  }, []);
-
-  // Escape clears the selection, matching the convention that Escape backs out
-  // of a mode rather than leaving rows armed.
-  useEffect(() => {
-    if (selected.size === 0) return undefined;
-    const onKey = (e) => { if (e.key === 'Escape') clearSelection(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [selected.size, clearSelection]);
-
-  // Drop keys that are no longer on the board, so a bulk action cannot fire at
-  // an alert that has already been closed by a source.
-  const liveSelection = useMemo(
-    () => [...selected].filter((k) => alerts.has(k)),
-    [selected, alerts],
+  // Selection is deliberately client-side only: it is a transient pointer state,
+  // not a fact about the alert, so persisting it (or syncing it) would only create
+  // disagreement between operators.
+  //
+  // Two independent selections, one per table, via the same hook. They are not
+  // shared: selecting an alert and selecting an event are different intents, and a
+  // single set keyed by two different id spaces would collide on nothing while
+  // making every consumer filter a mixed set.
+  const alertRowKeys = useMemo(() => sortedAlerts.map((a) => a.key), [sortedAlerts]);
+  const eventRowKeys = useMemo(
+    () => allEventRows.map((e) => `${e.id}@${e.brokerTs ?? ''}`),
+    [allEventRows],
   );
-
-  const selectedAlertKeys = liveSelection;
+  const alertsSel = useRowSelection(alertRowKeys);
+  const eventsSel = useRowSelection(eventRowKeys);
+  const { selected } = alertsSel;
+  const selectedAlertKeys = alertsSel.liveKeys;
 
   if (error) {
     return <main><h1>Fire-Watch</h1><p className="error">Cannot load config.json: {error}</p></main>;
@@ -2217,7 +2256,7 @@ function App() {
                     alert={a}
                     ack={ack}
                     selected={isSelected}
-                    onSelect={(e) => selectRow(a.key, e)}
+                    onSelect={(e) => alertsSel.selectRow(a.key, e)}
                     onContextMenu={(e) => openInspector(
                       e,
                       a.event?.wire ?? a.event ?? a,
@@ -2523,29 +2562,55 @@ function App() {
                     <th />
                   </>
                 )}
-                rows={allEventRows.map((e) => (
-                  <EventRow
-                    // Id plus brokerTs: a stored event id is unique, but the same
-                    // rule as the live tail keeps the two tables consistent.
-                    key={`${e.id}@${e.brokerTs ?? ''}`}
-                    evt={e}
-                    onContextMenu={(ev) => openInspector(
-                      ev,
-                      e.wire ?? e,
-                      `${e.source} · ${e.type}`,
-                      [
-                        {
-                          label: 'Delete event',
-                          disabled: false,
-                          title: `Permanently delete event ${e.id}`,
-                          run: () => deleteEvent(e.id),
-                          danger: true,
-                        },
-                      ],
-                      e.source && e.type ? `${e.source}:${e.type}` : null,
-                    )}
-                  />
-                ))}
+                rows={allEventRows.map((e) => {
+                  // Same key the selection set uses, so a row and its selection
+                  // entry cannot describe different records.
+                  const rowKey = `${e.id}@${e.brokerTs ?? ''}`;
+                  const isSelected = eventsSel.selected.has(rowKey);
+                  // Right-clicking inside a multi-row selection acts on the whole
+                  // selection: otherwise the menu would contradict what the board
+                  // shows as selected. Outside it, the menu targets that row alone.
+                  const targets = isSelected && eventsSel.liveKeys.length > 1
+                    ? eventsSel.liveKeys
+                    : [rowKey];
+                  const ids = targets
+                    .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k)?.id)
+                    .filter(Boolean);
+                  return (
+                    <EventRow
+                      // Id plus brokerTs: a stored event id is unique, but the same
+                      // rule as the live tail keeps the two tables consistent.
+                      key={rowKey}
+                      evt={e}
+                      selected={isSelected}
+                      onSelect={(ev) => eventsSel.selectRow(rowKey, ev)}
+                      onContextMenu={(ev) => openInspector(
+                        ev,
+                        e.wire ?? e,
+                        targets.length > 1 ? `${targets.length} events` : `${e.source} · ${e.type}`,
+                        [
+                          {
+                            label: ids.length > 1
+                              ? `Delete ${ids.length} events`
+                              : 'Delete event',
+                            disabled: ids.length === 0,
+                            title: ids.length > 1
+                              ? 'Permanently delete these event records. Cannot be undone.'
+                              : `Permanently delete event ${e.id}`,
+                            run: () => { for (const id of ids) deleteEvent(id); },
+                            danger: true,
+                          },
+                        ],
+                        // One journal per incident, so a multi-row selection has no
+                        // single key to open. Silently picking the first would hide
+                        // the others.
+                        targets.length === 1 && e.source && e.type
+                          ? `${e.source}:${e.type}`
+                          : null,
+                      )}
+                    />
+                  );
+                })}
               />
             </PaneBoundary>
           </Box>

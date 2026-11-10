@@ -2,6 +2,7 @@
   "name": "frontend",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "React UI for the fire-watch event stream",
   "type": "module",
   "engines": {

@@ -2,6 +2,7 @@
   "name": "ws-gateway",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Stateless WebSocket fan-out from Dragonfly pub/sub to browsers",
   "type": "module",
   "engines": {

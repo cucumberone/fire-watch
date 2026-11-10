@@ -2,6 +2,7 @@
   "name": "worker",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Consumes events from RabbitMQ, compresses, writes to Dragonfly, keeps an audit WAL, acks last",
   "type": "module",
   "engines": {

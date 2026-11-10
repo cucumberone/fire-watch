@@ -114,7 +114,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=fire-watch frontend
             org.opencontainers.image.description=fire-watch event server — static React UI
-            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.licenses=MIT
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Build and push

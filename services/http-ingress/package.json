@@ -2,6 +2,7 @@
   "name": "http-ingress",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Accepts HTTP from an external nginx, publishes to RabbitMQ as AMQP 0-9-1 with publisher confirms",
   "type": "module",
   "engines": {

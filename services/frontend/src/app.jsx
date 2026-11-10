@@ -691,7 +691,7 @@ function useSocket(config) {
 }
 
 // ------------------------------------------------------------------------ UI
-function Badge({ severity }) {
+function Badge({ severity, label }) {
   // Severity can be absent on a row that was incremented by a content-duplicate
   // frame: that frame carries no event, so there is nothing to read it from
   // (docs/frontend.md §5.3.1). Rendering `undefined` here used to throw
@@ -701,7 +701,13 @@ function Badge({ severity }) {
   if (severity === undefined || severity === null || severity === '') {
     return <span className="sev sev-unknown">—</span>;
   }
-  return <span className={`sev sev-${String(severity).toLowerCase()}`}>{severity}</span>;
+  // Colour comes from the INTERNAL severity (which is what the five colour classes
+  // are defined for); the text comes from the producer's own value when there is
+  // one. A producer sends CLEAR, never CLOSE — showing the mapped name would
+  // present a severity that does not exist in their vocabulary.
+  return (
+    <span className={`sev sev-${String(severity).toLowerCase()}`}>{label || severity}</span>
+  );
 }
 
 // ---------------------------------------------------------------------- icons
@@ -921,7 +927,7 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
       // explicit affordance (see the selection bar) rather than a hidden mode.
       aria-selected={selected || undefined}
     >
-      <td><Badge severity={alert.severity} /></td>
+      <td><Badge severity={alert.severity} label={alert.event?.displaySeverity} /></td>
       {/* Order follows the live table: severity, first, last, count, summary.
           Key is last: it is a stable identifier, read once when you need it,
           not scanned down the column on every glance. */}
@@ -963,7 +969,7 @@ function EventRow({ evt, onContextMenu }) {
   return (
     <>
       <tr className={rowClass} onContextMenu={onContextMenu}>
-        <td><Badge severity={evt.severity} /></td>
+        <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
         <td className="mono">{formatClock(evt.firstOccurrence)}</td>
         <td className="mont">{formatClock(evt.lastOccurrence)}</td>
         <td className="num">{evt.count}</td>
@@ -1390,7 +1396,13 @@ function App() {
                   const ack = acks.get(ackKey);
                   return (
                     <EventRow
-                      key={e.id}
+                      // NOT `e.id`: since the tail shows every ARRIVAL, two rows
+                      // can legitimately share an id (an absorbed repeat keeps the
+                      // original record's id). Duplicate React keys made the
+                      // reconciler reuse the wrong row, which showed MORE rows than
+                      // the buffer held and in the wrong order. The arrival is
+                      // identified by id plus its broker timestamp.
+                      key={`${e.id}@${e.brokerTs ?? ''}`}
                       evt={e}
                       onContextMenu={(ev) => openInspector(
                         ev,

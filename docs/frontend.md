@@ -296,6 +296,32 @@ Every severity is a token pair, so both themes stay legible:
 
 `HARMLESS` and `CLOSE` are green because resolution is a success state, not an absence of state. They are still ranked last in the alert table so an open `WARNING` never sorts below a resolved `CRITICAL`.
 
+#### The badge shows the PRODUCER's severity, not the internal one
+
+These five are **internal** values — the ingress maps a producer's eight-value
+scale onto them ([event-schema.md](event-schema.md) §3). A producer never sends
+`CLOSE` or `HARMLESS`; it sends `CLEAR` and `INFORMATION`. Rendering the mapped
+value therefore showed operators a severity that does not exist in their own
+vocabulary.
+
+So the badge splits its two jobs:
+
+| | Source | Why |
+|---|---|---|
+| **Colour** | internal `severity` | the five colour classes are defined for these |
+| **Text** | `payload.EVT_Severity` | what the producer actually reported |
+
+`toViewEvent` puts the producer value on `displaySeverity`, falling back to the
+internal one for a record that carries no `EVT_*` payload (a legacy or internal
+producer). A `CLEAR` therefore renders as a green **CLEAR** badge on a dimmed
+retirement row: colour and styling still come from the internal `CLOSE`, so
+nothing about the retirement behaviour changes.
+
+Deliberately **not** renamed in the data: `severity` on the wire, in the fold and
+in the alert hash stays internal. Only the label an operator reads is translated —
+renaming the stored value would break every comparison in `alert-fold.lua` and
+`SEVERITY_RANK`.
+
 ### 5.2 Whole-row colouring
 
 Off by default. When on, every cell of a row gets the severity tint and the first cell gets a 3px inset bar of the same hue. The bar is not decoration — it keeps the severity readable when the table is scrolled horizontally and for anyone who cannot separate the tints.

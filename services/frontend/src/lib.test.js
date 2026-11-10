@@ -682,3 +682,37 @@ test('the limit still bounds a stream of repeats', () => {
   assert.equal(list.length, 3);
   assert.deepEqual(list.map((e) => e.brokerTs), [8, 9, 10]);
 });
+
+// ------------------------------- the badge shows what the PRODUCER reported
+test('a CLEAR retired event is displayed as CLEAR, not the internal CLOSE', () => {
+  // The ingress maps a producer's CLEAR onto the internal CLOSE. Showing the
+  // mapped name presented a severity the producer never sends.
+  const evt = {
+    id: 'c1', source: 's', type: 't', severity: 'CLOSE',
+    payload: { msg: 'cleared', EVT_Severity: 'CLEAR' },
+  };
+  const v = toViewEvent(evt);
+  assert.equal(v.severity, 'CLOSE', 'internal severity is untouched, for styling');
+  assert.equal(v.displaySeverity, 'CLEAR', 'the badge shows the producer value');
+});
+
+test('an untouched severity displays as itself', () => {
+  const v = toViewEvent({
+    id: 'w1', source: 's', type: 't', severity: 'CRITICAL',
+    payload: { msg: 'x', EVT_Severity: 'MAJOR' },
+  });
+  assert.equal(v.displaySeverity, 'MAJOR');
+});
+
+test('a legacy event with no producer severity falls back to the internal one', () => {
+  const v = toViewEvent({ id: 'l1', source: 's', type: 't', severity: 'WARNING', payload: {} });
+  assert.equal(v.displaySeverity, 'WARNING');
+});
+
+test('retirement styling still keys off the internal severity', () => {
+  const v = toViewEvent({
+    id: 'c2', source: 's', type: 't', severity: 'CLOSE',
+    payload: { msg: 'cleared', EVT_Severity: 'CLEAR' },
+  });
+  assert.equal(isRetirement(v.severity), true, 'row still dims as a retirement');
+});

@@ -191,6 +191,20 @@ export function toViewEvent(evt) {
     count: asCount(firstPresent(payload, ['Count', 'count']), 1),
   };
 
+  // The badge must show the PRODUCER's severity, not the internal one.
+  //
+  // `severity` is the internal value after the ingress mapped it down onto five
+  // levels (docs/event-schema.md §3). A producer never sends `CLOSE` — it sends
+  // `CLEAR` — so rendering the mapped value told an operator their event had a
+  // severity that does not exist. The original is always preserved in
+  // `payload.EVT_Severity`, so prefer it whenever the record came through the
+  // `EVT_*` contract.
+  //
+  // Retirement signals keep their internal name visible through `isRetirement`,
+  // which drives the row styling, so the meaning is not lost: the row still dims
+  // as a retirement, and the badge says what was actually reported.
+  view.displaySeverity = asText(firstPresent(payload, ['EVT_Severity'])) || view.severity;
+
   for (const field of ENRICHED_FIELDS) {
     view[field.key] = asText(firstPresent(payload, field.wire));
   }

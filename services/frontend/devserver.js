@@ -64,14 +64,28 @@ const ENRICH = [
 
 function mkEvent(i, overrides = {}) {
   const first = now - (40 - i) * 45_000;
+  // The INTERNAL severity, as the ingress emits it after mapping the producer's
+  // value down onto five levels. The producer's own severity rides along in
+  // `payload.EVT_Severity`, exactly as the real ingress preserves it — without
+  // this the mock showed `CLOSE`, a value no producer ever sends, because the
+  // badge falls back to the internal name when the original is absent.
+  const internal = ['CRITICAL', 'WARNING', 'FATAL', 'HARMLESS', 'CLOSE'][i % 5];
+  const producerSeverity = {
+    CRITICAL: 'MAJOR',
+    WARNING: 'MINOR',
+    FATAL: 'CRITICAL',
+    HARMLESS: 'INFORMATION',
+    CLOSE: 'CLEAR',
+  }[internal];
   return {
     id: `evt-${i}`,
     source: SOURCES[i % SOURCES.length],
     type: TYPES[i % TYPES.length],
-    severity: ['CRITICAL', 'WARNING', 'FATAL', 'HARMLESS', 'CLOSE'][i % 5],
+    severity: internal,
     ts: new Date(first).toISOString(),
     brokerTs: first,
     payload: {
+      EVT_Severity: producerSeverity,
       msg: [
         'uplink flapping on port Gi0/24',
         'PSU 2 input voltage out of range',

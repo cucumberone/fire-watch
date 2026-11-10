@@ -257,15 +257,30 @@ not a styled dialog, because a destructive action must not be dismissible by an
 accidental outside click and must not look like the menu item above it. The menu
 item itself is styled red (`inspector-danger`) for the same reason.
 
-`op: delete` appears only on **live-events rows**, where an event id exists.
-The alert table has no per-event rows to delete, and offering it there was actively
-broken: the menu item was gated on `a.event?.id && targets.length === 1`, so with a
-multi-row selection it stayed ENABLED while every id failed to resolve — a clickable
-item that silently did nothing. That is the "right-click Delete does not work" report.
-An alert row aggregates many events, so "delete" could only ever mean "delete the
-newest one", leaving the row pointing at a record that no longer exists. Delete lives
-on the event rows (Live events, All events), where there is exactly one record and the
-operator is looking at it.
+`op: delete` appears on **alert rows** and on **event rows**, and they mean different
+things — which is why both menus carry both verbs:
+
+| Row | Close | Delete |
+|---|---|---|
+| Open alerts (an alert) | retire the alert | remove the event RECORD the row is showing |
+| All events (a stored event) | retire the alert this event belongs to | remove this event record |
+
+An alert row shows `a.event.id` — the newest record behind it — so deleting from there
+removes that one record and leaves the alert. "Remove the alert" is Close, and the two
+are different verbs rather than one ambiguous one.
+
+Both items resolve their targets **before** deciding whether they are enabled, and the
+label reports the resolved count (`Delete 3 events`, `Close 2 alerts`). The earlier
+version was gated on `a.event?.id && targets.length === 1`, so with a multi-row
+selection it stayed ENABLED while every id failed to resolve — a clickable item that
+silently did nothing. That is the "right-click Delete does not work" report.
+
+Close from an event row is offered because the operator is looking at an arrival and
+may be concluding the incident from it; forcing a tab switch to Open alerts to act on
+the same `source:type` is friction for no reason. Its targets are **deduplicated by
+alert key**, so selecting five events from two incidents offers `Close 2 alerts`, not
+`Close 5 alerts` — sending the same close five times would be one close reported as
+five.
 
 **No confirmation dialog.** Delete used to open a `window.confirm()`, on the reasoning
 that the only irreversible action should ask first. It was removed: reaching a delete

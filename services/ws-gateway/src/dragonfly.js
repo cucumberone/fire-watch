@@ -206,16 +206,28 @@ export class DragonflyReader {
   async readAllEvents({ sinceMs = 0, untilMs = Date.now(), limit = 500 } = {}) {
     const c = await this.connect();
 
+    const lo = Math.max(0, sinceMs);
     // ZREVRANGEBYSCORE descends, so the newest events come back first. The lower
     // bound is EXCLUSIVE `(` so a window boundary is not counted twice across two
     // overlapping queries.
     const ids = await c.zrevrangebyscore(
       'fw:idx:evt:all',
       String(untilMs),
-      `(${Math.max(0, sinceMs)}`,
+      `(${lo}`,
       'LIMIT', 0, Math.max(1, limit),
     );
-    if (ids.length === 0) return [];
+
+    // How many the window holds in TOTAL, not just how many this page carries.
+    //
+    // The UI needs this for its badge. Deriving the badge from the page made it
+    // report "rows I have fetched", which is 0 until the tab is opened — so after a
+    // browser refresh on another tab the badge read 0 while the window was full.
+    // ZCOUNT is one O(log N) index lookup, cheap next to the MGET below.
+    const total = await c.zcount('fw:idx:evt:all', `(${lo}`, String(untilMs));
+
+    if (ids.length === 0) {
+      return { events: [], total };
+    }
 
     const events = [];
     // 256 ids per MGET: bounded request size, bounded response size.
@@ -236,7 +248,7 @@ export class DragonflyReader {
         else this.log.warn('unparseable stored event during all-events read', { id: slice[j] });
       });
     }
-    return events;
+    return { events, total };
   }
 
   /** Read the records for a set of ids. Missing keys are filtered out. */

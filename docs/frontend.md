@@ -589,10 +589,22 @@ in this window" while every other view was visibly busy — measured: Open alert
 and Live events 76→79 with All events frozen at 0.
 
 A badge reading zero while the system is producing events is simply wrong. A partial
-count that becomes exact on first open is not, and the query still wins because
-`loadedAt` being null is exactly what triggers it. The same rule as the Closed tab's
-`count`: report what you know, and let the fetch correct it, rather than reporting
-nothing until you have fetched.
+count that becomes exact on first open is not.
+
+**The badge counts the WINDOW, not the page.** `op: allEvents` replies with a separate
+`total` — one `ZCOUNT` on the same range — and the badge reads that. Counting the
+fetched rows was the same bug in a different guise: the list is capped at
+`ALL_EVENTS_LIMIT`, so a full window would have shown the cap, and a refresh on
+another tab showed **0** because nothing had been fetched yet. `total` is `null` until
+a query answers, because "we have not asked" is not "there are none"; the badge falls
+back to the row count only during that first in-flight query.
+
+**The window is fetched once on CONNECT, not on first open.** One bounded query per
+connection is a fair price for a badge that is never wrong. `total` is cleared when the
+range changes — it described the *previous* window — and decremented on a delete, so it
+cannot outlive the rows it counts. A live arrival increments it once a query has
+answered, or the badge would freeze at whatever the last fetch said while the list
+visibly grew.
 
 **No heading and no count chip in a pane header.** The tab strip sits directly above
 and already names the pane, and its badge already carries the count. A heading

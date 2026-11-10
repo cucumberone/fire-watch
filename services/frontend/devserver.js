@@ -392,6 +392,57 @@ wss.on('connection', async (ws) => {
       return;
     }
 
+    // ---- op: close — retire one alert, mirroring handleClose in the gateway.
+    //
+    // The mock did not answer this op at all, so right-click → Close did NOTHING
+    // locally: the frame went out and no reply came back. That looks exactly like a
+    // broken frontend, and it is the third time an unhandled op has hidden a working
+    // feature (delete and journal were the others). Every op the UI sends needs an
+    // answer here.
+    if (frameIn.op === 'close') {
+      const key = frameIn.key;
+      if (typeof key !== 'string' || !key.includes(':')) {
+        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be source:type' }));
+        return;
+      }
+      const open = openAlerts.get(key);
+      if (!open) {
+        // Already retired — the real gateway answers `closeFrame` anyway (a close is
+        // idempotent), and says `already` only when it has an ack to report.
+        ws.send(JSON.stringify({ op: 'alert', key, applied: 3, closedBy: frameIn.by || 'operator' }));
+        return;
+      }
+      // Build a CLEAR record so the Closed tab has something to show, exactly like
+      // retireMock does for a CLOSE event from a producer.
+      const now = Date.now();
+      const [source, ...rest] = key.split(':');
+      const type = rest.join(':');
+      const evt = mkEvent(0, {
+        id: `operator-clear-${key.replace(/[^a-z0-9]+/gi, '_')}-${now}`,
+        source,
+        type,
+        severity: 'CLOSE',
+        brokerTs: now,
+        payload: {
+          EVT_Severity: 'CLEAR',
+          msg: `${type} cleared on ${source} by ${frameIn.by || 'operator'}`,
+          EVT_Device: source,
+          EVT_EventKey: type,
+          EVT_Agent: 'operator',
+          EVT_AgentOwner: 'AM-000000',
+        },
+      });
+      retireMock(evt, 3);
+      logMockEvent(evt);
+      for (const client of wss.clients) {
+        if (client.readyState === client.OPEN) {
+          client.send(JSON.stringify({ op: 'event', event: evt, applied: 3 }));
+          client.send(JSON.stringify({ op: 'alert', key, applied: 3, closedBy: frameIn.by || 'operator' }));
+        }
+      }
+      return;
+    }
+
     // ---- op: delete — remove one event record, mirroring handleDelete in the
     // gateway. The mock used to ignore this op entirely, so right-click → Delete
     // did NOTHING locally: the frame went out and no reply came back, which looks
@@ -443,13 +494,15 @@ wss.on('connection', async (ws) => {
       const limit = Math.min(frameIn.limit || 1000, 1000);
       const rows = [...mockEventLog.values()]
         .filter((e) => (e.brokerTs ?? 0) > since)
-        .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0))
-        .slice(0, limit);
+        .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
+      const page = rows.slice(0, limit);
       ws.send(JSON.stringify({
         op: 'allEvents',
-        events: rows,
+        events: page,
+        // The WINDOW total, not the page size — the client's badge reads this.
+        total: rows.length,
         range,
-        truncated: rows.length === limit,
+        truncated: page.length === limit,
         sinceMs: since,
         untilMs: now,
       }));

@@ -720,12 +720,15 @@ async function handleAllEventsQuery(conn, frame, send) {
   }
 
   let events;
+  let total;
   try {
-    events = await reader.readAllEvents({
+    const res = await reader.readAllEvents({
       sinceMs: verdict.sinceMs,
       untilMs: verdict.untilMs,
       limit: verdict.limit,
     });
+    events = res.events;
+    total = res.total;
   } catch (err) {
     log.warn('all-events read failed', { err: String(err) });
     send(JSON.stringify({ op: 'error', code: 'all_events_failed', message: 'could not read events' }));
@@ -736,6 +739,11 @@ async function handleAllEventsQuery(conn, frame, send) {
     op: 'allEvents',
     events,
     range: verdict.range,
+    // How many events the WINDOW holds, which is not the same as how many this
+    // reply carries. The client's badge needs the former: otherwise it reports just
+    // what it has happened to fetch, which is 0 before the tab is ever opened and
+    // stays at the page size once it is.
+    total,
     // A full page means "there may be older events inside this same window". The
     // client shows that as a notice rather than implying the range is empty.
     truncated: events.length >= verdict.limit,

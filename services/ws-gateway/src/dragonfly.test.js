@@ -234,13 +234,17 @@ test('an already-closed alert reports who closed it instead of overwriting', asy
 });
 
 // ------------------------------------------------ All Events reader contract
-function allEventsClient({ ids = [], events = {} } = {}) {
-  const calls = { range: null, mget: [] };
+function allEventsClient({ ids = [], events = {}, total = ids.length } = {}) {
+  const calls = { range: null, mget: [], count: null };
   return {
     calls,
     async zrevrangebyscore(key, max, min, ...rest) {
       calls.range = { key, max, min, rest };
       return ids;
+    },
+    async zcount(key, min, max) {
+      calls.count = { key, min, max };
+      return total;
     },
     async mget(keys) {
       calls.mget.push(keys);
@@ -250,11 +254,15 @@ function allEventsClient({ ids = [], events = {} } = {}) {
 }
 
 test('readAllEvents reads the GLOBAL index, newest first, windowed', async () => {
-  const client = allEventsClient({ ids: ['e1'] });
+  const client = allEventsClient({
+    ids: ['e1'],
+    events: { 'fw:evt:e1': JSON.stringify({ id: 'e1' }) },
+  });
   const r = new DragonflyReader(cfg, log);
   r.connect = async () => client;
 
-  await r.readAllEvents({ sinceMs: 5000, untilMs: 9000, limit: 100 });
+  const res = await r.readAllEvents({ sinceMs: 5000, untilMs: 9000, limit: 100 });
+  assert.deepEqual(res.events.map((e) => e.id), ['e1']);
 
   assert.equal(client.calls.range.key, 'fw:idx:evt:all',
     'must read the global timeline, not a per-source index');
@@ -262,6 +270,37 @@ test('readAllEvents reads the GLOBAL index, newest first, windowed', async () =>
   // Exclusive lower bound, so two overlapping windows never list the same event.
   assert.equal(client.calls.range.min, '(5000');
   assert.deepEqual(client.calls.range.rest.slice(-2), [0, 100]);
+});
+
+test('readAllEvents reports the WINDOW total, not the page size', async () => {
+  // The badge reads this. Deriving it from the fetched page made it report "rows I
+  // have fetched", which is 0 until the tab is opened — so a browser refresh on
+  // another tab showed All events 0 while the window was full.
+  const client = allEventsClient({
+    ids: ['e1'],
+    events: { 'fw:evt:e1': JSON.stringify({ id: 'e1' }) },
+    total: 4242,
+  });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const res = await r.readAllEvents({ sinceMs: 5000, untilMs: 9000, limit: 1 });
+  assert.equal(res.events.length, 1, 'the page is capped');
+  assert.equal(res.total, 4242, 'the total is the whole window');
+  // Same exclusive lower bound, or a boundary event would be counted twice.
+  assert.deepEqual(client.calls.count, { key: 'fw:idx:evt:all', min: '(5000', max: '9000' });
+});
+
+test('readAllEvents still reports a total when the page is empty', async () => {
+  // A window whose newest page is empty can still hold events beyond the range
+  // start; the caller must be able to tell "none in this window" from "did not ask".
+  const client = allEventsClient({ ids: [], total: 0 });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const res = await r.readAllEvents({ sinceMs: 0, untilMs: 1, limit: 10 });
+  assert.deepEqual(res.events, []);
+  assert.equal(res.total, 0);
 });
 
 test('readAllEvents returns the records newest-first', async () => {
@@ -275,8 +314,8 @@ test('readAllEvents returns the records newest-first', async () => {
   const r = new DragonflyReader(cfg, log);
   r.connect = async () => client;
 
-  const events = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
-  assert.deepEqual(events.map((e) => e.id), ['e2', 'e1']);
+  const res = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
+  assert.deepEqual(res.events.map((e) => e.id), ['e2', 'e1']);
 });
 
 test('readAllEvents skips an index member whose record expired', async () => {
@@ -286,8 +325,8 @@ test('readAllEvents skips an index member whose record expired', async () => {
   const r = new DragonflyReader(cfg, log);
   r.connect = async () => client;
 
-  const events = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
-  assert.deepEqual(events.map((e) => e.id), ['e1']);
+  const res = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
+  assert.deepEqual(res.events.map((e) => e.id), ['e1']);
 });
 
 test('readAllEvents chunks a large page instead of one huge MGET', async () => {
@@ -298,14 +337,16 @@ test('readAllEvents chunks a large page instead of one huge MGET', async () => {
   r.connect = async () => client;
 
   const out = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 1000 });
-  assert.equal(out.length, 600);
+  assert.equal(out.events.length, 600);
   assert.equal(client.calls.mget.length, 3, '600 ids -> 256 + 256 + 88');
 });
 
-test('readAllEvents returns [] without a second round trip when empty', async () => {
-  const client = allEventsClient({ ids: [] });
+test('readAllEvents does no MGET when the page is empty', async () => {
+  const client = allEventsClient({ ids: [], total: 42 });
   const r = new DragonflyReader(cfg, log);
   r.connect = async () => client;
-  assert.deepEqual(await r.readAllEvents({ sinceMs: 0, untilMs: 1, limit: 10 }), []);
+  const res = await r.readAllEvents({ sinceMs: 0, untilMs: 1, limit: 10 });
+  assert.deepEqual(res.events, []);
+  assert.equal(res.total, 42, 'the total is still reported');
   assert.equal(client.calls.mget.length, 0);
 });

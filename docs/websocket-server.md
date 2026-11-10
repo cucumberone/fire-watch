@@ -355,6 +355,16 @@ Read path: the index range, then ONE `MGET` for the records, chunked at 256 ids 
 neither the request nor the response is unbounded. An index member whose record has
 expired is skipped rather than rendered as a blank row; the prune drops the member.
 
+**The reply carries `total` as well as `events`.** `total` is one `ZCOUNT` over the
+same range: how many events the WINDOW holds, which is not how many this page does.
+The client's badge needs the former. Deriving it from the fetched page made the badge
+report "rows I have fetched" — 0 before the tab had ever been opened, and the page cap
+once it had. Both are the wrong number, and the first looked like the feature was
+broken after a browser refresh.
+
+`total` is answered even when `events` is empty, so a client can tell "the window is
+quiet" from "the request failed" without inferring it from an empty array.
+
 **The global index exists because the per-source one cannot answer this.** There is
 no way to enumerate sources without a SCAN, so the worker writes every accepted
 event to `fw:idx:evt:all` in the same step as `fw:idx:src:{source}`. An operator

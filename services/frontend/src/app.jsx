@@ -659,6 +659,9 @@ function useSocket(config) {
   const [allEvents, setAllEvents] = useState({
     events: [], loading: false, error: null, truncated: false,
     range: '24h', loadedAt: null,
+    // How many events the WINDOW holds, as reported by the server. `null` until a
+    // query answers, because "we have not asked" is not "there are none".
+    total: null,
   });
 
   const wsRef = useRef(null);
@@ -704,6 +707,10 @@ function useSocket(config) {
       setAllEvents((prev) => ({
         ...prev,
         events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT),
+        // Once a query has answered, the badge counts the WINDOW, so a live arrival
+        // must move that number too — otherwise the badge freezes at whatever the
+        // last fetch said while the list visibly grows.
+        total: prev.total === null ? null : prev.total + 1,
       }));
       if (frame.applied !== null && frame.applied !== undefined) {
         const alertKey = `${evt.source}:${evt.type}`;
@@ -842,6 +849,10 @@ function useSocket(config) {
           truncated: Boolean(frame.truncated),
           range: frame.range || '24h',
           loadedAt: Date.now(),
+          // The server's own count for the whole window. Kept as-is rather than
+          // recomputed from `merged`: the list is capped at ALL_EVENTS_LIMIT and
+          // grows from live frames, so `merged.length` answers a different question.
+          total: Number.isFinite(frame.total) ? frame.total : merged.length,
         };
       });
       return;
@@ -991,7 +1002,13 @@ function useSocket(config) {
       // dead record, so it stops offering an id that resolves to nothing.
       setEvents((prev) => prev.filter((e) => e.id !== frame.id));
       setAllEvents((prev) => (prev.events.some((e) => e.id === frame.id)
-        ? { ...prev, events: prev.events.filter((e) => e.id !== frame.id) }
+        ? {
+          ...prev,
+          events: prev.events.filter((e) => e.id !== frame.id),
+          // The window no longer holds it either, so the count must follow or the
+          // badge would outlive the row it was counting.
+          total: prev.total === null ? null : Math.max(0, prev.total - 1),
+        }
         : prev));
       setAlerts((prev) => {
         let changed = false;
@@ -1345,8 +1362,12 @@ function useSocket(config) {
       return;
     }
     // The range is recorded immediately, so the picker shows what was asked for
-    // even while the reply is in flight.
-    setAllEvents((prev) => ({ ...prev, range: nextRange, loading: true, error: null }));
+    // even while the reply is in flight. `total` is cleared because it described
+    // the PREVIOUS window: leaving it would make the badge quote a count for a
+    // window the operator is no longer looking at.
+    setAllEvents((prev) => ({
+      ...prev, range: nextRange, loading: true, error: null, total: null,
+    }));
     ws.send(JSON.stringify({ op: 'allEvents', range: nextRange }));
   }, []);
 
@@ -1982,14 +2003,18 @@ function App() {
     loadClosed();
   }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
 
-  // Same contract for All Events: load on first open, only when the socket can
-  // carry the request. A re-fetch happens on an explicit range change or refresh.
+  // Same contract for All Events: re-fetch on an explicit range change or refresh.
+  //
+  // Also fetched once on CONNECT, regardless of which tab is showing. The badge has
+  // to be right before the tab is opened: deriving it from "rows I have fetched"
+  // meant a browser refresh on another tab showed All events 0 while the window was
+  // full, and only opening the tab corrected it. One bounded query per connection
+  // is a fair price for a badge that is not lying.
   useEffect(() => {
-    if (tab !== 'all') return;
     if (status !== 'connected') return;
     if (allEvents.loadedAt || allEvents.loading) return;
     loadAllEvents(allEvents.range);
-  }, [tab, status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
+  }, [status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -2157,7 +2182,12 @@ function App() {
               const count = tabBadgeCount(t.id, {
                 alerts: sortedAlerts.length,
                 events: shownEvents.length,
-                allEvents: allEvents.events.length,
+                // The server's count for the window, falling back to the rows held
+                // only while the first query is still in flight. Counting the FETCHED
+                // ROWS made the badge read 0 after a browser refresh on any other tab,
+                // because nothing had been fetched yet — and then jump to the window
+                // size only once All events was opened.
+                allEvents: allEvents.total ?? allEvents.events.length,
                 closed: closed.count,
               });
               return (
@@ -2235,6 +2265,12 @@ function App() {
                   ? selectedAlertKeys
                   : [a.key];
                 const ackTargets = targets.filter((k) => !acks.has(k));
+                // The event RECORD behind each target, resolved once so the menu can
+                // state how many deletes it is about to do instead of saying "Delete"
+                // and leaving the operator to guess.
+                const eventIds = targets
+                  .map((k) => alerts.get(k)?.event?.id)
+                  .filter(Boolean);
                 return (
                   <AlertRow
                     key={a.key}
@@ -2263,20 +2299,32 @@ function App() {
                           title: 'Retire these alerts. Same end state as a CLOSE event from the source',
                           run: () => bulk('close', targets),
                         },
-                        // NO Delete here. An alert row aggregates many events, so
-                        // "delete" could only mean "delete the newest one", which
-                        // would leave the row showing a record that no longer exists
-                        // and change nothing an operator can see. Delete lives on the
-                        // EVENT rows (Live events, All events) where there is exactly
-                        // one record and the operator is looking at it
-                        // (docs/acknowledge.md §10.2).
-                        //
-                        // It used to be offered here, gated on `a.event?.id` — and
-                        // the gate was wrong for a multi-row selection (`&&
-                        // targets.length === 1` meant the item stayed enabled while
-                        // every id failed to resolve, so it silently did nothing).
-                        // That is the "Delete does not work" report: a menu item that
-                        // was clickable and had no effect.
+                        {
+                          // Delete from an ALERT row removes the event RECORD the row is
+                          // showing (`a.event.id`), not the alert. An alert is an aggregate
+                          // over many events, and "remove the alert" is Close — so the two
+                          // are different verbs and both belong here.
+                          //
+                          // Offered only when the row HAS a record attached. An alert loaded
+                          // from a snapshot may have none (its record expired), and a delete
+                          // that cannot resolve an id would be an item that always errors.
+                          // For a multi-row selection only the rows that resolved contribute,
+                          // and the label says how many that is — the old version was gated on
+                          // `targets.length === 1`, so with 2+ rows selected it stayed ENABLED
+                          // while every id failed to resolve, and clicking did nothing. That
+                          // was the "Delete does not work" report.
+                          label: eventIds.length > 1
+                            ? `Delete ${eventIds.length} events`
+                            : 'Delete event',
+                          disabled: eventIds.length === 0,
+                          title: eventIds.length > 1
+                            ? 'Permanently delete the event record behind each selected alert. Cannot be undone.'
+                            : (eventIds.length === 1
+                              ? `Permanently delete event ${eventIds[0]}. Cannot be undone.`
+                              : 'No event record is attached to the selected alert(s)'),
+                          run: () => { for (const id of eventIds) deleteEvent(id); },
+                          danger: true,
+                        },
                       ],
                       // The journal belongs to the INCIDENT, so a multi-row selection
                       // gets no journal: one panel cannot annotate several alerts at
@@ -2525,6 +2573,15 @@ function App() {
                   const ids = targets
                     .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k)?.id)
                     .filter(Boolean);
+                  // The ALERTS these rows belong to, deduplicated: several events from
+                  // one incident are one alert, so closing must not send the same
+                  // `close` frame twice — and the label must not claim otherwise.
+                  const alertKeys = [...new Set(
+                    targets
+                      .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k))
+                      .filter((x) => x?.source && x?.type)
+                      .map((x) => `${x.source}:${x.type}`),
+                  )];
                   return (
                     <EventRow
                       // Id plus brokerTs: a stored event id is unique, but the same
@@ -2538,6 +2595,24 @@ function App() {
                         e.wire ?? e,
                         targets.length > 1 ? `${targets.length} events` : `${e.source} · ${e.type}`,
                         [
+                          {
+                            // Close the ALERT this event belongs to. Offered here because
+                            // the operator is looking at an arrival and may be concluding
+                            // the incident from it — forcing a tab switch to Open alerts to
+                            // act on the same `source:type` is friction for no reason.
+                            //
+                            // The key is the PAIR, so a multi-row selection collapses to the
+                            // distinct alerts it touches: closing the same alert twice is one
+                            // close, and the label reports the deduplicated count so the
+                            // operator is not told they are closing five when they are
+                            // closing two.
+                            label: alertKeys.length > 1
+                              ? `Close ${alertKeys.length} alerts`
+                              : 'Close alert',
+                            disabled: alertKeys.length === 0,
+                            title: 'Retire the alert these events belong to. Same end state as a CLOSE event from the source',
+                            run: () => bulk('close', alertKeys),
+                          },
                           {
                             label: ids.length > 1
                               ? `Delete ${ids.length} events`

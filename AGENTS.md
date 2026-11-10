@@ -42,7 +42,7 @@ This repo sets up an event server.
 - [Redis Sentinel](docs/redis-sentinel.md) — failover, `sentinel-bridge`, split-brain walkthrough
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
 - [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
-- [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, HPA
+- [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, windowed event queries, HPA
 - [Frontend](docs/frontend.md) — static React + MUI app, two Routes, CSP
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
 - [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms

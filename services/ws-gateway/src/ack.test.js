@@ -13,6 +13,9 @@ import {
   MAX_CLOSED_LIMIT,
   DEFAULT_CLOSED_MS,
   validateClosedQuery,
+  validateAllEventsQuery,
+  ALL_EVENTS_RANGES,
+  MAX_ALL_EVENTS_LIMIT,
   MAX_KEY_LEN,
   MAX_ID_LEN,
   ackAlertKey,
@@ -236,4 +239,41 @@ test('closed rejects non-numeric bounds', () => {
 test('the wrong op is refused', () => {
   assert.equal(validateClosedQuery({ op: 'alerts' }).ok, false);
   assert.equal(validateClosedQuery(null).ok, false);
+});
+
+// ------------------------------------------------------ op: allEvents ranges
+test('allEvents maps a preset range onto a server-side window', () => {
+  const now = 1_800_000_000_000;
+  for (const [range, ms] of Object.entries(ALL_EVENTS_RANGES)) {
+    const v = validateAllEventsQuery({ op: 'allEvents', range }, { now });
+    assert.equal(v.ok, true);
+    assert.equal(v.range, range);
+    assert.equal(v.untilMs, now);
+    assert.equal(v.sinceMs, now - ms, `${range} should be a ${ms}ms window`);
+  }
+});
+
+test('an unknown range falls back to 24h instead of failing', () => {
+  // A stray value must not blank the table.
+  const v = validateAllEventsQuery({ op: 'allEvents', range: 'nonsense' });
+  assert.equal(v.ok, true);
+  assert.equal(v.range, '24h');
+});
+
+test('allEvents clamps limit and rejects a malformed one', () => {
+  assert.equal(validateAllEventsQuery({ op: 'allEvents', limit: 99999 }).limit, MAX_ALL_EVENTS_LIMIT);
+  assert.equal(validateAllEventsQuery({ op: 'allEvents', limit: 'lots' }).ok, false);
+});
+
+test('before pages backwards and cannot be in the future', () => {
+  const now = 1000;
+  const v = validateAllEventsQuery({ op: 'allEvents', range: '1h', before: 500 }, { now });
+  assert.equal(v.untilMs, 500);
+  assert.equal(v.sinceMs, 500 - ALL_EVENTS_RANGES['1h']);
+  assert.equal(validateAllEventsQuery({ op: 'allEvents', before: 9999 }, { now }).untilMs, now);
+});
+
+test('the wrong op is refused', () => {
+  assert.equal(validateAllEventsQuery({ op: 'closed' }).ok, false);
+  assert.equal(validateAllEventsQuery(null).ok, false);
 });

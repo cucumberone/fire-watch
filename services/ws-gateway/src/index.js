@@ -32,6 +32,7 @@ import {
   validateClose,
   validateDelete,
   validateClosedQuery,
+  validateAllEventsQuery,
   ackAlertKey,
   normaliseAck,
   ackFrame,
@@ -194,6 +195,11 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'closed') {
       await handleClosedQuery(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'allEvents') {
+      await handleAllEventsQuery(conn, frame, send);
       return;
     }
 
@@ -640,6 +646,50 @@ async function handleClosedQuery(conn, frame, send) {
     // smaller than it is.
     truncated: rows.length >= verdict.limit,
     sinceMs: verdict.sinceMs,
+  }));
+}
+
+/**
+ * `{"op":"allEvents","range":"24h"}` — every event in a time window, newest
+ * first, regardless of correlation.
+ *
+ * Distinct from `resync`/`subscribe`: those are about open alerts, this is the raw
+ * event log. Distinct from the live tail, which is a bounded in-memory buffer that
+ * dies on reload — this reads the worker's global timeline, so it survives a
+ * refresh and reaches the full 7-day retention.
+ *
+ * The window is applied SERVER-side, so a 1-hour request is cheaper than a 7-day
+ * one rather than the server building everything and the client filtering it.
+ */
+async function handleAllEventsQuery(conn, frame, send) {
+  const verdict = validateAllEventsQuery(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  let events;
+  try {
+    events = await reader.readAllEvents({
+      sinceMs: verdict.sinceMs,
+      untilMs: verdict.untilMs,
+      limit: verdict.limit,
+    });
+  } catch (err) {
+    log.warn('all-events read failed', { err: String(err) });
+    send(JSON.stringify({ op: 'error', code: 'all_events_failed', message: 'could not read events' }));
+    return;
+  }
+
+  send(JSON.stringify({
+    op: 'allEvents',
+    events,
+    range: verdict.range,
+    // A full page means "there may be older events inside this same window". The
+    // client shows that as a notice rather than implying the range is empty.
+    truncated: events.length >= verdict.limit,
+    sinceMs: verdict.sinceMs,
+    untilMs: verdict.untilMs,
   }));
 }
 

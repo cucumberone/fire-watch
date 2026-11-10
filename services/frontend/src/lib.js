@@ -579,3 +579,27 @@ export function closedSeverities(rows) {
   for (const r of rows || []) if (r.severity) set.add(r.severity);
   return [...set].sort();
 }
+
+/**
+ * Filter the All Events rows.
+ *
+ * Same shape as `filterClosedAlerts` and for the same reason: pure and exported so
+ * the matching rules can be tested without a DOM. It searches the fields an
+ * operator can actually see plus the summary, because "which switch was flapping
+ * last Tuesday" is a free-text question.
+ *
+ * @param {Array} events   view events (already through `toViewEvent`)
+ * @param {string} text    free text, case-insensitive
+ */
+export function filterEvents(events, text) {
+  const needle = String(text || '').trim().toLowerCase();
+  const list = events || [];
+  if (!needle) return list;
+  return list.filter((e) => {
+    const hay = [
+      e.id, e.source, e.type, e.severity, e.displaySeverity,
+      e.summary, e.device, e.agent, e.agentOwner, e.eventKey, e.environment,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(needle);
+  });
+}

@@ -458,7 +458,15 @@ already finished" are parallel questions rather than a hierarchy:
 |---|---|---|
 | **Open alerts** | what is firing right now | `op: snapshot` on connect + `op: alert` live |
 | **Live events** | what did we actually receive, and when | `op: event` frames, arrival order |
+| **All events** | what happened in the last N, searchable | `op: allEvents`, a windowed query |
 | **Closed** | what ended in the last 7 days | `op: closed`, a windowed query |
+
+**All events vs Live events** is the distinction worth stating, because they look
+alike: the live tail is an in-memory buffer of **arrivals since this page loaded**,
+which dies on reload and holds at most 500 rows. All events reads **storage**, so it
+survives a reload, reaches the full 7-day retention, and can be asked for a specific
+window. Search is over the fetched page (bounded, so it stays instant); the window
+is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
 The tab bar is a real `role=tablist` with `aria-selected` and Arrow key
 navigation. The active tab is marked by **both** a colour change and an underline,

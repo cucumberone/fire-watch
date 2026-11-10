@@ -193,7 +193,16 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   // ----------------------------------------------------------------- 3. index
   // Score is the BROKER timestamp, not the producer ts: a redelivered event
   // must keep its original position in the timeline (workers.md §4).
-  await dfl.write((c) => c.zadd(keys.index(evt.source), brokerTs, evt.id));
+  //
+  // Written to BOTH indexes in one pipelined write: the per-source one answers
+  // "this device's history", the global one answers "everything in the last N
+  // hours" without a SCAN. They are always written together, so the global index
+  // can never be missing an event the source index has.
+  await dfl.write((c) => {
+    c.zadd(keys.index(evt.source), brokerTs, evt.id);
+    c.zadd(keys.eventAllIndex, brokerTs, evt.id);
+    return null;
+  });
 
   // ------------------------------------------------------------ 4. alert fold
   // The fold also maintains the open-alert index (KEYS[3]) so the index cannot
@@ -257,6 +266,15 @@ export async function maybePruneIndex(dfl, source, cfg, log, force = false) {
       c.zremrangebyscore(keys.alertClosedIndex, '-inf', `(${cutoff}`),
     );
     if (removedClosed > 0) log.debug('pruned closed index members', { removed: removedClosed });
+
+    // The global event index needs the same cutoff for the same reason: ZADD
+    // members never expire on their own, and a 7-day timeline at 1 000 events/min
+    // is ~10 M members. Pruned here rather than per source because it is a single
+    // global zset.
+    const removedAll = await dfl.write((c) =>
+      c.zremrangebyscore(keys.eventAllIndex, '-inf', `(${cutoff}`),
+    );
+    if (removedAll > 0) log.debug('pruned global event index', { removed: removedAll });
     return true;
   } catch (err) {
     // A missed prune is corrected by the next one.

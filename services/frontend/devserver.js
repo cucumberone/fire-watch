@@ -167,6 +167,28 @@ function mockOpenAlerts() {
  */
 const closedMock = new Map();
 
+/**
+ * Every event the mock has produced, keyed by id.
+ *
+ * The real worker writes each accepted event to a global timeline; the mock keeps
+ * this Map so `op: allEvents` can answer a time-windowed query without inventing
+ * rows. Populated from the same emit path as the live stream, so the two agree.
+ */
+const mockEventLog = new Map();
+
+/** Record an event for the All Events tab. Bounded like the real index. */
+function logMockEvent(evt) {
+  if (!evt?.id) return;
+  mockEventLog.set(evt.id, evt);
+  if (mockEventLog.size > 5000) {
+    // Drop the oldest by brokerTs; the real index prunes by age instead.
+    const oldest = [...mockEventLog.entries()]
+      .sort((a, b) => (a[1].brokerTs ?? 0) - (b[1].brokerTs ?? 0))
+      .slice(0, 500);
+    for (const [id] of oldest) mockEventLog.delete(id);
+  }
+}
+
 // Seeded at load, not on subscribe. Seeding inside the subscribe handler made the
 // tab's contents depend on whether `op: closed` arrived before or after the first
 // subscribe — the app asks for the list when the tab is opened, which can happen
@@ -283,6 +305,31 @@ wss.on('connection', async (ws) => {
     // Built from the mock's own retired set so the tab shows something coherent
     // with the rest of the demo, rather than a hard-coded fixture that contradicts
     // the live stream.
+    // ---- op: allEvents — every stored event in a window, mirroring
+    // handleAllEventsQuery. Built from the mock's own event log so the tab agrees
+    // with the live stream rather than showing a fixture that contradicts it.
+    if (frameIn.op === 'allEvents') {
+      const RANGE_MS = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3,
+                         '7d': 7 * 86400e3 };
+      const range = RANGE_MS[frameIn.range] ? frameIn.range : '24h';
+      const now = Date.now();
+      const since = now - RANGE_MS[range];
+      const limit = Math.min(frameIn.limit || 1000, 1000);
+      const rows = [...mockEventLog.values()]
+        .filter((e) => (e.brokerTs ?? 0) > since)
+        .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0))
+        .slice(0, limit);
+      ws.send(JSON.stringify({
+        op: 'allEvents',
+        events: rows,
+        range,
+        truncated: rows.length === limit,
+        sinceMs: since,
+        untilMs: now,
+      }));
+      return;
+    }
+
     if (frameIn.op === 'closed') {
       const now = Date.now();
       const rows = [...closedMock.values()]
@@ -322,6 +369,7 @@ wss.on('connection', async (ws) => {
       for (let k = 0; k < a.count; k += 1) {
         const evt = mkEvent(0, { id: `${a.id}-${k}`, source: a.source, type: a.type, severity: a.severity });
         foldMock(evt, 1);
+        logMockEvent(evt);
         ws.send(JSON.stringify({ op: 'event', event: evt, applied: 1 }));
       }
       await new Promise((r) => setTimeout(r, 20));
@@ -367,6 +415,7 @@ wss.on('connection', async (ws) => {
       });
       foldMock(evt, applied);
       retireMock(evt, applied);
+      logMockEvent(evt);
       ws.send(JSON.stringify({ op: 'event', event: evt, applied }));
       n += 1;
     }, 1800);

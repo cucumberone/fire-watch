@@ -257,3 +257,66 @@ export function validateClosedQuery(frame, { maxLimit = MAX_CLOSED_LIMIT, now = 
 
   return { ok: true, limit, sinceMs };
 }
+
+/**
+ * Ranges offered by the All Events tab, in milliseconds.
+ *
+ * Presets rather than free date pickers: the tab asks "what happened in the last
+ * N", and a preset makes that one click with no timezone ambiguity. Filters are
+ * applied server-side, so a shorter range is strictly less work.
+ */
+export const ALL_EVENTS_RANGES = {
+  '1h': 60 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+};
+
+/** Default page size for All Events. Larger than the live tail: it is a query. */
+export const MAX_ALL_EVENTS_LIMIT = 1000;
+
+/**
+ * Validate `{"op":"allEvents"}`.
+ *
+ * `range` is one of the preset keys; anything else falls back to `24h` rather than
+ * erroring, because the tab always sends a known value and a stray one should not
+ * blank the table. `limit` is clamped for the same reason.
+ */
+export function validateAllEventsQuery(
+  frame,
+  { maxLimit = MAX_ALL_EVENTS_LIMIT, now = Date.now() } = {},
+) {
+  if (!frame || frame.op !== 'allEvents') {
+    return { ok: false, code: 'bad_op', message: 'expected {"op":"allEvents"}' };
+  }
+
+  const range = typeof frame.range === 'string' && ALL_EVENTS_RANGES[frame.range]
+    ? frame.range
+    : '24h';
+
+  let limit = maxLimit;
+  if (frame.limit !== undefined) {
+    if (!Number.isFinite(frame.limit)) {
+      return { ok: false, code: 'bad_limit', message: 'limit must be a number' };
+    }
+    limit = Math.max(1, Math.min(maxLimit, Math.floor(frame.limit)));
+  }
+
+  // An explicit `before` lets the UI page backwards without overlapping the page
+  // it already has. Defaults to now.
+  let untilMs = now;
+  if (frame.before !== undefined) {
+    if (!Number.isFinite(frame.before)) {
+      return { ok: false, code: 'bad_before', message: 'before must be a number' };
+    }
+    untilMs = Math.min(frame.before, now);
+  }
+
+  return {
+    ok: true,
+    range,
+    limit,
+    untilMs,
+    sinceMs: untilMs - ALL_EVENTS_RANGES[range],
+  };
+}

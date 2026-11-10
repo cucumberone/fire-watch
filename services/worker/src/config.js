@@ -61,6 +61,18 @@ export function loadConfig() {
 export const keys = {
   event: (id) => `fw:evt:${id}`,
   index: (source) => `fw:idx:src:${source}`,
+  /**
+   * Global event timeline: event id -> broker timestamp.
+   *
+   * The per-source index cannot answer "every event in the last hour" — there is
+   * no way to enumerate the sources without a SCAN, which this design refuses
+   * everywhere. So the worker also writes each event here, in the same atomic
+   * step as the source index.
+   *
+   * Pruned on the same cutoff as `fw:idx:src:*`, so it can never list an id whose
+   * record has expired — that would render as a blank row.
+   */
+  eventAllIndex: 'fw:idx:evt:all',
   alert: (key) => `fw:alert:${key}`,
   alertOpen: (key) => `fw:alert:open:${key}`,
   // Index of OPEN alerts, so a client that connects later can be told what is

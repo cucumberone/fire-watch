@@ -26,6 +26,7 @@ import {
   filterClosedAlerts,
   closedSeverities,
   isTimeField,
+  filterEvents,
   formatTimeValue,
 } from './lib.js';
 
@@ -831,4 +832,30 @@ test('epoch SECONDS are read as seconds, not as 1970', () => {
 test('formatTimes:false leaves the record completely raw', () => {
   const by = Object.fromEntries(recordEntries({ brokerTs: 1794319171950 }, { formatTimes: false }));
   assert.equal(by.brokerTs, '1794319171950');
+});
+
+// --------------------------------------------------- All Events free-text search
+test('filterEvents matches across the visible fields', () => {
+  const list = [
+    { id: 'e1', source: 'core-sw-07', type: 'net.link.down', summary: 'uplink flapping', agent: 'Prometheus' },
+    { id: 'e2', source: 'db-node-03', type: 'hw.psu.voltage', summary: 'PSU out of range', agent: 'Zabbix' },
+  ];
+  assert.equal(filterEvents(list, 'flapping').length, 1);
+  assert.equal(filterEvents(list, 'zabbix').length, 1);
+  assert.equal(filterEvents(list, 'core-sw').length, 1);
+  assert.equal(filterEvents(list, 'nothing').length, 0);
+});
+
+test('filterEvents is case-insensitive and tolerates empty input', () => {
+  const list = [{ id: 'e1', source: 'A', summary: 'X' }];
+  assert.equal(filterEvents(list, '  a  ').length, 1);
+  assert.equal(filterEvents(list, '').length, 1, 'an empty filter matches everything');
+  assert.deepEqual(filterEvents(null, 'x'), []);
+  assert.deepEqual(filterEvents([], 'x'), []);
+});
+
+test('filterEvents searches the producer severity as well as the internal one', () => {
+  const list = [{ id: 'e1', severity: 'CLOSE', displaySeverity: 'CLEAR' }];
+  assert.equal(filterEvents(list, 'clear').length, 1);
+  assert.equal(filterEvents(list, 'close').length, 1);
 });

@@ -40,6 +40,7 @@ import {
   isUnsupportedOpError,
   filterClosedAlerts,
   closedSeverities,
+  filterEvents,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -109,7 +110,23 @@ const TAB_KEY = 'fw:tab';
 const TABS = [
   { id: 'alerts', label: 'Open alerts' },
   { id: 'events', label: 'Live events' },
+  { id: 'all', label: 'All events' },
   { id: 'closed', label: 'Closed' },
+];
+
+/**
+ * Time ranges offered by All Events.
+ *
+ * Mirrors `ALL_EVENTS_RANGES` in the gateway. Presets rather than free pickers:
+ * the question is "what happened in the last N", and a preset is one click with no
+ * timezone ambiguity. The window is applied server-side, so a short range is
+ * genuinely cheaper.
+ */
+const ALL_RANGES = [
+  { id: '1h', label: 'last hour' },
+  { id: '6h', label: 'last 6 hours' },
+  { id: '24h', label: 'last 24 hours' },
+  { id: '7d', label: 'last 7 days' },
 ];
 
 /**
@@ -413,6 +430,14 @@ function useSocket(config) {
     loadedAt: null,
   });
 
+  // The All Events tab's data: a windowed server query, like Closed but over the
+  // raw event log rather than the alert rollups. Held here so switching tabs does
+  // not re-fetch, and keyed by the range so changing range is an explicit reload.
+  const [allEvents, setAllEvents] = useState({
+    events: [], loading: false, error: null, truncated: false,
+    range: '24h', loadedAt: null,
+  });
+
   const wsRef = useRef(null);
   const attemptRef = useRef(0);
   const timerRef = useRef(null);
@@ -539,6 +564,21 @@ function useSocket(config) {
       });
       return;
     }
+    if (frame.op === 'allEvents') {
+      // The answer to `op: allEvents`. Replaces the list wholesale: it is a
+      // windowed query, so an event it omits is outside the window rather than
+      // missing from the response.
+      const rows = Array.isArray(frame.events) ? frame.events : [];
+      setAllEvents({
+        events: rows.map((e) => toViewEvent(e)),
+        loading: false,
+        error: null,
+        truncated: Boolean(frame.truncated),
+        range: frame.range || '24h',
+        loadedAt: Date.now(),
+      });
+      return;
+    }
     if (frame.op === 'closed') {
       // The answer to `op: closed`. Replaces the list wholesale rather than
       // merging: it is a windowed query, so a row it omits is outside the window,
@@ -650,6 +690,14 @@ function useSocket(config) {
       if (frame.code === 'closed_failed') {
         setClosedState((prev) => ({
           ...prev, loading: false, error: frame.message || 'could not read closed alerts',
+        }));
+        return;
+      }
+      // Same rule for the All Events tab: a failed read belongs to that pane, not
+      // to the whole page.
+      if (frame.code === 'all_events_failed') {
+        setAllEvents((prev) => ({
+          ...prev, loading: false, error: frame.message || 'could not read events',
         }));
         return;
       }
@@ -915,9 +963,32 @@ function useSocket(config) {
     ws.send(JSON.stringify({ op: 'closed' }));
   }, []);
 
+  /**
+   * Ask for every event in a time window.
+   *
+   * A QUERY, like the Closed list, not a stream: the window is bounded, it changes
+   * slowly relative to a 24-hour span, and re-reading it on demand is cheaper and
+   * simpler than maintaining a second subscription. The range is sent to the
+   * server so filtering happens there — a 1-hour request reads far less than a
+   * 7-day one.
+   */
+  const loadAllEvents = useCallback((range) => {
+    const ws = wsRef.current;
+    const nextRange = range || '24h';
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — events not requested');
+      return;
+    }
+    // The range is recorded immediately, so the picker shows what was asked for
+    // even while the reply is in flight.
+    setAllEvents((prev) => ({ ...prev, range: nextRange, loading: true, error: null }));
+    ws.send(JSON.stringify({ op: 'allEvents', range: nextRange }));
+  }, []);
+
   return {
     status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
     loadClosed, closed: closedState,
+    loadAllEvents, allEvents,
   };
 }
 
@@ -1311,7 +1382,10 @@ function EventRow({ evt, onContextMenu }) {
 
 function App() {
   const { config, error } = useConfig();
-  const { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent, loadClosed, closed } = useSocket(config);
+  const {
+    status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
+    loadClosed, closed, loadAllEvents, allEvents,
+  } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
   // Which tab is showing. Persisted as a workspace preference, in the same spirit
   // as the theme: reopening the app should land where the operator left off.
@@ -1350,12 +1424,27 @@ function App() {
     reset: resetClosedWidths,
   } = useColumnWidths('closed', CLOSED_DEFAULT_W);
 
+  // Its own width state: the All Events table has the same columns as the live
+  // tail but is a different table, and sizing one must not resize the other.
+  const {
+    widthOf: allWidthOf,
+    beginResize: beginAllResize,
+  } = useColumnWidths('all', EVENT_DEFAULT_W);
+
   // Closed-tab filters. Case-insensitive substring across the columns an operator
   // can see, plus the summary text, which is where the human-readable detail
   // lives. Deliberately client-side: the window is capped at 7 days / 500 rows,
   // so a round trip per keystroke would make typing feel broken for no gain.
   const [filter, setFilter] = useState('');
   const [severityFilter, setSeverityFilter] = useState('');
+
+  // All Events filter. Same reasoning as the Closed tab: the page is bounded, so
+  // filtering client-side keeps typing instant.
+  const [eventFilter, setEventFilter] = useState('');
+  const allEventRows = useMemo(
+    () => filterEvents(allEvents.events, eventFilter),
+    [allEvents.events, eventFilter],
+  );
 
   const closedRows = useMemo(
     () => filterClosedAlerts(closed.alerts, filter, severityFilter),
@@ -1389,6 +1478,15 @@ function App() {
     if (closed.loadedAt || closed.loading) return;
     loadClosed();
   }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
+
+  // Same contract for All Events: load on first open, only when the socket can
+  // carry the request. A re-fetch happens on an explicit range change or refresh.
+  useEffect(() => {
+    if (tab !== 'all') return;
+    if (status !== 'open') return;
+    if (allEvents.loadedAt || allEvents.loading) return;
+    loadAllEvents(allEvents.range);
+  }, [tab, status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -1826,6 +1924,130 @@ function App() {
               </PaneBoundary>
             )}
         </Box>
+      </Box>
+      ) : null}
+
+      {tab === 'all' ? (
+      <Box role="tabpanel" id="panel-all" aria-labelledby="tab-all"
+           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                 p: 2, pt: 1.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}
+               flexWrap="wrap" useFlexGap>
+          <Typography variant="h2">All events</Typography>
+          <Chip label={allEventRows.length} size="small" variant="outlined" />
+          <FormControl sx={{ width: 170, flex: '0 0 auto' }}>
+            <InputLabel id="all-range-label">Window</InputLabel>
+            <Select
+              labelId="all-range-label"
+              label="Window"
+              value={allEvents.range}
+              onChange={(e) => loadAllEvents(e.target.value)}
+            >
+              {ALL_RANGES.map((r) => (
+                <MenuItem key={r.id} value={r.id}>{r.label}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <Box sx={{ flex: 1 }} />
+          <Button
+            variant="contained"
+            startIcon={allEvents.loading
+              ? <CircularProgress size={13} color="inherit" />
+              : <RefreshIcon />}
+            onClick={() => loadAllEvents(allEvents.range)}
+            disabled={allEvents.loading}
+            sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}
+          >
+            {allEvents.loading ? 'loading' : 'reload'}
+          </Button>
+        </Stack>
+
+        <TextField
+          type="search"
+          value={eventFilter}
+          onChange={(e) => setEventFilter(e.target.value)}
+          placeholder="Filter by key, device, severity, summary, agent…"
+          inputProps={{ 'aria-label': 'Filter all events' }}
+          sx={{ mb: 1.5, flex: '0 0 auto', maxWidth: 520 }}
+        />
+
+        {allEvents.error ? (
+          <MuiAlert severity="error">Events failed: {allEvents.error}</MuiAlert>
+        ) : allEvents.loading && allEvents.events.length === 0 ? (
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ p: 2 }}>
+            <CircularProgress size={16} />
+            <Typography variant="body2" color="text.secondary">Loading…</Typography>
+          </Stack>
+        ) : allEvents.events.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No events in this window.
+            {allEvents.loadedAt ? null : ' Open this tab to load.'}
+          </Typography>
+        ) : allEventRows.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No events match the filter.
+          </Typography>
+        ) : (
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            {allEvents.truncated ? (
+              <MuiAlert severity="warning" sx={{ mb: 1 }}>
+                Showing the newest {allEvents.events.length} events in this window —
+                narrow the window or the filter to see older ones.
+              </MuiAlert>
+            ) : null}
+            <PaneBoundary name="All events">
+              <ScrollTable
+                cols={(
+                  <>
+                    {EVENT_COLS.map((c, i) => (
+                      <col key={c} style={{ width: `${allWidthOf(i)}px` }} />
+                    ))}
+                    {ENRICHED_FIELDS.map((f) => <col key={f.key} />)}
+                    <col />
+                  </>
+                )}
+                head={(
+                  <>
+                    {EVENT_COLS.map((label, i) => (
+                      <ResizableTh
+                        key={label}
+                        index={i}
+                        width={allWidthOf(i)}
+                        onBegin={beginAllResize}
+                      >
+                        {label}
+                      </ResizableTh>
+                    ))}
+                    {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                    <th />
+                  </>
+                )}
+                rows={allEventRows.map((e) => (
+                  <EventRow
+                    // Id plus brokerTs: a stored event id is unique, but the same
+                    // rule as the live tail keeps the two tables consistent.
+                    key={`${e.id}@${e.brokerTs ?? ''}`}
+                    evt={e}
+                    onContextMenu={(ev) => openInspector(
+                      ev,
+                      e.wire ?? e,
+                      `${e.source} · ${e.type}`,
+                      [
+                        {
+                          label: 'Delete event',
+                          disabled: false,
+                          title: `Permanently delete event ${e.id}`,
+                          run: () => deleteEvent(e.id),
+                          danger: true,
+                        },
+                      ],
+                    )}
+                  />
+                ))}
+              />
+            </PaneBoundary>
+          </Box>
+        )}
       </Box>
       ) : null}
 

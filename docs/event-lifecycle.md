@@ -112,6 +112,7 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 | `fw:alert:{key}` | hash | current state + occurrence rollup + watermark | 7d (rolling) |
 | `fw:alert:open:{key}` | string | `"1"` while an alert is open | 7d |
 | `fw:idx:alert:open` | zset | member = alert key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN fw:alert:open:*` ([websocket-server.md](websocket-server.md) §3.1) | none (entries removed by the fold on retirement) |
+| `fw:idx:evt:all` | zset | member = event id, score = **broker** timestamp ms. The global event timeline, written in the same step as the per-source index so it can never be missing an event that index has. Backs the All Events tab, which cannot be answered from `fw:idx:src:*` without a SCAN. Removed on an operator delete, and pruned on the same 7-day cutoff | 7d, via the worker's index prune |
 | `fw:idx:alert:closed` | zset | member = alert key, score = `closed_at` ms. The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two. Removed again when an alert re-opens, and pruned on the same 7-day cutoff as the event index ([frontend.md](frontend.md) §5.6) | 7d, via the worker's index prune |
 | `fw:fp:{fingerprint}` | string | id of the event record that owns this content fingerprint. The content-dedup gate (§5.4.2): while present, an identical arrival is absorbed by that record instead of being stored | 7d, matching event retention |
 

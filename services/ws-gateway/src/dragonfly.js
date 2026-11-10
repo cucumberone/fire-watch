@@ -175,9 +175,59 @@ export class DragonflyReader {
     return c.zrangebyscore(`fw:idx:src:${source}`, min, max, 'LIMIT', 0, limit);
   }
 
-  /** Read the records for a set of ids. Missing keys are filtered out. */
-  async readEvents(ids) {
+  /**
+   * Read the newest events across ALL sources, with their records attached.
+   *
+   * Backs the All Events tab. The per-source index cannot answer this: there is no
+   * way to enumerate sources without a SCAN, which this design refuses everywhere.
+   * The worker therefore also writes every accepted event to `fw:idx:evt:all`, and
+   * this reads that one bounded range.
+   *
+   * Newest first, filtered SERVER-SIDE by `sinceMs`, so asking for the last hour
+   * costs strictly less work than the last 7 days rather than the server building
+   * everything and the client discarding most of it.
+   *
+   * Two round trips: the index range, then one MGET for the records. The MGET is
+   * chunked because a 7-day window can exceed what one command should carry.
+   */
+  async readAllEvents({ sinceMs = 0, untilMs = Date.now(), limit = 500 } = {}) {
+    const c = await this.connect();
+
+    // ZREVRANGEBYSCORE descends, so the newest events come back first. The lower
+    // bound is EXCLUSIVE `(` so a window boundary is not counted twice across two
+    // overlapping queries.
+    const ids = await c.zrevrangebyscore(
+      'fw:idx:evt:all',
+      String(untilMs),
+      `(${Math.max(0, sinceMs)}`,
+      'LIMIT', 0, Math.max(1, limit),
+    );
     if (ids.length === 0) return [];
+
+    const events = [];
+    // 256 ids per MGET: bounded request size, bounded response size.
+    const CHUNK = 256;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const slice = ids.slice(i, i + CHUNK);
+      const raw = await c.mget(slice.map((id) => `fw:evt:${id}`));
+      raw.forEach((item, j) => {
+        if (!item) {
+          // The record expired while its index member survived, or a delete raced
+          // this read. Skipped rather than rendered as a blank row; the prune will
+          // drop the member.
+          this.log.debug('event index member has no record', { id: slice[j] });
+          return;
+        }
+        const parsed = safeParse(item);
+        if (parsed) events.push(parsed);
+        else this.log.warn('unparseable stored event during all-events read', { id: slice[j] });
+      });
+    }
+    return events;
+  }
+
+  /** Read the records for a set of ids. Missing keys are filtered out. */
+  async readEvents(ids) {    if (ids.length === 0) return [];
     const c = await this.connect();
     const raw = await c.mget(ids.map((id) => `fw:evt:${id}`));
     const out = [];
@@ -510,6 +560,9 @@ export class DragonflyReader {
     const script = `
       local existed = redis.call('DEL', KEYS[1])
       redis.call('ZREM', KEYS[2], ARGV[1])
+      -- The global timeline too, or a deleted event stays listed in the All Events
+      -- tab and resolves to nothing when read — a row that can never be opened.
+      redis.call('ZREM', KEYS[3], ARGV[1])
       if existed == 0 then
         return {'missing'}
       end
@@ -521,9 +574,10 @@ export class DragonflyReader {
       try {
         const res = await c.eval(
           script,
-          2,
+          3,
           `fw:evt:${id}`,
           `${indexPrefix}${source}`,
+          'fw:idx:evt:all',
           id,
         );
         const [status] = res;
@@ -621,6 +675,10 @@ export class DragonflyReader {
       -- NX: a retried close must not rewrite a record that already exists.
       redis.call('SET', KEYS[5], ARGV[7], 'EX', ARGV[5], 'NX')
       redis.call('ZADD', KEYS[6], ARGV[2], ARGV[6])
+      -- ...and the GLOBAL timeline, so an operator close is searchable in All
+      -- Events like any other event. Omitted from the source index below would be
+      -- worse than useless: it would be findable by source but not by time.
+      redis.call('ZADD', KEYS[7], ARGV[2], ARGV[6])
 
       -- Carry the severity forward as the producer value so the badge shows
       -- CLEAR rather than the internal CLOSE (docs/frontend.md §5.1).
@@ -654,13 +712,14 @@ export class DragonflyReader {
       try {
         const res = await c.eval(
           script,
-          6,
+          7,
           hashKey,
           openKey,
           indexKey,
           'fw:idx:alert:closed',
           `fw:evt:${eventId}`,
           `fw:idx:src:${source}`,
+          'fw:idx:evt:all',
           by,
           String(nowMs),
           `operator-close-${nowMs}`,

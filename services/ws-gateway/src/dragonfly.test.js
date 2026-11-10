@@ -183,11 +183,12 @@ test('closeAlert writes the closed index, the event record and the source index'
   await evalReader(client).closeAlert(`fw:alert:${key}`, 'alice', 1000, 604800000);
 
   const call = client.calls[0];
-  assert.equal(call.numKeys, 6, 'six keys: hash, open, open-index, closed-index, event, source-index');
+  assert.equal(call.numKeys, 7, 'seven keys: hash, open, open-idx, closed-idx, event, source-idx, global-idx');
   assert.equal(call.args[0], `fw:alert:${key}`);
   assert.equal(call.args[3], 'fw:idx:alert:closed', 'the Closed tab enumerates from this');
   assert.match(call.args[4], /^fw:evt:operator-clear-/, 'a real event record id');
   assert.equal(call.args[5], 'fw:idx:src:probe-device', 'indexed by source, like any event');
+  assert.equal(call.args[6], 'fw:idx:evt:all', 'and on the global timeline, so All Events finds it');
 });
 
 test('the close event record is a CLEAR carrying the operator as author', async () => {
@@ -197,7 +198,7 @@ test('the close event record is a CLEAR carrying the operator as author', async 
   // `eval` is called as (script, numKeys, ...keys, ...argv), so `args` is
   // [6 keys, by, nowMs, watermarkId, alertKey, ttl, eventId, eventRecord] —
   // the JSON record is the LAST element.
-  const record = JSON.parse(client.calls[0].args[12]);
+  const record = JSON.parse(client.calls[0].args[13]);
   assert.equal(record.severity, 'CLOSE', 'internal severity, so the fold treats it as retirement');
   assert.equal(record.payload.EVT_Severity, 'CLEAR', 'the badge shows what a producer would send');
   assert.equal(record.payload.EVT_Agent, 'alice', 'a human closed it, and that is recorded');
@@ -218,7 +219,7 @@ test('the event id is deterministic, so a retried close cannot duplicate', async
 test('a type containing a colon splits on the FIRST colon only', async () => {
   const client = fakeEvalClient();
   await evalReader(client).closeAlert('fw:alert:dev:hw:psu', 'bob', 5, 1000);
-  const record = JSON.parse(client.calls[0].args[12]);
+  const record = JSON.parse(client.calls[0].args[13]);
   assert.equal(record.source, 'dev');
   assert.equal(record.type, 'hw:psu');
   assert.equal(client.calls[0].args[5], 'fw:idx:src:dev');
@@ -230,4 +231,81 @@ test('an already-closed alert reports who closed it instead of overwriting', asy
   assert.equal(res.status, 'already');
   assert.equal(res.by, 'alice', 'the original author is preserved');
   assert.equal(res.at, 900);
+});
+
+// ------------------------------------------------ All Events reader contract
+function allEventsClient({ ids = [], events = {} } = {}) {
+  const calls = { range: null, mget: [] };
+  return {
+    calls,
+    async zrevrangebyscore(key, max, min, ...rest) {
+      calls.range = { key, max, min, rest };
+      return ids;
+    },
+    async mget(keys) {
+      calls.mget.push(keys);
+      return keys.map((k) => events[k] ?? null);
+    },
+  };
+}
+
+test('readAllEvents reads the GLOBAL index, newest first, windowed', async () => {
+  const client = allEventsClient({ ids: ['e1'] });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  await r.readAllEvents({ sinceMs: 5000, untilMs: 9000, limit: 100 });
+
+  assert.equal(client.calls.range.key, 'fw:idx:evt:all',
+    'must read the global timeline, not a per-source index');
+  assert.equal(client.calls.range.max, '9000');
+  // Exclusive lower bound, so two overlapping windows never list the same event.
+  assert.equal(client.calls.range.min, '(5000');
+  assert.deepEqual(client.calls.range.rest.slice(-2), [0, 100]);
+});
+
+test('readAllEvents returns the records newest-first', async () => {
+  const client = allEventsClient({
+    ids: ['e2', 'e1'],
+    events: {
+      'fw:evt:e2': JSON.stringify({ id: 'e2', brokerTs: 200 }),
+      'fw:evt:e1': JSON.stringify({ id: 'e1', brokerTs: 100 }),
+    },
+  });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const events = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
+  assert.deepEqual(events.map((e) => e.id), ['e2', 'e1']);
+});
+
+test('readAllEvents skips an index member whose record expired', async () => {
+  // Otherwise the tab renders a blank row that cannot be opened.
+  const client = allEventsClient({ ids: ['gone', 'e1'],
+    events: { 'fw:evt:e1': JSON.stringify({ id: 'e1' }) } });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const events = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
+  assert.deepEqual(events.map((e) => e.id), ['e1']);
+});
+
+test('readAllEvents chunks a large page instead of one huge MGET', async () => {
+  const ids = Array.from({ length: 600 }, (_, i) => `e${i}`);
+  const events = Object.fromEntries(ids.map((id) => [`fw:evt:${id}`, JSON.stringify({ id })]));
+  const client = allEventsClient({ ids, events });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const out = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 1000 });
+  assert.equal(out.length, 600);
+  assert.equal(client.calls.mget.length, 3, '600 ids -> 256 + 256 + 88');
+});
+
+test('readAllEvents returns [] without a second round trip when empty', async () => {
+  const client = allEventsClient({ ids: [] });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+  assert.deepEqual(await r.readAllEvents({ sinceMs: 0, untilMs: 1, limit: 10 }), []);
+  assert.equal(client.calls.mget.length, 0);
 });

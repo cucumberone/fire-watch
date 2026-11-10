@@ -72,6 +72,7 @@ Four ops a client may send after `subscribe`:
 | `alerts` | `{"op":"alerts","keys":[...]}` | re-read ack state for the displayed rows |
 | `resync` | `{"op":"resync"}` | re-send the open-alert snapshot (§3.3) |
 | `closed` | `{"op":"closed"}` | the last 7 days of retired alerts (§3.5) |
+| `allEvents` | `{"op":"allEvents","range":"24h"}` | every event in a time window, searchable (§3.6) |
 
 `close` is confirmed with `{"op":"alert","key":…,"applied":3}` — the same frame a
 source-sent CLOSE produces — so no client needs a second code path to retire a
@@ -322,6 +323,43 @@ rather than the server building the full set and the client discarding most of i
 `truncated` is honest rather than silent: a full page means "there may be more",
 which the UI shows as a notice. Returning the newest N and saying nothing would
 make a busy week look smaller than it is.
+
+### 3.6 `op: allEvents` — the raw log, windowed
+
+```json
+{"op":"allEvents","range":"24h"}
+{"op":"allEvents","range":"1h","limit":500,"before":1762000000000}
+```
+
+Answers "what happened in the last N", regardless of correlation. Three things it
+is **not**:
+
+- not the live tail — that is a bounded in-memory buffer that dies on reload; this
+  reads storage and reaches the full 7-day retention
+- not `closed` — that lists alert rollups; this lists events, including those that
+  never opened an alert (`applied: 0`)
+- not `subscribe` — a subscription filters by source/type and streams; this is a
+  one-shot query
+
+| Field | Default | Notes |
+|---|---|---|
+| `range` | `24h` | one of `1h`, `6h`, `24h`, `7d`. Anything else falls back to `24h` rather than erroring, so a stray value cannot blank the table |
+| `limit` | 1000 | clamped; a full page sets `truncated` |
+| `before` | now | pages backwards without overlapping the page already held |
+
+**The window is applied server-side** (`ZREVRANGEBYSCORE` on `fw:idx:evt:all`), so a
+1-hour request reads strictly less than a 7-day one instead of the server building
+everything and the client discarding most of it.
+
+Read path: the index range, then ONE `MGET` for the records, chunked at 256 ids so
+neither the request nor the response is unbounded. An index member whose record has
+expired is skipped rather than rendered as a blank row; the prune drops the member.
+
+**The global index exists because the per-source one cannot answer this.** There is
+no way to enumerate sources without a SCAN, so the worker writes every accepted
+event to `fw:idx:evt:all` in the same step as `fw:idx:src:{source}`. An operator
+close writes its CLEAR there too, and an operator delete removes the member —
+otherwise a deleted event would stay listed and resolve to nothing.
 
 ## 4. Resource guardrails per connection
 

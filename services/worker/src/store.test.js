@@ -79,7 +79,13 @@ test('first delivery is stored, fingerprinted, indexed and folded', async () => 
   assert.equal(res.contentDuplicate, undefined);
   assert.equal(eventSets(dfl).length, 1, 'the record is written');
   assert.equal(fpSets(dfl).length, 1, 'the content fingerprint is claimed');
-  assert.equal(dfl.calls.zadd.length, 1, 'the event is indexed');
+  // Two indexes, written together: the per-source timeline and the global one that
+  // backs the All Events tab. A missing global member would make an event invisible
+  // to "everything in the last N hours" while still appearing under its source.
+  assert.equal(dfl.calls.zadd.length, 2, 'both indexes are written');
+  const idxKeys = dfl.calls.zadd.map((z) => z.key);
+  assert.ok(idxKeys.includes('fw:idx:evt:all'), 'the global index is written');
+  assert.ok(idxKeys.some((k) => k.startsWith('fw:idx:src:')), 'the source index is written');
   assert.equal(dfl.calls.eval.length, 1, 'the fold runs');
 });
 
@@ -88,6 +94,7 @@ test('a re-sent id is dropped before it can create a second record', async () =>
   const args = { dfl, evt: silent, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
   const first = await persistEvent(args);
+  const zaddsAfterFirst = dfl.calls.zadd.length;
   // A second delivery of the same id, with a NEWER broker timestamp — which is
   // what a re-send looks like and why the timestamp watermark alone missed it.
   //
@@ -100,7 +107,10 @@ test('a re-sent id is dropped before it can create a second record', async () =>
   assert.equal(first.applied, 1);
   assert.equal(second.contentDuplicate, true, 'caught as a content duplicate');
   assert.equal(eventSets(dfl).length, 1, 'no second record is written');
-  assert.equal(dfl.calls.zadd.length, 1, 'the index is not touched again');
+  // Compared against the state after the FIRST write, not a hard-coded 1: each
+  // accepted event writes two index members now (source + global), so a fixed
+  // number would have to change every time an index is added.
+  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst, 'the index is not touched again');
   assert.equal(dfl.calls.eval.length, 2, 'the rollup still took the occurrence');
 });
 
@@ -114,6 +124,7 @@ test('a content duplicate is absorbed by the original record', async () => {
   const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
   const first = await persistEvent({ ...args, evt: silent });
+  const zaddsAfterFirst = dfl.calls.zadd.length;
   // Same source/type/severity/payload, DIFFERENT id and a later arrival time.
   const copy = await persistEvent({
     ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000,
@@ -125,7 +136,7 @@ test('a content duplicate is absorbed by the original record', async () => {
   assert.equal(copy.applied, 1, 'the rollup still counts the occurrence');
 
   assert.equal(eventSets(dfl).length, 1, 'the copy is never stored');
-  assert.equal(dfl.calls.zadd.length, 1, 'the copy is not indexed');
+  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst, 'the copy is not indexed');
   assert.equal(dfl.calls.eval.length, 2, 'the fold runs for both arrivals');
 });
 

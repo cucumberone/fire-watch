@@ -603,29 +603,19 @@ function useSocket(config) {
       // tab and then watched it saw a still image of a live board, with the badge
       // pinned at whatever the count was at that instant.
       //
-      // Only events the worker actually STORED are added. `applied: 0` means the
-      // repeat was absorbed into an existing record (or is a redelivery) and lives
-      // under a different id, so adding it would invent a row this tab's own query
-      // can never return — `insertAllEvent`'s id-only dedup cannot catch it,
-      // because the abandoned copy carries its own id.
+      // Every arrival is a stored record now, including a content duplicate — the
+      // worker keeps the rollup deduplicated but indexes each delivery. So there is
+      // no `applied: 0` case to skip: the tab is literally "all events", and the
+      // tab would be lying if it omitted the repeats the live tail shows.
       //
       // Appended whether or not the tab has been opened. It used to be gated on
-      // `prev.loadedAt`, reasoning that a list of "events since page load" is a
-      // partial answer and the authoritative query would overwrite it anyway. But
-      // `loadedAt` stays null until the tab is opened, so the tab sat at badge 0
-      // and "No events in this window" while every other view was visibly busy —
-      // measured: Open alerts 4->5 and Live events 76->79 while All events stayed 0.
-      // A badge that reads zero while the system is producing events is simply
-      // wrong; a partial count that becomes exact on open is not.
-      //
-      // The query still wins: `loadedAt` null triggers it on first open, and the
-      // reply is authoritative for its window.
-      if (frame.applied !== 0 && frame.applied != null) {
-        setAllEvents((prev) => ({
-          ...prev,
-          events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT),
-        }));
-      }
+      // `prev.loadedAt`, so every event that arrived before the operator first
+      // opened the tab was thrown away and the badge sat at 0 while the rest of the
+      // board moved.
+      setAllEvents((prev) => ({
+        ...prev,
+        events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT),
+      }));
       if (frame.applied !== null && frame.applied !== undefined) {
         const alertKey = `${evt.source}:${evt.type}`;
         // Re-opening forgets the "already counted" marker, so the NEXT retirement
@@ -1771,76 +1761,38 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
 function EventRow({ evt, onContextMenu }) {
   // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
   // and the worker-enriched fields are already mapped by toViewEvent().
-  const { summary, msgCompleteString } = evt;
-  const [open, setOpen] = useState(false);
-
-  /**
-   * What the fold reveals: the producer's own long-form text, and nothing else.
-   *
-   * `msgc` is the "complete string" — `EVT_Details` on the wire, mapped in the
-   * ingress. When a producer sends one there is genuinely more to read than the
-   * clipped summary column shows, and the fold is useful.
-   *
-   * There used to be a fallback here: `|| JSON.stringify(evt.wire, null, 2)`. It
-   * was added because gating on `msgc` alone made rows look inert, which was a
-   * real complaint — but the fallback was the wrong answer to it, for two
-   * reasons. `toViewEvent` ALWAYS sets `wire`, so the fallback was always truthy
-   * and every row in every table grew a "details" link (measured: 211 of 211).
-   * And what it revealed was not detail, it was a raw debug dump of the record —
-   * which the right-click menu's Information submenu already renders as a proper
-   * field table. Two ways to see the same thing, one of them unreadable.
-   *
-   * So the link now means what it says: there is more TEXT than the column shows.
-   * A row with no `EVT_Details` has no more to say, and shows nothing.
-   */
-  const detailText = msgCompleteString;
+  //
+  // NO DISCLOSURE FOLD IN THE SUMMARY COLUMN. It went through three stages and the
+  // first two were both wrong:
+  //
+  //   1. A `details` toggle gated on `msgc` — never appeared for real producers,
+  //      which do not send `EVT_Details`, so rows looked inert.
+  //   2. A fallback to `JSON.stringify(evt.wire, null, 2)` — always truthy, so every
+  //      row in every table grew a link (measured 211 of 211) that opened a raw
+  //      debug dump.
+  //   3. Removed entirely, on the operator's judgement that the column is for the
+  //      summary and a fold inside a table cell is noise.
+  //
+  // The full record, including `EVT_Details`, is one right-click away in the
+  // inspector's Information submenu. That is the single place to read a whole
+  // record, and having a second partial one here was the mistake.
+  const { summary } = evt;
   const retirement = isRetirement(evt.severity);
   const rowClass = severityRowClass(evt.severity, retirement ? 'retirement' : '');
   return (
-    <>
-      <tr className={rowClass} onContextMenu={onContextMenu}>
-        <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
-        <td className="mono">{formatClock(evt.firstOccurrence)}</td>
-        <td className="mono">{formatClock(evt.lastOccurrence)}</td>
-        <td className="summary">
-          {summary || <span className="dim">—</span>}
-          {/*
-            Gated on there being TEXT to reveal. The comment that used to sit here
-            said "not on the msgc field existing" — because gating on msgc alone
-            once meant the fold never appeared for real events, while the dev
-            harness (whose mock always includes msgc) looked fine. The fix for that
-            was not to invent detail, though; it is that the mock must stop
-            fabricating a field production never sends. A row with no EVT_Details
-            now has no link, which is honest.
-          */}
-          {detailText ? (
-            <button
-              className="link"
-              onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
-              aria-expanded={open}
-            >
-              {open ? 'hide details' : 'details'}
-            </button>
-          ) : null}
-        </td>
-        {ENRICHED_FIELDS.map((f) => (
-          <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
-        ))}
-        {/* Spacer cell, matching the spacer column in the header. */}
-        <td />
-      </tr>
-      {open && detailText ? (
-        <tr className={rowClass}>
-          {/* +1 for the spacer column, or the expanded row stops short. Counted
-              from EVENT_COLS so removing a column cannot silently leave the
-              detail row spanning past the table — which showed as a horizontal
-              scrollbar and a truncated detail body. */}
-          <td className="detailcell" colSpan={EVENT_COLS.length + ENRICHED_FIELDS.length + 1}>
-            <pre className="detail">{detailText}</pre>
-          </td>
-        </tr>
-      ) : null}
-    </>
+    <tr className={rowClass} onContextMenu={onContextMenu}>
+      <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
+      <td className="mono">{formatClock(evt.firstOccurrence)}</td>
+      <td className="mono">{formatClock(evt.lastOccurrence)}</td>
+      <td className="summary">
+        {summary || <span className="dim">—</span>}
+      </td>
+      {ENRICHED_FIELDS.map((f) => (
+        <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
+      ))}
+      {/* Spacer cell, matching the spacer column in the header. */}
+      <td />
+    </tr>
   );
 }
 

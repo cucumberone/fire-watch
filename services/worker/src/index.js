@@ -131,39 +131,44 @@ async function handleMessage(msg) {
 
     // ---- content duplicate: the same CONDITION, reported again.
     //
-    // This is NOT silent. The original record absorbed it — the fold already
-    // incremented its count and moved its last_seen — so clients must be told, or
-    // the board would keep showing the old count until someone reloaded.
+    // The ALERT ROLLUP is deduplicated — one alert, one count, `last_id` pointing
+    // at the owner — but the ARRIVAL IS STORED under its own id. So this is a real
+    // event record now, indexed in both timelines, and it belongs in the live tail
+    // like any other arrival.
     //
-    // The new event itself is discarded: no record, no index member, no audit
-    // copy. The frame below carries the ORIGINAL record's id so the frontend
-    // updates the existing row rather than inserting a second one; `applied`
-    // tells it this is an occurrence, not a stale frame.
+    // It used to be discarded: no record, no index member, no audit copy, and the
+    // frame carried `applied: 0` so clients would not count it. That is what made
+    // the All events tab show one row while the live tail showed three for the
+    // same three deliveries — "all events" omitting events. The frame now carries
+    // the fold's real verdict, because the copy is an event and the count must move
+    // once per arrival.
     if (contentDuplicate) {
-      log.debug('content duplicate absorbed, copy discarded', { id: evt.id });
-      // The live tail still needs to show it.
-      //
-      // The copy is not STORED (the original record owns the condition), but it
-      // still arrived and still moved the rollup, so an operator watching the
-      // tail should see it. Omitting it left the tail empty for any producer that
-      // only ever repeats one event — every delivery after the first was absorbed,
-      // so nothing was ever broadcast, and the drawer read "Nothing yet" while
-      // alerts were open.
-      //
-      // `applied: 0` is deliberate: the client must not treat this as a new
-      // occurrence, or it would double-count against the `occurrence` frame that
-      // follows. 0 means "render the row, change no state".
+      log.debug('content duplicate: rollup absorbed, arrival stored', {
+        id: evt.id, ownerId, applied,
+      });
+
+      // Audit copy for the arrival too. It is a stored event, so the "recover the
+      // log from the broker" guarantee has to cover it, or the audit trail would
+      // be missing exactly the repeats that a dedup investigation cares about.
+      await amqpConsumer.publishAudit(msg.content);
+
       try {
         await dfl.publish(
           keys.channelEvents,
           JSON.stringify({
-            event: { ...evt, payload: storedPayload, brokerTs, absorbedBy: ownerId },
-            applied: 0,
+            event: {
+              ...evt,
+              payload: storedPayload,
+              brokerTs,
+              // Kept: it tells a reader that this arrival shares its condition
+              // with an earlier record. Useful for a dedup drill, ignored by the UI.
+              absorbedBy: ownerId,
+            },
+            applied,
           }),
         );
       } catch (err) {
-        // Best effort: the tail is diagnostic, and the rollup is already durable.
-        log.warn('absorbed event fan-out failed', { id: evt.id, err: String(err) });
+        log.warn('content-duplicate fan-out failed', { id: evt.id, err: String(err) });
       }
       try {
         await dfl.publish(
@@ -175,7 +180,6 @@ async function handleMessage(msg) {
           }),
         );
       } catch (err) {
-        // The rollup is already durable; the next snapshot carries it.
         log.warn('occurrence fan-out failed (rollup already durable)', { id: evt.id, err: String(err) });
       }
       return 'ack';

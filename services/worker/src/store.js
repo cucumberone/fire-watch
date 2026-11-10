@@ -134,10 +134,36 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
       // The stored record is NOT rewritten: it keeps its original id, original
       // payload and original brokerTs. Only the rollup moves. That is the
       // requested behaviour — "the original event stays, Last occurrence and
-      // Count move, the new event is deleted".
-      log.debug('content duplicate absorbed by the original record', {
-        id: evt.id, ownerId, fp, applied: Number(applied),
+      // Count move".
+      //
+      // The COPY IS STILL STORED, under its own id, and indexed in both timelines.
+      //
+      // This reverses an earlier decision. Absorbing meant the copy vanished from
+      // storage entirely, so the All events tab — which reads the global index —
+      // showed one row for three delivered events while the live tail showed
+      // three. Two tabs over the same traffic disagreeing is not a detail an
+      // operator can reconcile: "all events" that omits events is just wrong.
+      //
+      // What dedup still owns is the ALERT ROLLUP: `count` increments once per
+      // arrival and `last_id` keeps pointing at the owner, so the alert table is
+      // unchanged. The fingerprint still decides which record is the OWNER; it no
+      // longer decides whether the arrival is kept. Every delivery is now an
+      // event record, which is also what AGENTS.md's "no data loss" asks for.
+      //
+      // COST, stated because it is real: storage grows with DELIVERIES, not with
+      // distinct conditions. A producer that repeats the same event forever now
+      // costs one record per repeat instead of one total. docs/sizing.md assumed
+      // one record per event, so its figures remain the ceiling for a
+      // non-duplicating feed and must be multiplied by the observed duplication
+      // factor for a duplicating one.
+      await dfl.write((c) => {
+        c.set(keys.event(evt.id), record, 'EX', ttlSec, 'NX');
+        c.zadd(keys.index(evt.source), brokerTs, evt.id);
+        c.zadd(keys.eventAllIndex, brokerTs, evt.id);
+        return null;
       });
+      await maybePruneIndex(dfl, evt.source, cfg, log);
+
       return {
         applied: Number(applied),
         alertKey: key,

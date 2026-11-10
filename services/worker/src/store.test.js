@@ -89,37 +89,33 @@ test('first delivery is stored, fingerprinted, indexed and folded', async () => 
   assert.equal(dfl.calls.eval.length, 1, 'the fold runs');
 });
 
-test('a re-sent id is dropped before it can create a second record', async () => {
+test('a re-sent id still writes one record, and folds once per arrival', async () => {
   const dfl = makeDfl();
   const args = { dfl, evt: silent, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
   const first = await persistEvent(args);
   const zaddsAfterFirst = dfl.calls.zadd.length;
-  // A second delivery of the same id, with a NEWER broker timestamp — which is
-  // what a re-send looks like and why the timestamp watermark alone missed it.
-  //
-  // It is caught by the CONTENT gate, not the id gate: identical content has
-  // identical fingerprints, so the content check fires first. That is correct —
-  // from the system's point of view it is the same condition, and the outcome is
-  // the one that matters: no second record.
+  // A second delivery of the same id, with a NEWER broker timestamp.
   const second = await persistEvent({ ...args, brokerTs: 2000 });
 
   assert.equal(first.applied, 1);
-  assert.equal(second.contentDuplicate, true, 'caught as a content duplicate');
-  assert.equal(eventSets(dfl).length, 1, 'no second record is written');
-  // Compared against the state after the FIRST write, not a hard-coded 1: each
-  // accepted event writes two index members now (source + global), so a fixed
-  // number would have to change every time an index is added.
-  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst, 'the index is not touched again');
+  assert.equal(second.contentDuplicate, true, 'recognised as the same condition');
+  // The ARRIVAL is still stored — that is the reversal: "all events" must not omit
+  // events. What dedup owns is the ROLLUP, not whether the delivery exists.
+  assert.equal(eventSets(dfl).length, 2, 'every delivery is an event record');
+  // Two more index writes (source + global) for the second arrival. Compared
+  // against the state after the FIRST write rather than a hard-coded number, so
+  // adding an index does not require editing this assertion.
+  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst * 2, 'the copy is indexed too');
   assert.equal(dfl.calls.eval.length, 2, 'the rollup still took the occurrence');
 });
 
 // ------------------------------------------------------- content dedup (§5.5)
-// The requested behaviour: the same CONDITION reported again, arriving as a new
-// message with a new id, must NOT create a second record. The original record
-// stays, its count is incremented and its Last occurrence moves, and the new copy
-// is discarded.
-test('a content duplicate is absorbed by the original record', async () => {
+// The same CONDITION reported again, arriving as a new message with a new id:
+// the ALERT ROLLUP stays deduplicated (one alert, one count, last_id -> owner),
+// but the ARRIVAL is stored and indexed under its own id. Dedup owns the rollup,
+// not whether the delivery exists — "all events" that omits events is wrong.
+test('a content duplicate is stored, and the rollup names the owner', async () => {
   const dfl = makeDfl();
   const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
@@ -135,23 +131,27 @@ test('a content duplicate is absorbed by the original record', async () => {
   assert.equal(copy.ownerId, silent.id, 'the original record is named as owner');
   assert.equal(copy.applied, 1, 'the rollup still counts the occurrence');
 
-  assert.equal(eventSets(dfl).length, 1, 'the copy is never stored');
-  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst, 'the copy is not indexed');
+  assert.equal(eventSets(dfl).length, 2, 'the arrival is stored under its own id');
+  assert.equal(dfl.calls.zadd.length, zaddsAfterFirst * 2, 'the arrival is indexed in both timelines');
   assert.equal(dfl.calls.eval.length, 2, 'the fold runs for both arrivals');
 });
 
-test('the copy never reaches the record or the index', async () => {
-  // The strongest statement of the requirement: after two identical arrivals
-  // there is exactly ONE stored event, and it is the original id.
+test('the arrival reaches the record and the index under its own id', async () => {
+  // What the All events tab depends on: after two identical arrivals there are TWO
+  // stored events, so the tab can show both. It used to show one, which is the
+  // "all events is not all events" report.
   const dfl = makeDfl();
   const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
   await persistEvent({ ...args, evt: silent });
   await persistEvent({ ...args, evt: { ...silent, id: 'copy-1' }, brokerTs: 2000 });
 
-  const storedIds = [...dfl.store.keys()].filter((k) => k.startsWith('fw:evt:'));
-  assert.deepEqual(storedIds, [`fw:evt:${silent.id}`]);
-  assert.equal(dfl.store.has(`fw:evt:copy-1`), false);
+  const storedIds = [...dfl.store.keys()].filter((k) => k.startsWith('fw:evt:')).sort();
+  assert.deepEqual(storedIds, [`fw:evt:${silent.id}`, 'fw:evt:copy-1'].sort());
+  const idxMembers = dfl.calls.zadd
+    .filter((z) => z.key === 'fw:idx:evt:all')
+    .map((z) => z.member);
+  assert.ok(idxMembers.includes('copy-1'), 'the arrival is in the global timeline');
 });
 
 test('a different payload is a different condition and gets its own record', async () => {
@@ -180,9 +180,10 @@ test('SET is issued with NX so the checks are atomic', async () => {
   }
 });
 
-test('an id that differs but content that matches never writes a second record', async () => {
-  // This is the case that used to inflate the board: a producer re-reporting a
-  // condition with a fresh id on every delivery.
+test('an id that differs but content that matches stores every arrival', async () => {
+  // This is the case that used to inflate the board with one ROW per delivery; now
+  // the board shows one ALERT (deduped rollup) while storage keeps one RECORD per
+  // delivery, so All events and the live tail agree.
   const dfl = makeDfl();
   const args = { dfl, storedPayload: {}, brokerTs: 1000, cfg, fold, log };
 
@@ -191,8 +192,8 @@ test('an id that differs but content that matches never writes a second record',
     last = await persistEvent({ ...args, evt: { ...silent, id: `evt-${i}` }, brokerTs: 1000 + i });
   }
 
-  assert.equal(eventSets(dfl).length, 1, 'five deliveries, one record');
-  assert.equal(dfl.calls.eval.length, 5, 'but the count moved five times');
+  assert.equal(eventSets(dfl).length, 5, 'five deliveries, five records');
+  assert.equal(dfl.calls.eval.length, 5, 'and the count moved five times');
   assert.equal(last.contentDuplicate, true);
 });
 

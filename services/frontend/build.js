@@ -372,8 +372,8 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
 /* Right-click record inspector. Fixed, so it is never clipped by a table's
    scroll container; the click coordinates are clamped in JS to keep it on
    screen. */
-.inspector { position:fixed; z-index:50; width:460px; max-width:calc(100vw - 1rem);
-             max-height:min(320px, calc(100vh - 1rem)); overflow:auto;
+.inspector { position:fixed; z-index:50; width:620px; max-width:calc(100vw - 1rem);
+             max-height:min(560px, calc(100vh - 1rem)); overflow:auto;
              background:var(--bg); color:var(--fg);
              border:1px solid var(--line); border-radius:.375rem;
              box-shadow:0 .5rem 1.5rem rgba(0,0,0,.28); font-size:.78rem; }
@@ -387,13 +387,17 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
 .inspector-head .inspector-back { margin-left:0; margin-right:auto;
                                   text-decoration:none; font-size:.85rem;
                                   overflow:hidden; text-overflow:ellipsis; }
-.inspector-table { width:100%; border-collapse:collapse; }
+/* table-layout:fixed plus a percentage split keeps a long value (a gzipped
+   detail body, a full URL) INSIDE the panel. Without it the table sized to its
+   longest cell and the panel grew a horizontal scrollbar — the value the
+   operator opened the panel to read was the one forcing them to scroll. */
+.inspector-table { width:100%; border-collapse:collapse; table-layout:fixed; }
 .inspector-table th { text-align:left; font-weight:600; color:var(--dim);
-                      padding:.25rem .6rem; width:42%; vertical-align:top;
+                      padding:.25rem .6rem; width:34%; vertical-align:top;
                       border-bottom:1px solid var(--line); background:transparent;
-                      position:static; }
+                      position:static; word-break:break-word; }
 .inspector-table td { padding:.25rem .6rem; border-bottom:1px solid var(--line);
-                      word-break:break-word; }
+                      word-break:break-word; overflow-wrap:anywhere; }
 .inspector-table tr:last-child th, .inspector-table tr:last-child td { border-bottom:0; }
 /* Action row. Deliberately at the top of the menu: it is what the operator
    right-clicked for, and burying it under 20 field rows would be hostile. */

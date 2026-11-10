@@ -793,6 +793,29 @@ function RecordInspector({ state, onClose }) {
     };
   }, [state, onClose]);
 
+  /**
+   * Keep the panel fully on screen, measured from the REAL element.
+   *
+   * The size is a CSS decision (620x560), so hard-coding it here as well meant
+   * two copies that could disagree — and when they did, the clamp used the old,
+   * smaller numbers and pushed a taller panel off the bottom of the viewport.
+   *
+   * Runs on every open and whenever the view toggles, because the Information
+   * table is a different height from the action list. `offsetWidth/Height` is
+   * read after layout, so the browser has already applied the CSS max-height.
+   */
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !state) return;
+    const margin = 8;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const x = Math.max(margin, Math.min(state.x, window.innerWidth - w - margin));
+    const y = Math.max(margin, Math.min(state.y, window.innerHeight - h - margin));
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+  }, [state, view]);
+
   if (!state) return null;
   const entries = recordEntries(state.record);
   const actions = state.actions || [];
@@ -801,6 +824,9 @@ function RecordInspector({ state, onClose }) {
     <div
       ref={ref}
       className="inspector"
+      // Positioned by the effect below once the real size is known. Until then
+      // it is laid out off-view so it can be measured without flashing at the
+      // wrong place.
       style={{ left: state.x, top: state.y }}
       role="dialog"
       aria-label={state.title}
@@ -1060,16 +1086,16 @@ function App() {
 
   const openInspector = useCallback((e, record, title, actions = []) => {
     e.preventDefault();
-    // Keep the panel inside the viewport; a right-click near the right edge
-    // would otherwise open a menu that runs off-screen.
-    const width = 460;
-    const height = 380;
+    // Open at the pointer, then let the panel reposition itself once it has been
+    // measured (see the clamp effect in RecordInspector). The size lives in the
+    // stylesheet ONLY: duplicating 620x560 here meant two places to keep in sync,
+    // and a stale copy silently pushed the menu off-screen.
     setInspector({
       record,
       title,
       actions,
-      x: Math.max(8, Math.min(e.clientX, window.innerWidth - width - 8)),
-      y: Math.max(8, Math.min(e.clientY, window.innerHeight - height - 8)),
+      x: e.clientX,
+      y: e.clientY,
     });
   }, []);
 

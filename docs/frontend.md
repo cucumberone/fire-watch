@@ -499,7 +499,9 @@ keys the table does not show.
 | Absent vs. null | `undefined` keys are omitted (an absent field is noise); `null` is shown, because absence and explicit null are different facts. `0` and `false` are values and are shown |
 | Still-compressed fields | labelled `[gzip, N base64 chars]` rather than dumping base64 |
 | Cycles | detected with a `WeakSet` and reported as `[circular]`; a malformed payload must never blow the stack on a right-click |
-| Positioning | coordinates clamped to the viewport so a right-click near an edge cannot open a panel off-screen |
+| Size | `620px` wide, `max-height:min(560px, 100vh-1rem)`, from the stylesheet only. The action list is short, so the panel only reaches full height on the Information view — which is the view that needs it: 16 typical fields fit with no scrolling, where the previous `460x320` cap forced a scrollbar through the very values the panel exists to reveal |
+| No horizontal scroll | `table-layout:fixed` with a 34% key column and `overflow-wrap:anywhere` on values. Without it the table sized to its longest cell and the panel grew a sideways scrollbar |
+| Positioning | clamped to the viewport **using the element's measured size** (`offsetWidth/offsetHeight` after layout), re-run when the view toggles because the Information table is a different height from the action list. The size is deliberately not duplicated in JS — the two copies disagreed when the panel grew, and the stale clamp pushed it off the bottom of the screen |
 | Dismissal | Escape, click outside, or the ✕ button. The ✕ is present in both levels; the back link returns to the action list |
 
 **Why Information exists instead of wrapping cells.** Cells never wrap (see §4.3),

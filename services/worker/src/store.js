@@ -136,11 +136,48 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   // --------------------------------------- 2. record (transport dedup on id)
   //
   // NX again, now keyed on the event id: a redelivered MESSAGE must not overwrite
-  // the stored record. A content duplicate never reaches here, so this only fires
-  // for a genuine redelivery.
+  // the stored record.
   const created = await dfl.write((c) => c.set(keys.event(evt.id), record, 'EX', ttlSec, 'NX'));
   if (created === null) {
-    return { applied: 0, duplicate: true, alertKey: key };
+    // The record already exists for this id, but the fingerprint was free.
+    //
+    // That combination means the fingerprint for this content had expired or was
+    // never written — the normal case for records created before content dedup
+    // existed, and for anything left behind by a partial reset. It does NOT mean
+    // this is a transport duplicate: a genuine redelivery would have been caught
+    // by the fingerprint branch above (identical content, fingerprint present).
+    //
+    // Treating it as a transport duplicate was the bug: the run was dropped
+    // silently, the fold never ran, so `count` and `last_seen` never moved and the
+    // alert could not recover. Instead, absorb it exactly like a content
+    // duplicate — the existing record IS the owner of this condition.
+    const applied = await dfl.write((c) =>
+      c.eval(
+        fold.get(),
+        3,
+        keys.alert(key),
+        keys.alertOpen(key),
+        keys.alertOpenIndex,
+        String(brokerTs),
+        evt.id,
+        evt.severity,
+        String(cfg.alertDedupWindow),
+        key,
+      ),
+    );
+    log.debug('existing record absorbed a repeat (fingerprint was absent)', {
+      id: evt.id, fp, applied: Number(applied),
+    });
+    // Re-establish the fingerprint so subsequent arrivals take the cheap path
+    // above instead of falling through to this one every time. Not NX: whatever is
+    // there now must not be overwritten, but we know it was absent a moment ago.
+    await dfl.write((c) => c.set(keys.fingerprint(fp), evt.id, 'EX', ttlSec));
+    return {
+      applied: Number(applied),
+      alertKey: key,
+      contentDuplicate: true,
+      ownerId: evt.id,
+    };
   }
 
   // ----------------------------------------------------------------- 3. index

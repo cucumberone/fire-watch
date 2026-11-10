@@ -184,3 +184,47 @@ test('an id that differs but content that matches never writes a second record',
   assert.equal(dfl.calls.eval.length, 5, 'but the count moved five times');
   assert.equal(last.contentDuplicate, true);
 });
+
+test('a record that already exists absorbs the repeat when the fingerprint is absent', async () => {
+  // THE BUG THIS PINS.
+  //
+  // State: a stored record for this event id, but NO fingerprint (it expired, it
+  // was never written because the record predates content dedup, or a partial
+  // reset cleared it). The old code claimed the fingerprint, then hit the record's
+  // NX, and concluded "transport duplicate" — so it was dropped silently: no fold,
+  // no count, no last_seen, and the alert could never recover.
+  //
+  // It must instead be treated as a content duplicate: the existing record owns
+  // this condition, so it absorbs the arrival.
+  const dfl = makeDfl();
+  // Pre-seed only the record, mimicking a fingerprint-less event.
+  dfl.store.set(`fw:evt:${silent.id}`, '{"id":"evt-1"}');
+
+  const res = await persistEvent({
+    dfl, evt: silent, storedPayload: {}, brokerTs: 5000, cfg, fold, log,
+  });
+
+  assert.equal(res.contentDuplicate, true, 'treated as a content duplicate');
+  assert.equal(res.duplicate, undefined, 'NOT silently dropped as transport noise');
+  assert.equal(res.applied, 1, 'the fold ran, so count and last_seen move');
+  assert.equal(dfl.calls.eval.length, 1, 'the rollup was applied');
+  // The NX attempt still happens — that is how the existing record is detected —
+  // so assert on the store, not the call log: the original bytes must be intact.
+  assert.equal(
+    dfl.store.get(`fw:evt:${silent.id}`),
+    '{"id":"evt-1"}',
+    'the original record is not rewritten',
+  );
+});
+
+test('absorbing a fingerprint-less repeat repairs the fingerprint', async () => {
+  // Otherwise every subsequent delivery falls through the slow path forever.
+  const dfl = makeDfl();
+  dfl.store.set(`fw:evt:${silent.id}`, '{"id":"evt-1"}');
+
+  await persistEvent({ dfl, evt: silent, storedPayload: {}, brokerTs: 5000, cfg, fold, log });
+
+  const fpKeys = [...dfl.store.keys()].filter((k) => k.startsWith('fw:fp:'));
+  assert.equal(fpKeys.length, 1, 'the fingerprint exists again');
+  assert.equal(dfl.store.get(fpKeys[0]), silent.id, 'and points at the record');
+});

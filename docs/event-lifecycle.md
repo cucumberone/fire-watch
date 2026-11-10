@@ -300,7 +300,21 @@ SET fw:fp:{fingerprint} {id} NX
   -> null  : a record already owns this condition. Read the owner id, then:
                fold(brokerTs, this id)   -> count +1, last_seen moves
                and STOP. No record, no index member, no audit copy.
+
+record SET fw:evt:{id} NX
+  -> null  : the record exists but the fingerprint was absent. This is NOT a
+             transport duplicate — it means the fingerprint expired, was never
+             written (the record predates content dedup), or a partial reset
+             cleared it. The existing record owns this condition, so it absorbs
+             the arrival exactly like a content duplicate, AND the fingerprint is
+             re-established so the next arrival takes the cheap path.
 ```
+
+That last branch used to return "duplicate, drop it", which was a **silent data
+sink**: the fingerprint got claimed, the record NX failed, and the event was
+discarded with no fold — so `count` and `last_seen` never moved and the alert
+could not recover. A single stale record (from before the feature, or left by a
+partial reset) made every future delivery for that content vanish.
 
 The new copy is **never written anywhere**. Its arrival is recorded only as the
 rollup movement on the original record — which is exactly "the original event

@@ -131,6 +131,13 @@ The client treats `row` as authoritative for a key it has not seen (it carries t
 fold's real count), and ignores it for a key it already has so the visible count
 cannot jump around ([frontend.md](frontend.md) §5.3).
 
+**`row.count` already includes the occurrence that triggered the frame** — the
+fold increments before the gateway reads the hash. The client must therefore
+*use* it, not add to it. Adding one on top double-counted: a CLEAR followed by a
+re-send showed `Count 2`, because the new episode had reset to 1 and the client
+made it 2. When no row is present (an older gateway), the client falls back to
+incrementing its own copy.
+
 `handleAlertMessage` is therefore async, and its rejection is handled at the
 subscriber — an unhandled rejection inside an event emitter would take the process
 down and drop every client on the pod.

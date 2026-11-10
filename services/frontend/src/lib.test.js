@@ -604,3 +604,52 @@ test('row-supplied event fills the Summary when the frame has none', () => {
   });
   assert.equal(out.get('d:k').event.id, 'e1');
 });
+
+// ------------------------ the fold's count is authoritative, never added to
+test('a re-fire after a CLEAR shows Count 1, not 2', () => {
+  // Reported bug: probe -> CLEAR -> probe again showed Count 2. The fold resets
+  // count to 1 at the start of a new episode (alert-fold.lua), and the row the
+  // gateway attaches already reflects that, so adding one on the client made it 2.
+  const KEY = 'probe-device:static.probe';
+  let map = new Map();
+
+  // 1. opens
+  map = applyAlert(map, {
+    key: KEY, applied: 1,
+    event: { severity: 'WARNING', brokerTs: 1000 },
+  });
+  assert.equal(map.get(KEY).count, 1);
+
+  // 2. retired by a CLEAR
+  map = applyAlert(map, { key: KEY, applied: 3 });
+  assert.equal(map.has(KEY), false);
+
+  // 3. re-fired: new episode, the row from the server has count 1
+  map = applyAlert(map, {
+    key: KEY, applied: 1,
+    row: { severity: 'WARNING', count: 1, firstSeen: 2000, lastSeen: 2000 },
+  });
+  assert.equal(map.get(KEY).count, 1, 'a new episode starts at 1');
+});
+
+test('a repeat within the same episode follows the server count', () => {
+  const KEY = 'd:k';
+  let map = applyAlert(new Map(), {
+    key: KEY, applied: 1, event: { severity: 'WARNING', brokerTs: 1 },
+  });
+  assert.equal(map.get(KEY).count, 1);
+  // The fold's own count is 2 now, and the row carries it.
+  map = applyAlert(map, { key: KEY, applied: 1, row: { count: 2 } });
+  assert.equal(map.get(KEY).count, 2, 'not 3 — the row already counted this one');
+});
+
+test('without a row the client still increments a known row', () => {
+  // A gateway that predates the row attachment sends bare frames; the count must
+  // keep moving rather than freezing.
+  const KEY = 'd:k';
+  let map = applyAlert(new Map(), {
+    key: KEY, applied: 1, event: { severity: 'WARNING', brokerTs: 1 },
+  });
+  map = applyAlert(map, { key: KEY, applied: 1 });
+  assert.equal(map.get(KEY).count, 2);
+});

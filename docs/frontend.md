@@ -344,6 +344,13 @@ count and moves `lastSeen`, and never downgrades a known severity. Three tests i
 `lib.test.js` pin all of this, including one that walks a frame sequence and
 asserts every resulting row is renderable.
 
+**Count is the server's, not the client's.** When a frame carries `row` (see
+[websocket-server.md](websocket-server.md) §3.2), `row.count` is used verbatim —
+it already includes the occurrence that caused the frame. Adding one on top
+double-counted, so a CLEAR followed by a re-send showed `Count 2` for a brand-new
+episode. The client only increments its own copy when no row is supplied, which is
+the case against an older gateway.
+
 ### 5.4 Error boundaries: a bad row must not blank the board
 
 Fixing the one `toLowerCase` call was not enough, for a structural reason: **a

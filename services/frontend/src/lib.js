@@ -369,15 +369,11 @@ export function applyAlert(map, { key, applied, event, row }) {
     // The server's row is authoritative where it exists, because it knows the
     // fold's real count. Only its counts are used when we already have the row,
     // so a repeat cannot make the visible count jump around.
-    const base = prev ?? {
-      key,
-      severity: row?.severity,
-      firstSeen: row?.firstSeen ?? event?.brokerTs ?? Date.now(),
-      lastSeen: row?.lastSeen ?? event?.brokerTs ?? Date.now(),
-      count: row?.count ?? 0,
-      event: row?.event ?? event,
-    };
-
+    //
+    // `row.count` ALREADY INCLUDES this occurrence: the fold incremented it
+    // before the gateway read the hash. Adding one on top double-counts — the
+    // symptom was a CLEAR followed by a re-send showing Count 2 instead of 1,
+    // because the new episode had count 1 and the client made it 2.
     next.set(key, {
       key,
       // Never downgrade a known severity to undefined because a later frame had
@@ -387,7 +383,7 @@ export function applyAlert(map, { key, applied, event, row }) {
       // A repeat IS an occurrence, so lastSeen moves even without an event: the
       // fold recorded the arrival at roughly now.
       lastSeen: event?.brokerTs ?? row?.lastSeen ?? Date.now(),
-      count: (prev?.count ?? row?.count ?? 0) + 1,
+      count: row?.count ?? ((prev?.count ?? 0) + 1),
       // The latest applied event is the record worth inspecting: right-clicking
       // an alert row must show the enriched fields of the occurrence that put
       // the row there, not a synthetic merge of every event ever folded in.

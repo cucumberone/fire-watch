@@ -195,6 +195,16 @@ function logMockEvent(evt) {
   }
 }
 
+// Seed the log at load, NOT inside the subscribe handler.
+//
+// The real gateway answers `op: allEvents` from Dragonfly, where the events exist
+// whether or not anyone is connected. Seeding on subscribe made the mock answer an
+// early query with ZERO rows and then populate a second later — which is exactly
+// how a client that asks too early looks correct in the harness and empty in
+// production. The harness has to have the same property as the thing it stands in
+// for, or it hides the bug it exists to reveal.
+for (let i = 0; i < 14; i += 1) logMockEvent(mkEvent(i));
+
 // Seeded at load, not on subscribe. Seeding inside the subscribe handler made the
 // tab's contents depend on whether `op: closed` arrived before or after the first
 // subscribe — the app asks for the list when the tab is opened, which can happen

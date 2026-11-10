@@ -509,6 +509,30 @@ export function insertEvent(list, evt, limit) {
   return next.length > limit ? next.slice(next.length - limit) : next;
 }
 
+/**
+ * Append a live event to the All Events list.
+ *
+ * De-duplicates on `id` ALONE, unlike `insertEvent`. The two lists answer
+ * different questions:
+ *
+ *   Live events  — "what arrived", so an absorbed repeat is a distinct row
+ *                  (same id, new arrival time) and belongs on screen.
+ *   All events   — "what is stored", which is one record per id in
+ *                  `fw:evt:{id}`. An repeat the worker absorbed was never
+ *                  stored, so adding it would invent a row the tab's own
+ *                  query would never return.
+ *
+ * Sorting is by brokerTs like the query's ZREVRANGE order, but the list is kept
+ * ascending and the table renders it newest-first, so the two agree.
+ */
+export function insertAllEvent(list, evt, limit) {
+  if (!evt?.id) return list;
+  if (list.some((e) => e.id === evt.id)) return list;
+  const next = [...list, evt];
+  next.sort((a, b) => (a.brokerTs ?? 0) - (b.brokerTs ?? 0));
+  return next.length > limit ? next.slice(next.length - limit) : next;
+}
+
 /** Exponential backoff with jitter, capped. */
 export function backoffDelay(attempt, { base = 500, cap = 30000 } = {}) {
   const exp = Math.min(cap, base * 2 ** Math.max(0, attempt));

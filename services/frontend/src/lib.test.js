@@ -12,6 +12,7 @@ import {
   decodePayload,
   applyAlert,
   insertEvent,
+  insertAllEvent,
   backoffDelay,
   isRetirement,
   resolveTheme,
@@ -202,6 +203,29 @@ test('insertEvent trims to the limit, keeping the newest', () => {
   for (let i = 0; i < 10; i += 1) list = insertEvent(list, { id: `e${i}`, brokerTs: i }, 3);
   assert.equal(list.length, 3);
   assert.deepEqual(list.map((e) => e.id), ['e7', 'e8', 'e9']);
+});
+
+// ------------------------------------------------------------- all-events list
+test('insertAllEvent de-duplicates on id alone', () => {
+  // The All Events tab is "what is stored", and storage is ONE record per id in
+  // fw:evt:{id}. A second arrival of the same id is an absorbed repeat that was
+  // never stored, so it must not appear — even though its brokerTs differs, which
+  // is exactly what makes insertEvent accept it.
+  let list = insertAllEvent([], { id: 'p1', brokerTs: 1000 }, 10);
+  list = insertAllEvent(list, { id: 'p1', brokerTs: 2000 }, 10);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].brokerTs, 1000);
+});
+
+test('insertAllEvent keeps the list sorted and trims the oldest', () => {
+  let list = [];
+  list = insertAllEvent(list, { id: 'c', brokerTs: 300 }, 10);
+  list = insertAllEvent(list, { id: 'a', brokerTs: 100 }, 10);
+  list = insertAllEvent(list, { id: 'b', brokerTs: 200 }, 10);
+  assert.deepEqual(list.map((e) => e.id), ['a', 'b', 'c']);
+  for (let i = 0; i < 10; i += 1) list = insertAllEvent(list, { id: `x${i}`, brokerTs: 1000 + i }, 3);
+  assert.equal(list.length, 3);
+  assert.deepEqual(list.map((e) => e.id), ['x7', 'x8', 'x9']);
 });
 
 // -------------------------------------------------------------------- severity

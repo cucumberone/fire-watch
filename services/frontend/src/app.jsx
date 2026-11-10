@@ -43,9 +43,13 @@ import {
   filterEvents,
   tabBadgeCount,
   linkState,
+  insertAllEvent,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
+// Matches the gateway's MAX_ALL_EVENTS_LIMIT, so a list grown by live arrivals is
+// bounded the same way a query's reply is.
+const ALL_EVENTS_LIMIT = 1000;
 const MSG_MAX_BYTES = 1048576;
 // One `op: alerts` frame asks about this many keys. Matches the gateway's
 // FW_MAX_ALERT_QUERY limit so a large alert table degrades to "acks refresh a
@@ -499,6 +503,21 @@ function useSocket(config) {
       // msgCompleteString (lib.js WIRE_FIELD).
       const decorated = toViewEvent({ ...evt, payload });
       setEvents((prev) => insertEvent(prev, decorated, EVENT_LIMIT));
+      // The All Events tab is a windowed QUERY, but a query alone froze it: it
+      // answered once, on first open, and never again. An operator who opened the
+      // tab and then watched it saw a still image of a live board, with the badge
+      // pinned at whatever the count was at that instant.
+      //
+      // Only events the worker actually STORED are added. `applied: 0` means the
+      // repeat was absorbed into an existing record (or is a redelivery) and lives
+      // under a different id, so adding it would invent a row this tab's own query
+      // can never return — `insertAllEvent`'s id-only dedup cannot catch it,
+      // because the abandoned copy carries its own id.
+      if (frame.applied !== 0 && frame.applied != null) {
+        setAllEvents((prev) => (prev.loadedAt
+          ? { ...prev, events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT) }
+          : prev));
+      }
       if (frame.applied !== null && frame.applied !== undefined) {
         const alertKey = `${evt.source}:${evt.type}`;
         // Re-opening forgets the "already counted" marker, so the NEXT retirement
@@ -600,17 +619,33 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'allEvents') {
-      // The answer to `op: allEvents`. Replaces the list wholesale: it is a
-      // windowed query, so an event it omits is outside the window rather than
-      // missing from the response.
-      const rows = Array.isArray(frame.events) ? frame.events : [];
-      setAllEvents({
-        events: rows.map((e) => toViewEvent(e)),
-        loading: false,
-        error: null,
-        truncated: Boolean(frame.truncated),
-        range: frame.range || '24h',
-        loadedAt: Date.now(),
+      // The answer to `op: allEvents`. The reply is AUTHORITATIVE for the window:
+      // it is a bounded query, so an event it omits is outside the window rather
+      // than missing from the response.
+      //
+      // Live events that arrived while the request was in flight are re-applied on
+      // top, though. The reply only covers up to `untilMs`, so replacing wholesale
+      // would silently discard anything that landed in the round trip — the list
+      // would go backwards a moment after the operator saw it move, and the same
+      // event would reappear only on the next query. Merging by id keeps the reply
+      // authoritative for everything it covers while not throwing away what it
+      // could not have known about.
+      const rows = (Array.isArray(frame.events) ? frame.events : []).map((e) => toViewEvent(e));
+      const newest = rows.reduce((m, e) => Math.max(m, e.brokerTs ?? 0), 0);
+      setAllEvents((prev) => {
+        const inFlight = prev.events.filter((e) => (e.brokerTs ?? 0) > newest);
+        const merged = inFlight.reduce(
+          (acc, e) => insertAllEvent(acc, e, ALL_EVENTS_LIMIT),
+          rows,
+        );
+        return {
+          events: merged,
+          loading: false,
+          error: null,
+          truncated: Boolean(frame.truncated),
+          range: frame.range || '24h',
+          loadedAt: Date.now(),
+        };
       });
       return;
     }

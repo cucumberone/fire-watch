@@ -90,7 +90,6 @@ const css = `
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
        background:var(--bg); color:var(--fg); }
-main { max-width: none; margin: 0 auto; padding: 1.5rem; }
 /* The drawer is in the flow, so no bottom padding is needed to clear it. */
 h1 { font-size:1.25rem; margin:0; }
 h2 { font-size:1rem; margin:2rem 0 .5rem; font-weight:600; }
@@ -163,8 +162,6 @@ th { white-space:normal; }
    Without the section rules the table wrapper kept its natural (content) height,
    so .tbody had nothing to scroll and the whole section overflowed instead —
    which is what pushed the header out of view before. */
-main > section { display:flex; flex-direction:column; min-height:0; flex:0 1 auto; }
-main > section:first-of-type { flex:1 1 auto; }
 /* Both tables are table-layout:fixed with the same colgroup, so the header and
    body columns line up exactly. */
 .tablewrap > div > table { table-layout:fixed; min-width:100%; border-collapse:separate;
@@ -244,21 +241,21 @@ pre.detail { margin:.25rem 0 0; padding:.6rem; background:var(--pre-bg);
    the row is scrolled horizontally and for anyone who cannot separate the
    tints. Dimming retirement rows is suppressed here: the green tint already
    says "retired", and dimming would undo the point of the mode. */
-main.color-rows tr.row-fatal    td { background:var(--row-fatal);    color:var(--row-fatal-fg); }
-main.color-rows tr.row-critical td { background:var(--row-critical); color:var(--row-critical-fg); }
-main.color-rows tr.row-warning  td { background:var(--row-warning);  color:var(--row-warning-fg); }
-main.color-rows tr.row-harmless td { background:var(--row-harmless); color:var(--row-harmless-fg); }
-main.color-rows tr.row-close    td { background:var(--row-close);    color:var(--row-close-fg); }
-main.color-rows tr.row-unknown  td { background:var(--row-unknown);  color:var(--row-unknown-fg); }
+.color-rows tr.row-fatal    td { background:var(--row-fatal);    color:var(--row-fatal-fg); }
+.color-rows tr.row-critical td { background:var(--row-critical); color:var(--row-critical-fg); }
+.color-rows tr.row-warning  td { background:var(--row-warning);  color:var(--row-warning-fg); }
+.color-rows tr.row-harmless td { background:var(--row-harmless); color:var(--row-harmless-fg); }
+.color-rows tr.row-close    td { background:var(--row-close);    color:var(--row-close-fg); }
+.color-rows tr.row-unknown  td { background:var(--row-unknown);  color:var(--row-unknown-fg); }
 /* FATAL is pure black in both themes, so its bar is red rather than a darker
    shade of black, which would be invisible. */
-main.color-rows tr.row-fatal    td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
-main.color-rows tr.row-critical td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
-main.color-rows tr.row-warning  td:first-child { box-shadow: inset 3px 0 0 #f59e0b; }
-main.color-rows tr.row-harmless td:first-child { box-shadow: inset 3px 0 0 #16a34a; }
-main.color-rows tr.row-close    td:first-child { box-shadow: inset 3px 0 0 #15803d; }
-main.color-rows tr.retirement td { opacity:1; }
-main.color-rows td .dim { color:inherit; opacity:.7; }
+.color-rows tr.row-fatal    td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
+.color-rows tr.row-critical td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
+.color-rows tr.row-warning  td:first-child { box-shadow: inset 3px 0 0 #f59e0b; }
+.color-rows tr.row-harmless td:first-child { box-shadow: inset 3px 0 0 #16a34a; }
+.color-rows tr.row-close    td:first-child { box-shadow: inset 3px 0 0 #15803d; }
+.color-rows tr.retirement td { opacity:1; }
+.color-rows td .dim { color:inherit; opacity:.7; }
 
 /* Live-events drawer: a real bottom bar, never an overlay.
    position:sticky with bottom:0 looked like it worked, but sticky LIFTS the
@@ -278,15 +275,9 @@ html, body, #root { height:100%; }
    column and must have the same width. Without it a shrink-to-fit main ended up
    narrower than the drawer and the two tables stopped lining up. */
 #root { display:flex; flex-direction:column; align-items:stretch; overflow:hidden; }
-/* width:100% because a flex item in a column does not stretch horizontally on
-   its own once max-width stops capping it; it shrink-to-fits its content. */
-main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
-       display:flex; flex-direction:column;
-       /* Inset shadow, so it is painted against the scroll container's edge and
-          does NOT scroll with the content. It marks the bottom edge as a
-          scroll boundary, so a partially visible row reads as "more below"
-          rather than as a row the drawer is covering. */
-       box-shadow: inset 0 -14px 14px -14px rgba(0,0,0,.45); }
+/* Shell layout now comes from the MUI Box in app.jsx, so the old main block
+   is gone. It set overflow:hidden on a fixed-height column, which is what
+   produced the stray horizontal scrollbar once the content moved into panes. */
 /* ---------------------------------------------------------------- tab bar
 
    Replaces the old bottom drawer. The drawer competed with the alert table for
@@ -336,7 +327,7 @@ main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
    the one thing the row exists to communicate. */
 tr.row-selected td { background:var(--pre-bg); }
 tr.row-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
-main.color-rows tr.row-selected td { background:rgba(127,127,127,.25); }
+.color-rows tr.row-selected td { background:rgba(127,127,127,.25); }
 /* Rows are a selection surface, not a document.
    Without this, shift-click also runs the browser's text-selection gesture and
    paints the cell text with the native highlight — which on a dark board looks

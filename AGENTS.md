@@ -43,7 +43,7 @@ This repo sets up an event server.
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
 - [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
 - [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, HPA
-- [Frontend](docs/frontend.md) — static React app, two Routes, CSP
+- [Frontend](docs/frontend.md) — static React + MUI app, two Routes, CSP
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
 - [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms
 - [Monitoring](docs/monitoring.md) — 21 alerts, the redis-exporter, and two Dragonfly metric names that were wrong

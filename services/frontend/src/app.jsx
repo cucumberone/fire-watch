@@ -10,6 +10,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
+  ThemeProvider, createTheme, CssBaseline,
+  AppBar, Toolbar, Tabs, Tab, TextField, MenuItem, Select, FormControl,
+  InputLabel, Button, IconButton, Tooltip, Chip, Box, Stack, Typography,
+  Paper, Alert as MuiAlert, CircularProgress,
+} from '@mui/material';
+import {
+  DarkMode as DarkModeIcon,
+  LightMode as LightModeIcon,
+  Palette as PaletteIcon,
+  Refresh as RefreshIcon,
+  Pause as PauseIcon,
+  PlayArrow as PlayArrowIcon,
+} from '@mui/icons-material';
+import {
   resolveWsUrl,
   decodePayload,
   toViewEvent,
@@ -97,6 +111,94 @@ const TABS = [
   { id: 'events', label: 'Live events' },
   { id: 'closed', label: 'Closed' },
 ];
+
+/**
+ * MUI theme.
+ *
+ * MUI replaces the hand-rolled chrome — header, tab strip, filters, buttons — but
+ * NOT the tables. The tables carry behaviour MUI's DataGrid does not provide out
+ * of the box (drag-to-resize columns with per-table persistence, a header that
+ * cannot scroll away, shift/ctrl multi-select, and two stacked tables sharing one
+ * scroll offset), and re-implementing that on DataGrid's API would change how the
+ * board behaves. So the tables stay custom and the surface around them is MUI.
+ *
+ * Built per render from the resolved mode rather than once at module scope, so the
+ * existing light/dark/auto preference keeps working: `auto` follows
+ * `prefers-color-scheme` and resolves to one of these two palettes.
+ *
+ * The density is deliberately tight. This is an operations board read at a glance
+ * during an incident, not a content site: a 56px app bar and 48px rows would fit
+ * half the alerts on the same screen.
+ */
+function buildTheme(mode) {
+  const dark = mode === 'dark';
+  return createTheme({
+    palette: {
+      mode,
+      primary: { main: dark ? '#60a5fa' : '#2563eb' },
+      secondary: { main: dark ? '#c084fc' : '#7c3aed' },
+      error: { main: dark ? '#f87171' : '#dc2626' },
+      warning: { main: dark ? '#fbbf24' : '#d97706' },
+      success: { main: dark ? '#4ade80' : '#16a34a' },
+      background: {
+        default: dark ? '#0d1117' : '#ffffff',
+        paper: dark ? '#161b22' : '#ffffff',
+      },
+      divider: dark ? 'rgba(240,246,252,.12)' : 'rgba(0,0,0,.12)',
+      text: {
+        primary: dark ? '#e6edf3' : '#1f2328',
+        secondary: dark ? '#8b949e' : '#59636e',
+      },
+    },
+    shape: { borderRadius: 6 },
+    typography: {
+      // System stack, not Roboto: no extra font request, and the numerals align
+      // with the monospace columns the tables already use.
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
+      fontSize: 13,
+      h1: { fontSize: '1.05rem', fontWeight: 700, letterSpacing: '.01em' },
+      h2: { fontSize: '.92rem', fontWeight: 600 },
+      button: { textTransform: 'none', fontWeight: 600 },
+    },
+    components: {
+      MuiCssBaseline: {
+        styleOverrides: { body: { overflow: 'hidden' } },
+      },
+      MuiAppBar: {
+        defaultProps: { elevation: 0, color: 'default' },
+        styleOverrides: {
+          root: { borderBottom: '1px solid', borderColor: 'divider',
+                  backgroundImage: 'none' },
+        },
+      },
+      MuiToolbar: {
+        styleOverrides: {
+          root: { minHeight: 48, gap: 12, paddingInline: 16, width: '100%' },
+        },
+      },
+      MuiTab: {
+        styleOverrides: {
+          root: { minHeight: 40, textTransform: 'none', fontWeight: 600,
+                  fontSize: '.85rem', paddingInline: 14 },
+        },
+      },
+      MuiTabs: {
+        styleOverrides: {
+          // width:100% because a scrollable Tabs strip shrink-wraps its content;
+          // without it the bar (and the Toolbar above it) collapse to the width
+          // of the tab labels and sit centred in the AppBar.
+          root: { minHeight: 40, width: '100%', borderBottom: '1px solid',
+                  borderColor: 'divider' },
+          indicator: { height: 2 },
+        },
+      },
+      MuiButton: { defaultProps: { size: 'small', disableElevation: true } },
+      MuiTextField: { defaultProps: { size: 'small', margin: 'dense' } },
+      MuiFormControl: { defaultProps: { size: 'small', margin: 'dense' } },
+      MuiChip: { styleOverrides: { root: { height: 22, fontSize: '.72rem' } } },
+    },
+  });
+}
 
 function readPref(key, fallback) {
   try {
@@ -1247,6 +1349,11 @@ function App() {
 
   const closeInspector = useCallback(() => setInspector(null), []);
 
+  // One theme instance per mode, not per render: MUI's ThemeProvider propagates
+  // a new context value on identity change, so rebuilding it every render would
+  // re-render every styled component on every socket frame.
+  const theme = useMemo(() => buildTheme(darkMode ? 'dark' : 'light'), [darkMode]);
+
   const sortedAlerts = useMemo(
     () => [...alerts.values()].sort(
       (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
@@ -1338,101 +1445,95 @@ function App() {
   if (!config) return <main><h1>Fire-Watch</h1><p className="dim">Loading…</p></main>;
 
   return (
-    <>
-      <main className={rowColor ? 'color-rows' : ''}>
-        <header>
-        <h1>Fire-Watch</h1>
-        <span className={`status status-${status}`}>{status}</span>
-        {notice ? <span className="notice">{notice}</span> : null}
-        <div className="controls">
-          {themePreference === 'auto' ? null : (
-            <button className="link" onClick={() => setTheme('auto')} title="Follow the operating system">
-              auto
-            </button>
-          )}
-          <div className="togglegroup">
-            <button
-              className="iconbtn iconbtn-theme"
-              onClick={() => setTheme(darkMode ? 'light' : 'dark')}
-              aria-pressed={darkMode}
-              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-            >
-              {darkMode ? <IconSun /> : <IconMoon />}
-            </button>
-            <button
-              className="iconbtn iconbtn-rows"
-              onClick={() => setRowColor(!rowColor)}
-              aria-pressed={rowColor}
-              aria-label={rowColor ? 'Turn off severity row colours' : 'Turn on severity row colours'}
-              title={rowColor ? 'Severity row colours: on' : 'Severity row colours: off'}
-            >
-              <IconPalette />
-            </button>
-          </div>
-        </div>
-      </header>
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh',
+                 overflow: 'hidden' }} className={rowColor ? 'color-rows' : ''}>
+        <AppBar position="static">
+          <Toolbar variant="dense">
+            <Typography variant="h1" sx={{ mr: 1.5 }}>Fire-Watch</Typography>
+            <Chip
+              label={status}
+              size="small"
+              color={status === 'open' ? 'success'
+                : status === 'misconfigured' ? 'error' : 'warning'}
+              variant={status === 'open' ? 'filled' : 'outlined'}
+            />
+            {notice ? (
+              <MuiAlert severity="info" sx={{ py: 0, flex: '0 1 auto',
+                                              '& .MuiAlert-message': { py: .25 } }}>
+                {notice}
+              </MuiAlert>
+            ) : null}
+            <Box sx={{ flex: 1 }} />
+            {themePreference === 'auto' ? null : (
+              <Button onClick={() => setTheme('auto')}
+                      title="Follow the operating system">auto</Button>
+            )}
+            <Tooltip title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+              <IconButton size="small" color="inherit"
+                          onClick={() => setTheme(darkMode ? 'light' : 'dark')}
+                          aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+                {darkMode ? <LightModeIcon fontSize="small" /> : <DarkModeIcon fontSize="small" />}
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={rowColor ? 'Severity row colours: on' : 'Severity row colours: off'}>
+              <IconButton size="small"
+                          color={rowColor ? 'primary' : 'inherit'}
+                          onClick={() => setRowColor(!rowColor)}
+                          aria-label="Toggle severity row colours">
+                <PaletteIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          </Toolbar>
 
-      {/*
-        Tabs, not a header plus a drawer.
-
-        The drawer forced a fixed-height shell: the alert table could never use
-        the bottom of the page, and the tail was permanently either collapsed
-        (invisible during an incident) or eating a third of the viewport. Three
-        peers also match how the data is actually used — open, arriving, and
-        already finished are parallel questions, not a primary view with an
-        accessory.
-
-        The tab bar is a real tablist: `role=tab` with `aria-selected` and arrow
-        keys, so it is navigable without a mouse.
-      */}
-      <div className="tabbar" role="tablist" aria-label="Views">
-        {TABS.map((t) => {
-          const count = t.id === 'alerts' ? sortedAlerts.length
-            : t.id === 'events' ? shownEvents.length
-            : closed.alerts.length;
-          return (
-            <button
-              key={t.id}
-              role="tab"
-              id={`tab-${t.id}`}
-              aria-selected={tab === t.id}
-              aria-controls={`panel-${t.id}`}
-              tabIndex={tab === t.id ? 0 : -1}
-              className={tab === t.id ? 'tab tab-active' : 'tab'}
-              onClick={() => setTab(t.id)}
-              onKeyDown={(e) => {
-                // Arrow keys move between tabs, as the WAI-ARIA pattern expects.
-                // Only when focus is on a tab, so typing in the Closed search box
-                // is never hijacked.
-                const i = TABS.findIndex((x) => x.id === tab);
-                if (e.key === 'ArrowRight') { e.preventDefault(); setTab(TABS[(i + 1) % TABS.length].id); }
-                if (e.key === 'ArrowLeft') { e.preventDefault(); setTab(TABS[(i - 1 + TABS.length) % TABS.length].id); }
-              }}
-            >
-              {t.label}
-              <span className="dim">{t.id === 'closed' && closed.loading ? ' …' : ` (${count})`}</span>
-            </button>
-          );
-        })}
-      </div>
+          {/* Tabs live in the AppBar so the header and the view selector are one
+              block, not two stacked bars eating vertical space. `value` is the
+              tab id, so the mapping from state to selection is direct. */}
+          <Tabs
+            value={tab}
+            onChange={(_, v) => setTab(v)}
+            variant="scrollable"
+            scrollButtons="auto"
+            aria-label="Views"
+          >
+            {TABS.map((t) => {
+              const count = t.id === 'alerts' ? sortedAlerts.length
+                : t.id === 'events' ? shownEvents.length
+                : closed.alerts.length;
+              return (
+                <Tab
+                  key={t.id}
+                  value={t.id}
+                  id={`tab-${t.id}`}
+                  aria-controls={`panel-${t.id}`}
+                  label={(
+                    <Stack direction="row" spacing={0.75} alignItems="center">
+                      <span>{t.label}</span>
+                      {t.id === 'closed' && closed.loading
+                        ? <CircularProgress size={11} />
+                        : <Chip label={count} size="small" variant="outlined" />}
+                    </Stack>
+                  )}
+                />
+              );
+            })}
+          </Tabs>
+        </AppBar>
 
       {tab === 'alerts' ? (
-      <section
-        role="tabpanel"
-        id="panel-alerts"
-        aria-labelledby="tab-alerts"
-      >
-        <h2>
-          Open alerts <span className="dim">({sortedAlerts.length})</span>
-          <button
-            className="link colreset"
-            onClick={resetAlertWidths}
-            title="Restore the default column widths"
-          >
+      <Box role="tabpanel" id="panel-alerts" aria-labelledby="tab-alerts"
+           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                 p: 2, pt: 1.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h2">Open alerts</Typography>
+          <Chip label={sortedAlerts.length} size="small" variant="outlined" />
+          <Box sx={{ flex: 1 }} />
+          <Button startIcon={<RefreshIcon />} onClick={resetAlertWidths}
+                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
             reset columns
-          </button>
-        </h2>
+          </Button>
+        </Stack>
         {/* No selection banner by design. Selecting rows is purely a pointer
             state; every action lives in the right-click menu, which is where the
             operator already goes for a single row. A toolbar that appears on
@@ -1543,37 +1644,33 @@ function App() {
             />
             </PaneBoundary>
           )}
-      </section>
+      </Box>
       ) : null}
 
       {tab === 'events' ? (
-      <section
-        role="tabpanel"
-        id="panel-events"
-        aria-labelledby="tab-events"
-      >
-        <h2>
-          Live events <span className="dim">({shownEvents.length} of last {EVENT_LIMIT})</span>
-          <span className="h2actions">
-            <button
-              className="link colreset"
-              onClick={resetEventWidths}
-              title="Restore the default column widths"
-            >
-              reset columns
-            </button>
-            <button
-              className={paused ? 'pause pause-on' : 'pause'}
-              onClick={() => setPaused((p) => !p)}
-              aria-pressed={paused}
-              title={paused ? 'Resume the live tail' : 'Freeze the live tail'}
-            >
-              {paused ? '▶ Resume' : '❚❚ Pause'}
-            </button>
-          </span>
-          {paused ? <span className="notice">paused</span> : null}
-        </h2>
-        <div className="panelbody" id="live-events-panel">
+      <Box role="tabpanel" id="panel-events" aria-labelledby="tab-events"
+           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                 p: 2, pt: 1.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h2">Live events</Typography>
+          <Chip label={`${shownEvents.length} of last ${EVENT_LIMIT}`} size="small" variant="outlined" />
+          {paused ? <Chip label="paused" size="small" color="warning" /> : null}
+          <Box sx={{ flex: 1 }} />
+          <Button startIcon={<RefreshIcon />} onClick={resetEventWidths}
+                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
+            reset columns
+          </Button>
+          <Button
+            variant={paused ? 'contained' : 'outlined'}
+            color={paused ? 'warning' : 'primary'}
+            startIcon={paused ? <PlayArrowIcon /> : <PauseIcon />}
+            onClick={() => setPaused((p) => !p)}
+          >
+            {paused ? 'Resume' : 'Pause'}
+          </Button>
+        </Stack>
+        <Box sx={{ flex: 1, minHeight: 0, overflow: 'hidden',
+                   display: 'flex', flexDirection: 'column' }} id="live-events-panel">
           {shownEvents.length === 0
             ? <p className="dim">Nothing yet.</p>
             : (
@@ -1661,93 +1758,97 @@ function App() {
               />
               </PaneBoundary>
             )}
-        </div>
-      </section>
+        </Box>
+      </Box>
       ) : null}
 
       {tab === 'closed' ? (
-      <section
-        role="tabpanel"
-        id="panel-closed"
-        aria-labelledby="tab-closed"
-      >
-        <h2>
-          Closed <span className="dim">(last 7 days, {closedRows.length})</span>
-          <span className="h2actions">
-            <button
-              className="link colreset"
-              onClick={loadClosed}
-              disabled={closed.loading}
-              title="Re-read the closed alerts from Dragonfly"
-            >
-              {closed.loading ? 'loading…' : 'refresh'}
-            </button>
-            <button
-              className="link colreset"
-              onClick={resetClosedWidths}
-              title="Restore the default column widths"
-            >
-              reset columns
-            </button>
-          </span>
-        </h2>
+      <Box role="tabpanel" id="panel-closed" aria-labelledby="tab-closed"
+           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                 p: 2, pt: 1.5 }}>
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h2">Closed</Typography>
+          <Chip label={`last 7 days`} size="small" variant="outlined" />
+          <Chip label={closedRows.length} size="small" variant="outlined" />
+          <Box sx={{ flex: 1 }} />
+          <Button startIcon={<RefreshIcon />} onClick={resetClosedWidths}
+                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
+            reset columns
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={closed.loading ? <CircularProgress size={13} color="inherit" /> : <RefreshIcon />}
+            onClick={loadClosed}
+            disabled={closed.loading}
+          >
+            {closed.loading ? 'loading' : 'refresh'}
+          </Button>
+        </Stack>
 
         {/* Search. Client-side, over the rows already fetched, because the window
             is bounded (7 days) and a server round trip per keystroke would make
             typing feel broken. It matches every column the operator can see plus
             the summary, so "which switch was flapping last Tuesday" is one box. */}
-        <div className="closedfilters">
-          <input
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+          <TextField
             type="search"
-            className="filterinput"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter by key, severity, summary, agent…"
-            aria-label="Filter closed alerts"
+            inputProps={{ 'aria-label': 'Filter closed alerts' }}
+            // `flex:1` with `minWidth:0` is what lets it shrink: a flex item
+            // defaults to min-width:auto, so it refuses to go below its content
+            // width and pushes the select off the right edge.
+            sx={{ flex: '1 1 260px', minWidth: 0, maxWidth: 460 }}
           />
-          <select
-            className="filterselect"
-            value={severityFilter}
-            onChange={(e) => setSeverityFilter(e.target.value)}
-            aria-label="Filter by severity"
-          >
-            <option value="">All severities</option>
-            {closedSeverityOptions.map((sev) => (
-              <option key={sev} value={sev}>{sev}</option>
-            ))}
-          </select>
-          {filter || severityFilter ? (
-            <button
-              className="link colreset"
-              onClick={() => { setFilter(''); setSeverityFilter(''); }}
-              title="Clear the filters"
+          <FormControl sx={{ width: 160, flex: '0 0 auto' }}>
+            <InputLabel id="sev-filter-label">Severity</InputLabel>
+            <Select
+              labelId="sev-filter-label"
+              label="Severity"
+              value={severityFilter}
+              onChange={(e) => setSeverityFilter(e.target.value)}
             >
+              <MenuItem value="">All severities</MenuItem>
+              {closedSeverityOptions.map((sev) => (
+                <MenuItem key={sev} value={sev}>{sev}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {filter || severityFilter ? (
+            <Button onClick={() => { setFilter(''); setSeverityFilter(''); }}>
               clear
-            </button>
+            </Button>
           ) : null}
-          <span className="dim">
+          <Box sx={{ flex: 1 }} />
+          <Typography variant="caption" color="text.secondary">
             {closedRows.length} of {closed.alerts.length}
-          </span>
-        </div>
+          </Typography>
+        </Stack>
 
         {closed.error ? (
-          <p className="error">Closed list failed: {closed.error}</p>
+          <MuiAlert severity="error">Closed list failed: {closed.error}</MuiAlert>
         ) : closed.loading && closed.alerts.length === 0 ? (
-          <p className="dim">Loading…</p>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ p: 2 }}>
+            <CircularProgress size={16} />
+            <Typography variant="body2" color="text.secondary">Loading…</Typography>
+          </Stack>
         ) : closed.alerts.length === 0 ? (
-          <p className="dim">
+          <Typography variant="body2" color="text.secondary">
             Nothing has closed in the last 7 days.
             {closed.loadedAt ? null : ' Open this tab to load.'}
-          </p>
+          </Typography>
         ) : closedRows.length === 0 ? (
-          <p className="dim">No closed alerts match the filter.</p>
+          <Typography variant="body2" color="text.secondary">
+            No closed alerts match the filter.
+          </Typography>
         ) : (
-          <>
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             {closed.truncated ? (
-              <p className="notice">
+              <MuiAlert severity="warning" sx={{ mb: 1 }}>
                 Showing the {closed.alerts.length} most recent closures — narrow the
                 filter to see older ones.
-              </p>
+              </MuiAlert>
             ) : null}
             <PaneBoundary name="Closed">
               <ScrollTable
@@ -1800,14 +1901,14 @@ function App() {
                 ))}
               />
             </PaneBoundary>
-          </>
+          </Box>
         )}
-      </section>
+      </Box>
       ) : null}
-      </main>
+      </Box>
 
       <RecordInspector state={inspector} onClose={closeInspector} />
-    </>
+    </ThemeProvider>
   );
 }
 

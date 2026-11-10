@@ -2,6 +2,49 @@
 
 React single-page app served as static assets, talking to the WebSocket gateway.
 
+## 0. UI framework
+
+The chrome is **MUI** (`@mui/material` + emotion). The tables are not — they are
+custom, because they carry behaviour DataGrid does not provide out of the box:
+drag-to-resize columns with per-table persistence, a header that cannot scroll
+away, shift/ctrl multi-select, and two stacked tables sharing one scroll offset.
+Re-implementing those on DataGrid's API would change how the board behaves, so the
+surface around the tables is MUI and the tables stay hand-built.
+
+| Layer | Provided by |
+|---|---|
+| App bar, status chip, theme/palette controls | MUI `AppBar` / `Toolbar` / `Chip` / `IconButton` |
+| View selector | MUI `Tabs` / `Tab` |
+| Pane headings and actions | MUI `Stack` / `Typography` / `Button` |
+| Closed-tab filters | MUI `TextField` / `FormControl` / `Select` |
+| Messages | MUI `Alert`, `CircularProgress` |
+| Tables | custom (`ScrollTable`, `ResizableTh`) |
+
+`buildTheme(mode)` creates one theme per resolved mode, memoised on `darkMode` —
+rebuilding it per render would re-render every styled component on every socket
+frame, because MUI propagates a new context value on identity change.
+
+The palette is intentionally tight (48px toolbar, 40px tabs, 13px base, dense
+inputs). This is an operations board read at a glance during an incident, not a
+content site; Material's default sizing fits half the alerts on the same screen.
+
+Two MUI defaults had to be overridden, both for the same reason — a flex column
+shrink-wraps:
+
+- `MuiToolbar` needs `width: 100%`, or it collapses to the width of its content
+  and sits centred in the AppBar
+- `MuiTabs` (with `variant="scrollable"`) shrink-wraps its labels, so it needs
+  `width: 100%` too, and the Toolbar above it inherits the same shrink without it
+
+The CSP already allowed `style-src 'unsafe-inline'`, which is what emotion's
+runtime style injection requires, so no CSP change was needed.
+
+**Cost:** the bundle went from 169 KiB to 459 KiB (unminified) because MUI and
+emotion are large. That is the price of the framework, accepted deliberately —
+but it is the reason MUI stopped at the chrome. Pulling in DataGrid would have
+added more on top of an already-heavy bundle, to replace tables whose behaviour
+would then need rebuilding.
+
 ## 1. Topology
 
 | Item | Value |

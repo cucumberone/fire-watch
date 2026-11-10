@@ -97,7 +97,14 @@ const CLOSED_DEFAULT_W = [96, 172, 172, 172, 64, 340, 240];
 // operator cares about is the alert's occurrence rollup, which lives on the alert
 // hash and is the alert table's Count. A column that always reads 1 is noise that
 // invites the reader to look for meaning in it.
+// Live events and All events share a row component but NOT a column list.
+//
+// All events gets a Count column and Live events does not, because the two answer
+// different questions: the tail is "what arrived", one row per delivery, so a count
+// there would repeat the alert's rollup on every row. All events is "what happened in
+// this window", where "how many times did this fire" is a real thing to scan.
 const EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Summary'];
+const ALL_EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Count', 'Summary'];
 
 /**
  * Default widths, in px, for every real column.
@@ -114,6 +121,7 @@ const EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 
  */
 const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
 const EVENT_DEFAULT_W = [96, 84, 172, 172, 340];
+const ALL_EVENT_DEFAULT_W = [96, 84, 172, 172, 64, 340];
 
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
@@ -1916,7 +1924,8 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   );
 }
 
-function EventRow({ evt, selected, onSelect, onContextMenu }) {  // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
+function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false }) {
+  // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
   // and the worker-enriched fields are already mapped by toViewEvent().
   //
   // NO DISCLOSURE FOLD IN THE SUMMARY COLUMN. It went through three stages and the
@@ -1954,6 +1963,19 @@ function EventRow({ evt, selected, onSelect, onContextMenu }) {  // `evt` is a v
       <td><AlertStateChip state={evt.alertState} closedAt={evt.alertClosedAt} /></td>
       <td className="mono">{formatClock(evt.firstOccurrence)}</td>
       <td className="mono">{formatClock(evt.lastOccurrence)}</td>
+      {showCount ? (
+        <td
+          className="num"
+          // The ALERT's rollup, not a per-event number: the `EVT_*` schema has no
+          // Count field, so a per-event count would always read 1. `null` means the
+          // alert hash is gone and we do not know, which is not the same as 0.
+          title={evt.alertCount == null
+            ? 'No alert state for this record — the alert hash has expired'
+            : `This alert has been reported ${evt.alertCount} time(s)`}
+        >
+          {evt.alertCount == null ? <span className="dim">—</span> : evt.alertCount}
+        </td>
+      ) : null}
       <td className="summary">
         {summary || <span className="dim">—</span>}
       </td>
@@ -2062,7 +2084,7 @@ function App() {
   const {
     widthOf: allWidthOf,
     beginResize: beginAllResize,
-  } = useColumnWidths('all', EVENT_COLS, EVENT_DEFAULT_W);
+  } = useColumnWidths('all', ALL_EVENT_COLS, ALL_EVENT_DEFAULT_W);
 
   // Closed-tab filters. Case-insensitive substring across the columns an operator
   // can see, plus the summary text, which is where the human-readable detail
@@ -2515,24 +2537,40 @@ function App() {
                     <th />
                   </>
                 )}
-                rows={[...shownEvents].reverse().map((e) => (
-                  <EventRow
-                    // NOT `e.id`: since the tail shows every ARRIVAL, two rows can
-                    // legitimately share an id (an absorbed repeat keeps the original
-                    // record's id). Duplicate React keys made the reconciler reuse the
-                    // wrong row, which showed MORE rows than the buffer held and in
-                    // the wrong order. The arrival is identified by id plus its
-                    // broker timestamp.
-                    key={`${e.id}@${e.brokerTs ?? ''}`}
-                    evt={e}
-                    // No onContextMenu: the live tail is a DIAGNOSTIC view, not a
-                    // working surface. Every action on it — ack, close, delete,
-                    // journal — belongs to the alert or the stored record, and the
-                    // operator reaches those from Open alerts and All events, where
-                    // the row is the thing being acted on. Three action surfaces for
-                    // one row was three places to keep in step for no gain.
-                  />
-                ))}
+                rows={[...shownEvents].reverse().map((e) => {
+                  // The live tail's state comes from the client's OWN alert map, not
+                  // from the frame: `op: event` carries no alertState (the gateway only
+                  // joins it onto query replies), so relying on the field left every
+                  // tail row reading `unknown` while the board was visibly firing.
+                  //
+                  // The client already knows: `alerts` is the open set, maintained from
+                  // the fold's own frames. Absent means the alert is not open — which is
+                  // `closed`, not `unknown`, because this client has been tracking the
+                  // fold and would hold the row if it were open. `unknown` stays reserved
+                  // for "we have never heard of this alert", i.e. a gap in this client's
+                  // own knowledge rather than a state it can vouch for.
+                  const alertKey = e.source && e.type ? `${e.source}:${e.type}` : null;
+                  const liveState = e.alertState
+                    ?? (alertKey && alerts.has(alertKey) ? 'open' : null);
+                  return (
+                    <EventRow
+                      // NOT `e.id`: since the tail shows every ARRIVAL, two rows can
+                      // legitimately share an id (an absorbed repeat keeps the original
+                      // record's id). Duplicate React keys made the reconciler reuse the
+                      // wrong row, which showed MORE rows than the buffer held and in
+                      // the wrong order. The arrival is identified by id plus its
+                      // broker timestamp.
+                      key={`${e.id}@${e.brokerTs ?? ''}`}
+                      evt={liveState === e.alertState ? e : { ...e, alertState: liveState }}
+                      // No onContextMenu: the live tail is a DIAGNOSTIC view, not a
+                      // working surface. Every action on it — ack, close, delete,
+                      // journal — belongs to the alert or the stored record, and the
+                      // operator reaches those from Open alerts and All events, where
+                      // the row is the thing being acted on. Three action surfaces for
+                      // one row was three places to keep in step for no gain.
+                    />
+                  );
+                })}
               />
               </PaneBoundary>
             )}
@@ -2659,7 +2697,7 @@ function App() {
               <ScrollTable
                 cols={(
                   <>
-                    {EVENT_COLS.map((c, i) => (
+                    {ALL_EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${allWidthOf(i)}px` }} />
                     ))}
                     {ENRICHED_FIELDS.map((f) => <col key={f.key} />)}
@@ -2668,7 +2706,7 @@ function App() {
                 )}
                 head={(
                   <>
-                    {EVENT_COLS.map((label, i) => (
+                    {ALL_EVENT_COLS.map((label, i) => (
                       <ResizableTh
                         key={label}
                         index={i}
@@ -2721,6 +2759,7 @@ function App() {
                       evt={e}
                       selected={isSelected}
                       onSelect={(ev) => eventsSel.selectRow(rowKey, ev)}
+                      showCount
                       onContextMenu={(ev) => openInspector(
                         ev,
                         e.wire ?? e,

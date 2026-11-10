@@ -278,9 +278,15 @@ export class DragonflyReader {
     // alerts in the page rather than over every row: 400 events from 4 incidents is 4
     // lookups, not 400.
     //
-    // One pipeline, two fields. `state` is 'open' or 'closed'; `closed_at` says when,
-    // and is null while open. An alert hash that has expired yields nulls, which the
-    // client renders as unknown rather than guessing.
+    // One pipeline, three fields. `state` is 'open' or 'closed'; `closed_at` says
+    // when, and is null while open; `count` is the alert's occurrence rollup — how
+    // many times this CONDITION has been reported.
+    //
+    // `count` is fetched here rather than per event because an event record has no
+    // count of its own: the `EVT_*` schema has no such field and the ingress never
+    // adds one, so any per-event count would be a constant 1. The number an operator
+    // means by "count" is the alert's, and it costs nothing extra to join it in the
+    // same HMGET that already runs for the state.
     const alertKeys = [...new Set(
       events
         .filter((e) => e?.source && e?.type)
@@ -289,15 +295,16 @@ export class DragonflyReader {
     const states = new Map();
     if (alertKeys.length > 0) {
       const pipe = c.pipeline();
-      for (const key of alertKeys) pipe.hmget(`fw:alert:${key}`, 'state', 'closed_at');
+      for (const key of alertKeys) pipe.hmget(`fw:alert:${key}`, 'state', 'closed_at', 'count');
       const res = await pipe.exec();
       res.forEach((tuple, i) => {
         const [err, value] = tuple || [];
         if (err || !Array.isArray(value)) return;
-        const [state, closedAt] = value;
+        const [state, closedAt, count] = value;
         states.set(alertKeys[i], {
           state: state || null,
           closedAt: closedAt ? Number(closedAt) : null,
+          count: Number.isFinite(Number(count)) ? Number(count) : null,
         });
       });
     }
@@ -306,6 +313,8 @@ export class DragonflyReader {
       const s = key ? states.get(key) : null;
       e.alertState = s?.state ?? null;
       e.alertClosedAt = s?.closedAt ?? null;
+      // The ALERT's occurrence count, not a per-event number.
+      e.alertCount = s?.count ?? null;
     }
 
     return { events, total };

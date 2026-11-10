@@ -503,10 +503,13 @@ wss.on('connection', async (ws) => {
         const key = `${e.source}:${e.type}`;
         const isOpen = openAlerts.has(key);
         const closed = closedMock.get(key);
+        const row = isOpen ? openAlerts.get(key) : closed;
         return {
           ...e,
           alertState: isOpen ? 'open' : (closed ? 'closed' : null),
           alertClosedAt: isOpen ? null : (closed?.closedAt ?? null),
+          // The ALERT's rollup, not a per-event number.
+          alertCount: row?.count ?? null,
         };
       });
       ws.send(JSON.stringify({

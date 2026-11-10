@@ -730,16 +730,30 @@ when", which is what you need when the two disagree. Concretely:
 - see events that never reached the alert fold at all (`applied: 0`)
 - inspect the full record, including fields the tables do not show
 
-**There is no Count column.** It used to be labelled "Msg count" and carried the
-producer's own `Count` payload field — except the `EVT_*` schema has no such field
-and the ingress never adds one, so it rendered a constant **1** on every row. The
-occurrence number an operator cares about is the alert's rollup, which lives on the
-alert hash and is the alert table's `Count`. A column that always reads 1 is worse
-than a blank one: it invites the reader to look for meaning in it.
+**Count is on All events, not on the tail.** It is the **alert's** occurrence rollup —
+how many times the condition has been reported — fetched in the same `HMGET` that
+carries `state`, so it costs nothing extra. It is NOT a per-event number: the `EVT_*`
+schema has no `Count` field and the ingress never adds one, so anything per-event would
+render a constant 1. A cell with no alert hash renders `—`, not `0`, because an expired
+alert is unknown rather than zero.
 
-The dev harness used to fabricate `Count: (i % 5) + 1`, which made the dead field
-look meaningful and hid the problem for as long as it existed. It now emits no
-`Count`, so the mock has the same shape production does.
+The two tables therefore have **different column lists** despite sharing a row
+component:
+
+| | Columns |
+|---|---|
+| Live events | Severity · State · First · Last · Summary · enrichment |
+| All events | Severity · State · First · Last · **Count** · Summary · enrichment |
+
+The tail is one row per DELIVERY, so an alert's rollup repeated on every row of it would
+invite exactly the misreading "three rows, one number, which is which". All events is a
+window over stored events, where "how often did this fire" is a real thing to scan.
+
+The old `Count` column this replaces was labelled "Msg count" and read the producer's
+own payload field — which does not exist, so it rendered a constant **1**. The dev
+harness fabricated `Count: (i % 5) + 1`, which made the dead field look meaningful and
+hid the problem for as long as it existed; it now emits no `Count`, so the mock has the
+same shape production does.
 
 **The tail is NOT seeded from the alert snapshot.** It used to be: on connect the
 gateway sends a `snapshot` of open alerts carrying each one's newest record, and the

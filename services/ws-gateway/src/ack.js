@@ -123,3 +123,36 @@ export function normaliseAck(hash) {
 export function ackFrame(key, ack) {
   return JSON.stringify({ op: 'alert', key, ack });
 }
+
+/**
+ * Validate an inbound `op: close` frame.
+ *
+ * Same shape as `ack`, and the same key rules: closing targets the ALERT
+ * (`source:type`), because that is what the fold maintains and what the UI shows
+ * as a row. Closing an event id would leave the alert row still firing.
+ */
+export function validateClose(frame) {
+  if (!frame || frame.op !== 'close') {
+    return { ok: false, code: 'bad_op', message: 'expected {"op":"close"}' };
+  }
+  if (!isValidAlertKey(frame.key)) {
+    return {
+      ok: false,
+      code: 'bad_key',
+      message: `key must be a non-empty string of at most ${MAX_KEY_LEN} chars`,
+    };
+  }
+  const by = cleanText(frame.by, MAX_BY_LEN) || ANONYMOUS;
+  return { ok: true, key: frame.key, by };
+}
+
+/**
+ * Frame telling clients an alert is gone.
+ *
+ * Reuses `op: alert` with `applied: 3`, which is exactly what a CLOSE event from
+ * a source produces. A separate op would mean two code paths in every client for
+ * one state transition (docs/event-lifecycle.md §5.2).
+ */
+export function closeFrame(key) {
+  return JSON.stringify({ op: 'alert', key, applied: 3, closedBy: 'operator' });
+}

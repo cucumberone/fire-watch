@@ -54,12 +54,32 @@ Server → client:
 Rules:
 
 - `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **broker timestamp** index (`fw:idx:src:*`), so they stay correct even when producer clocks are skewed.
-- `applied` is the alert fold's return code from the worker ([event-lifecycle.md](event-lifecycle.md) §5.2): `0` stale, `1` new occurrence, `2` coalesced, `3` closed. A client must not treat `2` as a new alert entry (it only moves `last_seen`) and must not treat `0` as anything at all. Ignoring the code produces a close/reopen flicker on stale CLOSEs and a count that increments 1 000×/min ([event-lifecycle.md](event-lifecycle.md) §9).
-- `op: alert` frames carry the **coalesced** alert row, not the raw event: `count` is occurrences separated by more than `FW_ALERT_DEDUP_WINDOW`, and `last_seen` moves on every applied repeat. Alert frames are emitted from `fw:ch:alerts`; a client that missed one recovers by re-reading `fw:alert:*` on reconnect rather than by replaying events.
+- `applied` is the alert fold's return code from the worker ([event-lifecycle.md](event-lifecycle.md) §5.2): `0` dropped (duplicate or stale), `1` applied, `3` closed. `2` is a retired alias for `1`. A duplicate never reaches the client at all — the worker's `SET … NX` gate drops it — so treating `0` as an applied event would double-count, and treating it as a close would flicker the row.
+- `op: alert` frames carry an alert row, not the raw event. `count` counts every applied event; a redelivered event is dropped by the worker's `SET … NX` gate before it can affect the count ([event-lifecycle.md](event-lifecycle.md) §5.4). Alert frames are emitted from `fw:ch:alerts`; a client that missed one recovers via the snapshot on reconnect rather than by replaying events.
 - `payload.msgc` may arrive **gzip-compressed** and base64-encoded. The gateway passes it through untouched — it must not decompress, because that adds per-message CPU to every pod for no benefit ([payload-and-compression.md](payload-and-compression.md) §5.1).
 - Raw events are still delivered on `op: event` for the event log. The UI must not compute alert state from them.
 - Backfill is capped (`FW_BACKFILL_MAX`, default 2000 records); when exceeded, reply with `"truncated": true` and let the client narrow its window.
 - Heartbeat: server sends `{"op":"ping"}` every 20s; the client must reply `{"op":"pong"}` within 10s or the socket is closed. Required because an OpenShift router will not report a half-open TCP connection.
+
+### 3.0 Client → server ops
+
+Three ops a client may send after `subscribe`:
+
+| Op | Frame | Effect |
+|---|---|---|
+| `ack` | `{"op":"ack","key":"source:type"}` | claim the episode; first ack wins ([acknowledge.md](acknowledge.md) §4) |
+| `close` | `{"op":"close","key":"source:type"}` | retire the alert as an operator ([acknowledge.md](acknowledge.md) §8.1) |
+| `alerts` | `{"op":"alerts","keys":[...]}` | re-read ack state for the displayed rows |
+
+`close` is confirmed with `{"op":"alert","key":…,"applied":3}` — the same frame a
+source-sent CLOSE produces — so no client needs a second code path to retire a
+row. Both `ack` and `close` answer `no_such_alert` rather than creating a hash: an
+ack-only or close-only hash would render as a phantom row with no severity and no
+count.
+
+Bulk actions are **not** a batched op. The client sends one frame per key, which
+keeps partial failure trivial to reason about and avoids inventing a batch result
+shape the UI would have to render.
 
 ### 3.1 `op: snapshot` — why replaying events is not enough
 

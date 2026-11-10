@@ -127,6 +127,45 @@ Why a menu rather than a button:
 
 An already-acked alert still shows the item, disabled and labelled `Acked by <name>`, so the menu does not change shape between rows.
 
+### 8.1 Close, and bulk actions
+
+The menu carries **Acknowledge**, **Close** and **Information**. Close is an
+operator-initiated retirement, and it deliberately ends in the *same state a
+CLOSE event from the source produces*:
+
+| Write | Why it cannot be skipped |
+|---|---|
+| `DEL fw:alert:open:{key}` | otherwise the alert still reads as firing |
+| `ZREM fw:idx:alert:open` | otherwise the snapshot resurrects a closed alert on every client's next page load — a phantom row nobody can clear |
+| `HSET state=closed severity=CLOSE closed_by=… closed_at=…` | the record itself |
+| `HDEL acked_by acked_at` | the ack belonged to the episode that has just ended |
+
+All four happen in one Lua script, for the same reason the fold is atomic: a
+crash between the hash write and the index removal leaves exactly the phantom row
+above. Verified against Dragonfly: after the call, `state=closed`, the open flag is
+gone and the index entry is removed.
+
+The broadcast frame is `op: alert` with `applied: 3` — the same frame a
+source-sent CLOSE produces — so clients retire the row through the path they
+already have, with no new code path.
+
+**Bulk actions.** Rows select with a plain click, `Shift+click` for a range and
+`Ctrl/Cmd+click` to toggle, and a selection bar offers `Acknowledge N` and
+`Close N`. Three rules:
+
+- Bulk sends **one frame per key**, not a batched op. A batch would need its own
+  partial-failure semantics ("3 of 5 closed, 1 already gone, 1 expired") for no
+  gain: the per-key writes are already cheap.
+- `Acknowledge` is **disabled** when every selected alert is already acked, and
+  the label says how many are actually claimable — a range select can include
+  rows another operator already took.
+- Selection is filtered to keys **still on the board** before sending, so a bulk
+  action never fires at an alert a source closed mid-selection.
+
+Right-clicking inside a multi-row selection targets the whole selection; outside
+it, targets that row alone. Otherwise the menu would contradict what the board
+shows as selected.
+
 ## 9. Verification
 ```bash
 # 1. ack an alert with a real client

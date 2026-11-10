@@ -491,7 +491,28 @@ function useSocket(config) {
     ws.send(JSON.stringify({ op: 'ack', key }));
   }, []);
 
-  return { status, events, alerts, acks, notice, acknowledge };
+  /**
+   * Bulk ack/close.
+   *
+   * One frame per key rather than a batched op, deliberately: a batch op would
+   * need its own partial-failure semantics ("3 of 5 closed, 1 already gone, 1
+   * expired") and the gateway's per-key writes are already cheap. The client
+   * gets individual `op: alert` confirmations and the map settles per key.
+   *
+   * Guarded so a mixed selection does not stall on one already-acked alert:
+   * only keys that still need the action are sent.
+   */
+  const bulk = useCallback((op, keys) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice(`not connected — ${op} not sent`);
+      return 0;
+    }
+    for (const key of keys) ws.send(JSON.stringify({ op, key }));
+    return keys.length;
+  }, []);
+
+  return { status, events, alerts, acks, notice, acknowledge, bulk };
 }
 
 // ------------------------------------------------------------------------ UI
@@ -700,12 +721,19 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
   );
 }
 
-function AlertRow({ alert, ack, onContextMenu }) {
+function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   const acked = Boolean(ack);
   return (
     <tr
-      className={severityRowClass(alert.severity, acked ? 'acked' : '')}
+      className={`${severityRowClass(alert.severity, acked ? 'acked' : '')}${selected ? ' row-selected' : ''}`}
       onContextMenu={onContextMenu}
+      onClick={onSelect}
+      // Selection is pointer state, so the row is not focusable and carries no
+      // button semantics: making a data row behave like a button breaks
+      // screen-reader table navigation. Keyboard users get the same actions via
+      // the context menu's Acknowledge/Information, and bulk actions are an
+      // explicit affordance (see the selection bar) rather than a hidden mode.
+      aria-selected={selected || undefined}
     >
       <td><Badge severity={alert.severity} /></td>
       {/* Order follows the live table: severity, first, last, count, summary.
@@ -773,7 +801,7 @@ function EventRow({ evt, onContextMenu }) {
 
 function App() {
   const { config, error } = useConfig();
-  const { status, events, alerts, acks, notice, acknowledge } = useSocket(config);
+  const { status, events, alerts, acks, notice, acknowledge, bulk } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
   // The live tail is a diagnostic view, not the primary signal. Closed by
   // default so the alert table owns the screen; the count stays in the handle
@@ -830,6 +858,85 @@ function App() {
     [alerts],
   );
 
+  // ------------------------------------------------------------- selection
+  // A Set of alert keys. Selection is deliberately client-side only: it is a
+  // transient pointer state, not a fact about the alert, so persisting it (or
+  // syncing it) would only create disagreement between operators.
+  const [selected, setSelected] = useState(() => new Set());
+  // Anchor for shift-range selection: the last row clicked without shift.
+  const anchorRef = useRef(null);
+
+  /**
+   * Click behaviour, the usual file-manager convention:
+   *
+   *   plain click   select only this row (and move the anchor)
+   *   shift+click   select the range from the anchor to this row
+   *   ctrl/cmd+click toggle this row, leaving the rest alone
+   *
+   * The anchor is what makes shift-click predictable. Without it, shift+click
+   * would select from whatever happened to be selected last, which after a
+   * shift-range is the far end of that range and not where the operator started.
+   */
+  const selectRow = useCallback((key, e) => {
+    const additive = e.metaKey || e.ctrlKey;
+    const range = e.shiftKey;
+
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (range && anchorRef.current !== null) {
+        const keys = sortedAlerts.map((a) => a.key);
+        const from = keys.indexOf(anchorRef.current);
+        const to = keys.indexOf(key);
+        if (from === -1 || to === -1) {
+          next.clear();
+          next.add(key);
+          return next;
+        }
+        // An additive shift-range adds to the existing selection; a plain one
+        // replaces it. Both include the anchor and the clicked row.
+        if (!additive) next.clear();
+        const [lo, hi] = from <= to ? [from, to] : [to, from];
+        for (let i = lo; i <= hi; i += 1) next.add(keys[i]);
+        return next;
+      }
+      if (additive) {
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        anchorRef.current = key;
+        return next;
+      }
+      next.clear();
+      next.add(key);
+      anchorRef.current = key;
+      return next;
+    });
+  }, [sortedAlerts]);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    anchorRef.current = null;
+  }, []);
+
+  // Escape clears the selection, matching the convention that Escape backs out
+  // of a mode rather than leaving rows armed.
+  useEffect(() => {
+    if (selected.size === 0) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') clearSelection(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [selected.size, clearSelection]);
+
+  // Drop keys that are no longer on the board, so a bulk action cannot fire at
+  // an alert that has already been closed by a source.
+  const liveSelection = useMemo(
+    () => [...selected].filter((k) => alerts.has(k)),
+    [selected, alerts],
+  );
+
+  const selectedAlertKeys = liveSelection;
+  const selectedAckable = selectedAlertKeys.filter((k) => !acks.has(k));
+  const selectedUnacked = selectedAckable.length;
+
   if (error) {
     return <main><h1>Fire-Watch</h1><p className="error">Cannot load config.json: {error}</p></main>;
   }
@@ -882,7 +989,43 @@ function App() {
             reset columns
           </button>
         </h2>
-        <p className="hint dim">Right-click a row for Acknowledge or Information. Drag a column edge to widen it.</p>
+        <p className="hint dim">
+          Click to select, Shift+click for a range, Ctrl/Cmd+click to toggle.
+          Right-click for Acknowledge, Close or Information. Drag a column edge to widen it.
+        </p>
+        {/* Bulk actions. Appears only when something is selected, so the normal
+            case has no extra chrome; the count is stated because a range select
+            can grab far more rows than the operator counted. */}
+        {selectedAlertKeys.length > 0 ? (
+          <div className="selbar" role="region" aria-label="Selection actions">
+            <span className="selbar-count">
+              {selectedAlertKeys.length} selected
+              {selectedUnacked > 0 && selectedUnacked !== selectedAlertKeys.length
+                ? ` · ${selectedUnacked} unacknowledged`
+                : ''}
+            </span>
+            <button
+              className="selbar-btn"
+              onClick={() => bulk('ack', selectedAckable)}
+              disabled={selectedAckable.length === 0}
+              title={selectedAckable.length === 0
+                ? 'Every selected alert is already acknowledged'
+                : `Acknowledge ${selectedAckable.length} alert(s)`}
+            >
+              Acknowledge{selectedAckable.length > 1 ? ` ${selectedAckable.length}` : ''}
+            </button>
+            <button
+              className="selbar-btn selbar-close"
+              onClick={() => bulk('close', selectedAlertKeys)}
+              title={`Close ${selectedAlertKeys.length} alert(s)`}
+            >
+              Close{selectedAlertKeys.length > 1 ? ` ${selectedAlertKeys.length}` : ''}
+            </button>
+            <button className="link" onClick={clearSelection} title="Clear the selection (Esc)">
+              clear
+            </button>
+          </div>
+        ) : null}
         {sortedAlerts.length === 0
           ? <p className="dim">No open alerts.</p>
           : (
@@ -915,23 +1058,44 @@ function App() {
               )}
               rows={sortedAlerts.map((a) => {
                 const ack = acks.get(a.key);
+                // Right-clicking inside a multi-row selection acts on the whole
+                // selection, not just the row under the pointer: otherwise the
+                // menu would silently contradict what the board shows as
+                // selected. Right-clicking outside it targets that row alone.
+                const isSelected = selected.has(a.key);
+                const targets = isSelected && selectedAlertKeys.length > 1
+                  ? selectedAlertKeys
+                  : [a.key];
+                const ackTargets = targets.filter((k) => !acks.has(k));
                 return (
                   <AlertRow
                     key={a.key}
                     alert={a}
                     ack={ack}
+                    selected={isSelected}
+                    onSelect={(e) => selectRow(a.key, e)}
                     onContextMenu={(e) => openInspector(
                       e,
                       a.event?.wire ?? a.event ?? a,
-                      a.key,
-                      [{
-                        label: ack ? `Acked by ${ack.by}` : 'Acknowledge',
-                        disabled: Boolean(ack),
-                        title: ack
-                          ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
-                          : 'Claim this alert; it clears when the alert re-fires',
-                        run: () => acknowledge(a.key),
-                      }],
+                      targets.length > 1 ? `${targets.length} alerts` : a.key,
+                      [
+                        {
+                          label: ackTargets.length > 1
+                            ? `Acknowledge ${ackTargets.length}`
+                            : (ack ? `Acked by ${ack.by}` : 'Acknowledge'),
+                          disabled: ackTargets.length === 0,
+                          title: ackTargets.length === 0
+                            ? 'Already acknowledged — the ack survives until the alert re-fires'
+                            : 'Claim these alerts; an ack clears when the alert re-fires',
+                          run: () => bulk('ack', ackTargets),
+                        },
+                        {
+                          label: targets.length > 1 ? `Close ${targets.length}` : 'Close',
+                          disabled: false,
+                          title: 'Retire these alerts. Same end state as a CLOSE event from the source',
+                          run: () => bulk('close', targets),
+                        },
+                      ],
                     )}
                   />
                 );
@@ -1017,14 +1181,22 @@ function App() {
                         ev,
                         e.wire ?? e,
                         `${e.source} · ${e.type}`,
-                        [{
-                          label: ack ? `Acked by ${ack.by}` : 'Acknowledge alert',
-                          disabled: Boolean(ack),
-                          title: ack
-                            ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
-                            : `Acknowledge ${ackKey}`,
-                          run: () => acknowledge(ackKey),
-                        }],
+                        [
+                          {
+                            label: ack ? `Acked by ${ack.by}` : 'Acknowledge alert',
+                            disabled: Boolean(ack),
+                            title: ack
+                              ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
+                              : `Acknowledge ${ackKey}`,
+                            run: () => acknowledge(ackKey),
+                          },
+                          {
+                            label: 'Close alert',
+                            disabled: false,
+                            title: `Retire ${ackKey}`,
+                            run: () => bulk('close', [ackKey]),
+                          },
+                        ],
                       )}
                     />
                   );

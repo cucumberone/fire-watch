@@ -315,6 +315,75 @@ export class DragonflyReader {
    *    failover: re-resolve the master once, then fail. The caller reports the
    *    failure to the client; it must not be swallowed.
    */
+  /**
+   * Close an alert on behalf of an operator.
+   *
+   * Writes the same end-state the worker's fold produces for a CLOSE event, so
+   * an operator-closed alert is indistinguishable from a source-closed one
+   * downstream (the board, the alert hash, the open index). That matters: two
+   * different notions of "closed" in one store is how phantom rows appear.
+   *
+   * Deliberately a named method with a fixed script rather than a general write
+   * escape hatch, same rule as ackAlert. The three writes it must make:
+   *
+   *   1. DEL fw:alert:open:{key}   — otherwise the alert still reads as firing
+   *   2. ZREM fw:idx:alert:open    — otherwise the snapshot resurrects it on
+   *                                  every client's next page load
+   *   3. HSET state=closed …       — plus HDEL the ack, which belongs to the
+   *                                  episode that has just ended
+   *
+   * Returns 'missing' when the alert hash does not exist, mirroring ackAlert:
+   * closing a nonexistent alert must not create one.
+   */
+  async closeAlert(hashKey, by, nowMs, ttlMs, indexKey = 'fw:idx:alert:open', bareKey = '') {
+    const script = `
+      if redis.call('EXISTS', KEYS[1]) == 0 then
+        return {'missing'}
+      end
+      redis.call('DEL', KEYS[2])
+      redis.call('ZREM', KEYS[3], ARGV[4])
+      redis.call('HSET', KEYS[1],
+        'state', 'closed',
+        'severity', 'CLOSE',
+        'closed_by', ARGV[1],
+        'closed_at', ARGV[2],
+        'watermark', ARGV[2],
+        'watermark_id', ARGV[3])
+      redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
+      redis.call('PEXPIRE', KEYS[1], ARGV[5])
+      return {'closed', ARGV[1], ARGV[2]}
+    `;
+    const openKey = hashKey.replace(/^fw:alert:/, 'fw:alert:open:');
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const c = await this.connect();
+      try {
+        const res = await c.eval(
+          script,
+          3,
+          hashKey,
+          openKey,
+          indexKey,
+          by,
+          String(nowMs),
+          `operator-close-${nowMs}`,
+          bareKey || hashKey.replace(/^fw:alert:/, ''),
+          String(ttlMs),
+        );
+        const [status, closedBy, closedAt] = res;
+        if (status === 'missing') return { status: 'missing' };
+        return { status: 'closed', by: closedBy, at: Number(closedAt) };
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');
+        if (!retryable || attempt === 1) throw err;
+        this.log.warn('close write hit a demoted node, re-resolving master', { err: msg });
+        await this.reset();
+      }
+    }
+    throw new Error('unreachable');
+  }
+
   async ackAlert(hashKey, by, nowMs, ttlMs) {
     const script = `
       if redis.call('EXISTS', KEYS[1]) == 0 then

@@ -28,9 +28,11 @@ import {
 import {
   validateAck,
   validateAlertQuery,
+  validateClose,
   ackAlertKey,
   normaliseAck,
   ackFrame,
+  closeFrame,
 } from './ack.js';
 
 const cfg = loadConfig();
@@ -137,6 +139,11 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'ack') {
       await handleAck(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'close') {
+      await handleClose(conn, frame, send);
       return;
     }
 
@@ -311,6 +318,62 @@ async function handleAck(conn, frame, send) {
  * connect is exactly the unbounded read the design forbids
  * (websocket-server.md §3).
  */
+/**
+ * Close an alert on behalf of an operator.
+ *
+ * Same shape as handleAck: validate, one narrow Lua write, confirm to the
+ * originator, broadcast so other pods' clients see it immediately.
+ *
+ * The broadcast frame is `op: alert` with `applied: 3` — the same frame a
+ * source-sent CLOSE produces — so clients need no new code path to retire a row.
+ */
+async function handleClose(conn, frame, send) {
+  const verdict = validateClose(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  const hashKey = ackAlertKey(verdict.key);
+  let result;
+  try {
+    result = await reader.closeAlert(hashKey, verdict.by, Date.now(), cfg.alertTtlMs);
+  } catch (err) {
+    log.error('close write failed', { key: verdict.key, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'close_failed',
+      message: 'could not close the alert, retry',
+    }));
+    return;
+  }
+
+  if (result.status === 'missing') {
+    // Same rule as ack: never create a hash just to close it, or a phantom row
+    // with no severity and no count appears on every board.
+    send(JSON.stringify({
+      op: 'error',
+      code: 'no_such_alert',
+      message: 'that alert no longer exists',
+    }));
+    return;
+  }
+
+  // Confirm to the originator, then fan out to the other pods.
+  send(closeFrame(verdict.key));
+
+  try {
+    await reader.publish(cfg.channelAlerts, JSON.stringify({
+      kind: 'close',
+      key: verdict.key,
+    }));
+  } catch (err) {
+    // The write is durable already; other pods will simply not see the frame and
+    // their clients keep the row until they reload. Loud, because it diverges.
+    log.error('close broadcast failed after a durable write', { key: verdict.key, err: String(err) });
+  }
+}
+
 async function handleAlertQuery(conn, frame, send) {
   const verdict = validateAlertQuery(frame);
   if (!verdict.ok) {
@@ -375,6 +438,16 @@ function handleAlertMessage(raw) {
   // new state without a re-read (docs/acknowledge.md §5).
   if (parsed.kind === 'ack') {
     const frame = ackFrame(parsed.key, parsed.ack);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
+  // An operator close travels on the same channel and fans out as applied: 3,
+  // so clients retire the row through the path they already have.
+  if (parsed.kind === 'close') {
+    const frame = closeFrame(parsed.key);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

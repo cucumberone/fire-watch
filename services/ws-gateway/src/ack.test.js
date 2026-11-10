@@ -13,10 +13,12 @@ import {
   MAX_KEY_LEN,
   ackAlertKey,
   ackFrame,
+  closeFrame,
   isValidAlertKey,
   normaliseAck,
   validateAck,
   validateAlertQuery,
+  validateClose,
 } from './ack.js';
 
 // ------------------------------------------------------------------ key rules
@@ -130,4 +132,31 @@ test('ackFrame is a JSON alert frame carrying the ack', () => {
   assert.equal(frame.op, 'alert');
   assert.equal(frame.key, 'a:b');
   assert.deepEqual(frame.ack, { by: 'gunnar', at: 1 });
+});
+
+// --------------------------------------------------------------------- close
+// A close retires the alert, so its validation must be exactly as strict as ack:
+// a loose key here would let a client target a hash it should not touch.
+test('validateClose accepts a normal alert key and defaults the operator', () => {
+  const v = validateClose({ op: 'close', key: 'shop:check-001' });
+  assert.equal(v.ok, true);
+  assert.equal(v.key, 'shop:check-001');
+  assert.equal(v.by, ANONYMOUS);
+});
+
+test('validateClose rejects a wrong op or a bad key', () => {
+  assert.equal(validateClose({ op: 'ack', key: 'a:b' }).ok, false);
+  assert.equal(validateClose({ op: 'close', key: '' }).ok, false);
+  assert.equal(validateClose({ op: 'close', key: 'x'.repeat(MAX_KEY_LEN + 1) }).ok, false);
+  assert.equal(validateClose({ op: 'close', key: 'a\u0000b' }).ok, false);
+});
+
+test('closeFrame is an alert frame with applied 3', () => {
+  // Reusing the CLOSE-event frame shape means clients need no new code path to
+  // retire a row: it is the same frame a source-sent CLOSE produces.
+  const f = JSON.parse(closeFrame('a:b'));
+  assert.equal(f.op, 'alert');
+  assert.equal(f.key, 'a:b');
+  assert.equal(f.applied, 3);
+  assert.equal(f.closedBy, 'operator');
 });

@@ -797,11 +797,35 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'deleted') {
-      // An event record is gone for good. Drop it from the live tail so the row
-      // stops claiming a record exists. The alert row is NOT touched: `count` is
-      // owned by the fold, and silently decrementing it here would disagree with
-      // the stored state until the next write.
+      // An event record is gone for good, so every list that was showing it must
+      // stop claiming it exists. This used to touch the live tail only, which made
+      // delete look broken on any other tab: the record was gone from storage while
+      // the All events row sat there.
+      //
+      // The alert ROW stays. `count` is owned by the fold, and decrementing it here
+      // would disagree with the stored state until the next write
+      // (docs/acknowledge.md §10.1). What is dropped is the row's reference to the
+      // dead record, so it stops offering an id that resolves to nothing.
       setEvents((prev) => prev.filter((e) => e.id !== frame.id));
+      setAllEvents((prev) => (prev.events.some((e) => e.id === frame.id)
+        ? { ...prev, events: prev.events.filter((e) => e.id !== frame.id) }
+        : prev));
+      setAlerts((prev) => {
+        let changed = false;
+        const next = new Map(prev);
+        for (const [key, row] of next) {
+          if (row?.event?.id !== frame.id) continue;
+          next.set(key, { ...row, event: undefined });
+          changed = true;
+        }
+        return changed ? next : prev;
+      });
+      setClosedState((prev) => (prev.alerts.some((r) => r?.event?.id === frame.id)
+        ? {
+          ...prev,
+          alerts: prev.alerts.map((r) => (r?.event?.id === frame.id ? { ...r, event: undefined } : r)),
+        }
+        : prev));
       return;
     }
     if (frame.op === 'error') {
@@ -1054,10 +1078,12 @@ function useSocket(config) {
   /**
    * Permanently delete one event.
    *
-   * The only irreversible action in the UI, so it asks first. `confirm()` rather
-   * than a custom dialog deliberately: the browser's modal is unmissable, cannot
-   * be dismissed by an outside click, and cannot be styled into something that
-   * looks like a normal menu item.
+   * NO CONFIRMATION DIALOG. It had a `window.confirm()`, on the reasoning that the
+   * only irreversible action in the UI should ask first. In practice the dialog was
+   * the wrong affordance here: delete already requires right-click → a menu → a red
+   * item naming the event id, which is three deliberate steps, and a native modal on
+   * top of that is friction that trains an operator to dismiss it without reading.
+   * The menu item is styled red and names the id; that is the confirmation.
    *
    * Confirmed in the same place as ack and close — the `deleted` broadcast — so a
    * delete made on another pod removes the row here too.
@@ -1068,13 +1094,6 @@ function useSocket(config) {
       setNotice('not connected — delete not sent');
       return;
     }
-    // eslint-disable-next-line no-alert
-    const ok = window.confirm(
-      `Permanently delete event ${id}?\n\n` +
-      'This removes the stored record and cannot be undone. There is no audit ' +
-      'copy for an operator delete.',
-    );
-    if (!ok) return;
     ws.send(JSON.stringify({ op: 'delete', id }));
   }, []);
 
@@ -1974,33 +1993,20 @@ function App() {
                           title: 'Retire these alerts. Same end state as a CLOSE event from the source',
                           run: () => bulk('close', targets),
                         },
-                        {
-                          // Delete targets the event RECORD behind this alert,
-                          // not the alert itself: an alert is an aggregate over
-                          // many events, and "remove the alert" is Close.
-                          //
-                          // Only offered when the row's backing event is known.
-                          // An alert loaded from a snapshot may have no `event`
-                          // attached (its record expired), and offering a delete
-                          // that cannot resolve an id would be a menu item that
-                          // always errors.
-                          label: targets.length > 1
-                            ? `Delete ${targets.length} event(s)`
-                            : 'Delete event',
-                          disabled: !a.event?.id && targets.length === 1,
-                          title: targets.length > 1
-                            ? 'Permanently delete the event record behind each selected alert'
-                            : (a.event?.id
-                              ? `Permanently delete event ${a.event.id}. Cannot be undone.`
-                              : 'No event record is attached to this alert'),
-                          run: () => {
-                            const ids = targets
-                              .map((k) => alerts.get(k)?.event?.id)
-                              .filter(Boolean);
-                            for (const id of ids) deleteEvent(id);
-                          },
-                          danger: true,
-                        },
+                        // NO Delete here. An alert row aggregates many events, so
+                        // "delete" could only mean "delete the newest one", which
+                        // would leave the row showing a record that no longer exists
+                        // and change nothing an operator can see. Delete lives on the
+                        // EVENT rows (Live events, All events) where there is exactly
+                        // one record and the operator is looking at it
+                        // (docs/acknowledge.md §10.2).
+                        //
+                        // It used to be offered here, gated on `a.event?.id` — and
+                        // the gate was wrong for a multi-row selection (`&&
+                        // targets.length === 1` meant the item stayed enabled while
+                        // every id failed to resolve, so it silently did nothing).
+                        // That is the "Delete does not work" report: a menu item that
+                        // was clickable and had no effect.
                       ],
                     )}
                   />

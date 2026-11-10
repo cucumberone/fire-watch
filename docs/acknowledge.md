@@ -258,7 +258,20 @@ accidental outside click and must not look like the menu item above it. The menu
 item itself is styled red (`inspector-danger`) for the same reason.
 
 `op: delete` appears only on **live-events rows**, where an event id exists.
-The alert table has no per-event rows to delete.
+The alert table has no per-event rows to delete, and offering it there was actively
+broken: the menu item was gated on `a.event?.id && targets.length === 1`, so with a
+multi-row selection it stayed ENABLED while every id failed to resolve — a clickable
+item that silently did nothing. That is the "right-click Delete does not work" report.
+An alert row aggregates many events, so "delete" could only ever mean "delete the
+newest one", leaving the row pointing at a record that no longer exists. Delete lives
+on the event rows (Live events, All events), where there is exactly one record and the
+operator is looking at it.
+
+**No confirmation dialog.** Delete used to open a `window.confirm()`, on the reasoning
+that the only irreversible action should ask first. It was removed: reaching a delete
+already takes right-click → menu → a red item naming the event id, which is three
+deliberate steps, and a native modal on top of that trains an operator to dismiss it
+without reading. The red item naming the id *is* the confirmation.
 
 ### 10.3 Verification
 

@@ -332,6 +332,41 @@ wss.on('connection', async (ws) => {
       return;
     }
 
+    // ---- op: delete — remove one event record, mirroring handleDelete in the
+    // gateway. The mock used to ignore this op entirely, so right-click → Delete
+    // did NOTHING locally: the frame went out and no reply came back, which looks
+    // exactly like a frontend bug. The harness has to answer the ops the UI sends,
+    // or it turns every one of them into a false report.
+    if (frameIn.op === 'delete') {
+      const id = frameIn.id;
+      if (typeof id !== 'string' || id === '') {
+        ws.send(JSON.stringify({ op: 'error', code: 'bad_id', message: 'id required' }));
+        return;
+      }
+      if (!mockEventLog.has(id)) {
+        ws.send(JSON.stringify({ op: 'error', code: 'no_such_event',
+          message: 'that event no longer exists' }));
+        return;
+      }
+      mockEventLog.delete(id);
+      // The alert aggregate keeps its count (the fold owns it) but loses the
+      // reference to the dead record, same as the real gateway's clients.
+      for (const [key, row] of openAlerts) {
+        if (row.event?.id === id) openAlerts.set(key, { ...row, event: undefined });
+      }
+      for (const [key, row] of closedMock) {
+        if (row.event?.id === id) closedMock.set(key, { ...row, event: undefined });
+      }
+      // Broadcast, like fw:ch:alerts: a delete on one connection must clear the row
+      // on every other.
+      for (const client of wss.clients) {
+        if (client.readyState === client.OPEN) {
+          client.send(JSON.stringify({ op: 'deleted', id }));
+        }
+      }
+      return;
+    }
+
     // ---- op: closed — the recently retired alerts, mirroring handleClosedQuery.
     // Built from the mock's own retired set so the tab shows something coherent
     // with the rest of the demo, rather than a hard-coded fixture that contradicts

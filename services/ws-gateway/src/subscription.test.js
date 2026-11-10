@@ -13,6 +13,7 @@ import {
   eventFrame,
   alertFrame,
   shouldFanOut,
+  foldDbProbe,
 } from './subscription.js';
 
 const limits = { maxSubscriptions: 20, existing: 0 };
@@ -319,4 +320,55 @@ test('POD_NAME is defined once and used by the hello frame too', () => {
   assert.match(SRC, /const POD_NAME = process\.env\.POD_NAME \|\| 'local'/);
   assert.doesNotMatch(SRC, /process\.env\.POD_NAME \|\| 'local'\}`/,
     'the hello frame must reuse the constant, not re-read the env var');
+});
+
+// ------------------------------------------- Dragonfly health reporting rules
+test('a single failed probe does NOT report the database as down', () => {
+  // One failed PING is indistinguishable from a demoted master or a network blip.
+  // Reporting it would make the indicator flicker on noise.
+  let s = { up: true, fails: 0 };
+  s = foldDbProbe(s, false, 3, 1);
+  assert.equal(s.up, true, 'still up after 1 failure');
+  assert.equal(s.changed, false, 'no frame worth sending');
+  assert.equal(s.fails, 1);
+});
+
+test('the third consecutive failure flips to DOWN and reports a change', () => {
+  let s = { up: true, fails: 0 };
+  s = foldDbProbe(s, false, 3, 1);
+  s = foldDbProbe(s, false, 3, 2);
+  assert.equal(s.up, true, 'two failures is not yet an outage');
+  s = foldDbProbe(s, false, 3, 3);
+  assert.equal(s.up, false, 'three failures is DOWN');
+  assert.equal(s.changed, true, 'this is the frame that must be pushed');
+});
+
+test('further failures while DOWN do not re-send the frame', () => {
+  let s = { up: true, fails: 0 };
+  for (let i = 0; i < 3; i += 1) s = foldDbProbe(s, false, 3, i);
+  assert.equal(s.up, false);
+  const again = foldDbProbe(s, false, 3, 9);
+  assert.equal(again.up, false);
+  assert.equal(again.changed, false, 'still down is not a state change');
+});
+
+test('one success recovers immediately and resets the counter', () => {
+  let s = { up: true, fails: 0 };
+  for (let i = 0; i < 3; i += 1) s = foldDbProbe(s, false, 3, i);
+  const back = foldDbProbe(s, true, 3, 99);
+  assert.equal(back.up, true);
+  assert.equal(back.changed, true, 'recovery is a transition worth pushing');
+  assert.equal(back.fails, 0, 'the counter resets, or the next outage is misjudged');
+});
+
+test('a success while already up is not a change', () => {
+  const s = foldDbProbe({ up: true, fails: 2 }, true, 3, 1);
+  assert.equal(s.up, true);
+  assert.equal(s.changed, false, 'healthy to healthy sends nothing');
+});
+
+test('a threshold of 1 reports the first failure', () => {
+  const s = foldDbProbe({ up: true, fails: 0 }, false, 1, 1);
+  assert.equal(s.up, false);
+  assert.equal(s.changed, true);
 });

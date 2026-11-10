@@ -631,3 +631,29 @@ export function tabBadgeCount(tabId, counts) {
       throw new Error(`tabBadgeCount: unknown tab "${tabId}" — give it an explicit count`);
   }
 }
+
+/**
+ * Visual state of the link between the connection chip and the database chip.
+ *
+ * `ok` only when BOTH are healthy. That is the whole point of the pair: a socket can
+ * be perfectly connected while the gateway cannot read, which is a stale board with a
+ * green chip. Showing the combined state on the line means "all connections are fine"
+ * is one glance rather than two readings.
+ *
+ * Three states rather than two, because "not told yet" is not the same as "down".
+ * Rendering unknown as red would cry wolf on every page load; rendering it as green
+ * would be a lie.
+ *
+ * @param {string} socket  socket status: idle | connecting | connected | reconnecting | misconfigured
+ * @param {boolean|null} db  database health; null means not reported yet
+ */
+export function linkState(socket, db) {
+  // A known-bad socket is BAD, whatever the database says: the browser cannot reach
+  // the gateway, so the whole path is down. Reporting `unknown` here would dress a
+  // definite failure up as uncertainty.
+  if (socket === 'reconnecting' || socket === 'misconfigured') return 'bad';
+  // `idle`/`connecting` genuinely are unknown — nothing has been attempted yet.
+  if (socket !== 'connected') return 'unknown';
+  if (db === null || db === undefined) return 'unknown';
+  return db ? 'ok' : 'bad';
+}

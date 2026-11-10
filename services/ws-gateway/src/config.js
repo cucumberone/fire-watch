@@ -51,6 +51,20 @@ export function loadConfig() {
     maxOutboundQueue: int('FW_MAX_OUTBOUND_QUEUE', 1000),
     idleTimeoutMs: int('FW_IDLE_TIMEOUT_MS', 300000),
     heartbeatMs: int('FW_HEARTBEAT_MS', 20000),
+    // How often to PING Dragonfly and report its health to clients.
+    //
+    // This is the only thing that lets the UI show the DATABASE being down rather
+    // than just the socket: a client can be perfectly connected to a gateway whose
+    // reads are failing. 10s is frequent enough to notice an incident and cheap
+    // enough to ignore — one PING per pod per interval, not per client.
+    dbProbeMs: int('FW_DB_PROBE_MS', 10000),
+    // Consecutive failed probes before the database is reported as down.
+    //
+    // One failed PING is not proof of an outage: a demoted master, a Sentinel
+    // re-resolve and a brief network blip all look identical. Reporting the first
+    // failure would make the indicator flicker red on noise, which trains an
+    // operator to ignore it — worse than not having the indicator.
+    dbFailThreshold: int('FW_DB_FAIL_THRESHOLD', 3),
     pongTimeoutMs: int('FW_PONG_TIMEOUT_MS', 10000),
 
     // Acks live on the alert hash, so they expire with it. Only extended, never

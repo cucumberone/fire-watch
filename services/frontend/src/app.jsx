@@ -42,6 +42,7 @@ import {
   closedSeverities,
   filterEvents,
   tabBadgeCount,
+  linkState,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -295,6 +296,33 @@ function readWidths(table) {
   }
 }
 
+/**
+ * Widths are stored per COLUMN NAME, never by index.
+ *
+ * They used to be keyed by position, which is silently wrong the moment a column
+ * is added or removed: deleting the "Msg count" column shifted every index past it,
+ * so an operator's saved widths were reapplied one column to the left. Nothing
+ * errored — the table just came back with the wrong columns wide, and the only way
+ * to notice was to remember what it looked like before.
+ *
+ * Keying by label means a removed column's entry is simply ignored, and a new one
+ * starts at its default.
+ */
+function migrateWidths(table, cols) {
+  const saved = readWidths(table);
+  const byName = {};
+  let changed = false;
+  for (let i = 0; i < cols.length; i += 1) {
+    // A name-keyed entry wins; a legacy index-keyed one is accepted once, so an
+    // existing layout is not thrown away on upgrade.
+    const v = saved[cols[i]] ?? saved[String(i)];
+    if (typeof v === 'number' && Number.isFinite(v)) byName[cols[i]] = v;
+    if (String(i) in saved) changed = true;
+  }
+  if (changed) writeWidths(table, byName);   // rewrite in the new shape
+  return byName;
+}
+
 function writeWidths(table, widths) {
   try {
     window.localStorage.setItem(COL_WIDTH_KEY(table), JSON.stringify(widths));
@@ -315,18 +343,21 @@ function writeWidths(table, widths) {
  */
 const MIN_COL_WIDTH = 48;
 
-function useColumnWidths(table, defaults) {
-  const [overrides, setOverrides] = useState(() => readWidths(table));
+function useColumnWidths(table, cols, defaults) {
+  const [overrides, setOverrides] = useState(() => migrateWidths(table, cols));
 
-  // Effective width for a column: the operator's value, else the default.
+  // Effective width for a column: the operator's value, else the default. Keyed by
+  // LABEL, so adding or removing a column cannot shift a saved width onto its
+  // neighbour.
   const widthOf = useCallback(
-    (index) => Math.max(MIN_COL_WIDTH, overrides[index] ?? defaults[index] ?? MIN_COL_WIDTH),
-    [overrides, defaults],
+    (index) => Math.max(MIN_COL_WIDTH, overrides[cols[index]] ?? defaults[index] ?? MIN_COL_WIDTH),
+    [overrides, cols, defaults],
   );
 
   const beginResize = useCallback((index) => (event) => {
     event.preventDefault();
     event.stopPropagation();
+    const name = cols[index];
     const startX = event.clientX;
     const startWidth = widthOf(index);
 
@@ -334,7 +365,7 @@ function useColumnWidths(table, defaults) {
     // handle almost immediately, and a handle-local listener would stop tracking.
     const onMove = (e) => {
       const next = Math.max(MIN_COL_WIDTH, startWidth + (e.clientX - startX));
-      setOverrides((prev) => ({ ...prev, [index]: next }));
+      setOverrides((prev) => ({ ...prev, [name]: next }));
     };
     const onUp = () => {
       document.removeEventListener('mousemove', onMove);
@@ -352,14 +383,12 @@ function useColumnWidths(table, defaults) {
     document.body.classList.add('resizing');
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [table, widthOf]);
+  }, [table, cols, widthOf]);
 
-  const reset = useCallback(() => {
-    setOverrides({});
-    writeWidths(table, {});
-  }, [table]);
-
-  return { widthOf, beginResize, reset };
+  // No `reset`. The "reset columns" button is gone: widths persist per column NAME
+  // now, so a stored layout can never be corrupted by adding or removing a column —
+  // which was the only thing the button was recovering from.
+  return { widthOf, beginResize };
 }
 
 /**
@@ -410,6 +439,10 @@ function useConfig() {
 // --------------------------------------------------------------------- socket
 function useSocket(config) {
   const [status, setStatus] = useState('idle');
+  // Dragonfly health as reported by the gateway. `null` means "not told yet", which
+  // renders differently from "told, and it is down" — an unknown state must never
+  // look like a healthy one.
+  const [dbUp, setDbUp] = useState(null);
   const [events, setEvents] = useState([]);
   const [alerts, setAlerts] = useState(new Map());
   // Ack state is keyed by alert key and lives apart from the alert rows: the
@@ -659,8 +692,17 @@ function useSocket(config) {
       }
       return;
     }
+    if (frame.op === 'db') {
+      // The gateway probes Dragonfly and pushes only on CHANGE, so this frame is a
+      // transition worth showing, not routine traffic.
+      setDbUp(Boolean(frame.up));
+      return;
+    }
     if (frame.op === 'hello') {
       if (frame.truncated) setNotice('Backfill was truncated — narrow the time window.');
+      // The initial database state, so a client joining mid-outage does not have to
+      // wait for the next probe tick to find out.
+      if (frame.db && typeof frame.db.up === 'boolean') setDbUp(frame.db.up);
       return;
     }
     if (frame.op === 'deleted') {
@@ -726,7 +768,7 @@ function useSocket(config) {
 
     ws.onopen = () => {
       attemptRef.current = 0;
-      setStatus('open');
+      setStatus('connected');
       setNotice(null);
       // Resume from the last event we saw, minus a small overlap, so a reconnect
       // does not leave a gap. Overlap is de-duplicated by id on the server side
@@ -991,10 +1033,35 @@ function useSocket(config) {
     status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
     loadClosed, closed: closedState,
     loadAllEvents, allEvents,
+    dbUp,
   };
 }
 
 // ------------------------------------------------------------------------ UI
+/**
+ * The line between the connection chip and the database chip.
+ *
+ * Its colour is the COMBINED state, so the pair reads as one statement instead of
+ * two independent ones. The rule lives in `lib.js` (`linkState`) so it can be tested
+ * without a DOM.
+ *
+ * The pulse is CSS-only (`@keyframes`), and it runs ONLY when everything is healthy.
+ * A pulsing line means "this path is live"; pulsing it in a failure state would add
+ * motion at the moment an operator is trying to read the screen. `prefers-reduced-
+ * motion` switches it off entirely.
+ */
+function HealthLink({ socket, db }) {
+  const state = linkState(socket, db);
+  return (
+    <span
+      className={`healthlink healthlink-${state}`}
+      aria-hidden="true"
+      // Not announced: it carries no information a screen reader user does not
+      // already get from the two chips either side of it.
+    />
+  );
+}
+
 function Badge({ severity, label }) {
   // Severity can be absent on a row that was incremented by a content-duplicate
   // frame: that frame carries no event, so there is nothing to read it from
@@ -1388,7 +1455,7 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
-    loadClosed, closed, loadAllEvents, allEvents,
+    loadClosed, closed, loadAllEvents, allEvents, dbUp,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
   // Which tab is showing. Persisted as a workspace preference, in the same spirit
@@ -1414,26 +1481,23 @@ function App() {
   const {
     widthOf: alertWidthOf,
     beginResize: beginAlertResize,
-    reset: resetAlertWidths,
-  } = useColumnWidths('alerts', ALERT_DEFAULT_W);
+  } = useColumnWidths('alerts', ALERT_COLS, ALERT_DEFAULT_W);
   const {
     widthOf: eventWidthOf,
     beginResize: beginEventResize,
-    reset: resetEventWidths,
-  } = useColumnWidths('events', EVENT_DEFAULT_W);
+  } = useColumnWidths('events', EVENT_COLS, EVENT_DEFAULT_W);
 
   const {
     widthOf: closedWidthOf,
     beginResize: beginClosedResize,
-    reset: resetClosedWidths,
-  } = useColumnWidths('closed', CLOSED_DEFAULT_W);
+  } = useColumnWidths('closed', CLOSED_COLS, CLOSED_DEFAULT_W);
 
   // Its own width state: the All Events table has the same columns as the live
   // tail but is a different table, and sizing one must not resize the other.
   const {
     widthOf: allWidthOf,
     beginResize: beginAllResize,
-  } = useColumnWidths('all', EVENT_DEFAULT_W);
+  } = useColumnWidths('all', EVENT_COLS, EVENT_DEFAULT_W);
 
   // Closed-tab filters. Case-insensitive substring across the columns an operator
   // can see, plus the summary text, which is where the human-readable detail
@@ -1478,7 +1542,7 @@ function App() {
   // the request can actually be sent.
   useEffect(() => {
     if (tab !== 'closed') return;
-    if (status !== 'open') return;
+    if (status !== 'connected') return;
     if (closed.loadedAt || closed.loading) return;
     loadClosed();
   }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
@@ -1487,7 +1551,7 @@ function App() {
   // carry the request. A re-fetch happens on an explicit range change or refresh.
   useEffect(() => {
     if (tab !== 'all') return;
-    if (status !== 'open') return;
+    if (status !== 'connected') return;
     if (allEvents.loadedAt || allEvents.loading) return;
     loadAllEvents(allEvents.range);
   }, [tab, status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
@@ -1617,13 +1681,40 @@ function App() {
         <AppBar position="static">
           <Toolbar variant="dense">
             <Typography variant="h1" sx={{ mr: 1.5 }}>Fire-Watch</Typography>
-            <Chip
-              label={status}
-              size="small"
-              color={status === 'open' ? 'success'
-                : status === 'misconfigured' ? 'error' : 'warning'}
-              variant={status === 'open' ? 'filled' : 'outlined'}
-            />
+            {/*
+              Two chips joined by a line: connection → database.
+
+              They are separate because they fail separately — the socket can be
+              perfectly healthy while the gateway's reads fail, which is a stale
+              board with a green chip. The line between them is the COMBINED state,
+              so "everything is fine" is one glance rather than two readings.
+
+              The line pulses only when it is green: a slow steady pulse reads as
+              "live", while a flashing red would be noise during exactly the incident
+              where an operator needs to concentrate. Motion is off entirely under
+              `prefers-reduced-motion`.
+            */}
+            <Stack direction="row" alignItems="center" spacing={0} sx={{ mr: 1 }}>
+              <Chip
+                label={status}
+                size="small"
+                color={status === 'connected' ? 'success'
+                  : status === 'misconfigured' ? 'error' : 'warning'}
+                variant={status === 'connected' ? 'filled' : 'outlined'}
+              />
+              <HealthLink socket={status} db={dbUp} />
+              <Chip
+                label={dbUp === null ? 'database ?' : dbUp ? 'database' : 'database down'}
+                size="small"
+                color={dbUp === null ? 'default' : dbUp ? 'success' : 'error'}
+                variant={dbUp === true ? 'filled' : 'outlined'}
+                title={dbUp === null
+                  ? 'The gateway has not reported database health yet'
+                  : dbUp
+                    ? 'The gateway can read and write Dragonfly'
+                    : 'The gateway cannot reach Dragonfly — the board may be stale'}
+              />
+            </Stack>
             {notice ? (
               <MuiAlert severity="info" sx={{ py: 0, flex: '0 1 auto',
                                               '& .MuiAlert-message': { py: .25 } }}>
@@ -1706,10 +1797,6 @@ function App() {
           <Typography variant="h2">Open alerts</Typography>
           <Chip label={sortedAlerts.length} size="small" variant="outlined" />
           <Box sx={{ flex: 1 }} />
-          <Button startIcon={<RefreshIcon />} onClick={resetAlertWidths}
-                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
-            reset columns
-          </Button>
         </Stack>
         {/* No selection banner by design. Selecting rows is purely a pointer
             state; every action lives in the right-click menu, which is where the
@@ -1833,10 +1920,6 @@ function App() {
           <Chip label={`${shownEvents.length} of last ${EVENT_LIMIT}`} size="small" variant="outlined" />
           {paused ? <Chip label="paused" size="small" color="warning" /> : null}
           <Box sx={{ flex: 1 }} />
-          <Button startIcon={<RefreshIcon />} onClick={resetEventWidths}
-                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
-            reset columns
-          </Button>
           <Button
             variant={paused ? 'contained' : 'outlined'}
             color={paused ? 'warning' : 'primary'}
@@ -1961,17 +2044,25 @@ function App() {
             </Select>
           </FormControl>
           <Box sx={{ flex: 1 }} />
-          <Button
-            variant="contained"
-            startIcon={allEvents.loading
-              ? <CircularProgress size={13} color="inherit" />
-              : <RefreshIcon />}
-            onClick={() => loadAllEvents(allEvents.range)}
-            disabled={allEvents.loading}
-            sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}
-          >
-            {allEvents.loading ? 'loading' : 'reload'}
-          </Button>
+          <Tooltip title={allEvents.loading ? 'Loading…' : 'Re-read this window'}>
+            <span>
+              {/* Icon-only and compact: the heading already says what the pane is, so
+                  a labelled filled button was the loudest control on the screen for
+                  a read-only refresh. `span` wrapper because a disabled IconButton
+                  swallows pointer events and the tooltip would stop showing. */}
+              <IconButton
+                size="small"
+                onClick={() => loadAllEvents(allEvents.range)}
+                disabled={allEvents.loading}
+                aria-label="Reload events"
+                sx={{ flex: '0 0 auto' }}
+              >
+                {allEvents.loading
+                  ? <CircularProgress size={16} />
+                  : <RefreshIcon fontSize="small" />}
+              </IconButton>
+            </span>
+          </Tooltip>
         </Stack>
 
         <TextField
@@ -2078,18 +2169,19 @@ function App() {
             <Chip label="stale" size="small" color="warning" variant="outlined" />
           )}
           <Box sx={{ flex: 1 }} />
-          <Button startIcon={<RefreshIcon />} onClick={resetClosedWidths}
-                  sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
-            reset columns
-          </Button>
-          <Button
-            variant="contained"
-            startIcon={closed.loading ? <CircularProgress size={13} color="inherit" /> : <RefreshIcon />}
-            onClick={loadClosed}
-            disabled={closed.loading}
-          >
-            {closed.loading ? 'loading' : 'refresh'}
-          </Button>
+          <Tooltip title={closed.loading ? 'Loading…' : 'Re-read the closed list'}>
+            <span>
+              <IconButton
+                size="small"
+                onClick={loadClosed}
+                disabled={closed.loading}
+                aria-label="Reload closed alerts"
+                sx={{ flex: '0 0 auto' }}
+              >
+                {closed.loading ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
+              </IconButton>
+            </span>
+          </Tooltip>
         </Stack>
 
         {/* Search. Client-side, over the rows already fetched, because the window

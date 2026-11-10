@@ -125,6 +125,10 @@ function mkEvent(i, overrides = {}) {
 // fw:alert:{key} in Dragonfly.
 const acks = new Map();
 
+// One shared timer so every socket sees the same simulated database flip, rather
+// than one timer per connection.
+let devserverDbTimer = null;
+
 /**
  * What the mock currently considers "open".
  *
@@ -355,7 +359,27 @@ wss.on('connection', async (ws) => {
       ws.send(JSON.stringify({ op: 'event', event: evt, applied: null }));
       await new Promise((r) => setTimeout(r, 15));
     }
-    ws.send(JSON.stringify({ op: 'hello', server: 'ws-gateway-demo', backfill: history.length, truncated: false }));
+    ws.send(JSON.stringify({ op: 'hello', server: 'ws-gateway-demo', backfill: history.length, truncated: false,
+      // The real gateway reports Dragonfly health here and on every transition.
+      // Sending it keeps the two-chip header exercisable in the harness.
+      db: { up: true, checkedAt: Date.now() } }));
+
+    // Exercise the `db` frame: flip the simulated database down for a moment, then
+    // back. Without this the down state and the red link are unreachable locally,
+    // which is how a broken failure path ships.
+    if (!devserverDbTimer) {
+      devserverDbTimer = setInterval(() => {
+        for (const client of wss.clients) {
+          if (client.readyState !== client.OPEN) continue;
+          client.send(JSON.stringify({ op: 'db', up: false, checkedAt: Date.now() }));
+          setTimeout(() => {
+            if (client.readyState === client.OPEN) {
+              client.send(JSON.stringify({ op: 'db', up: true, checkedAt: Date.now() }));
+            }
+          }, 4000);
+        }
+      }, 25000);
+    }
 
     // Open alerts, so the top table is populated. Each alert is sent once per
     // occurrence because the UI derives the count from the applied:1 frames.

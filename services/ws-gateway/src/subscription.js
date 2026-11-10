@@ -171,3 +171,30 @@ export function shouldFanOut(parsed, podName) {
   if (!parsed.origin) return true;
   return parsed.origin !== podName;
 }
+
+/**
+ * Fold one Dragonfly probe result into the reported state.
+ *
+ * Pure and exported so the threshold rule can be tested directly — a timer body is
+ * not testable without waiting 30 seconds, and getting this wrong means either a
+ * chip that flickers on noise or one that never turns red.
+ *
+ * @param {{up:boolean, fails:number}} state  current state
+ * @param {boolean} ok                        did this probe succeed
+ * @param {number} threshold                  consecutive failures before DOWN
+ * @param {number} now                        probe timestamp
+ * @returns {{up:boolean, fails:number, changed:boolean, checkedAt:number}}
+ *   `changed` is true only when the REPORTED state flips, which is what decides
+ *   whether a frame is worth sending to every socket.
+ */
+export function foldDbProbe(state, ok, threshold, now) {
+  if (ok) {
+    return { up: true, fails: 0, changed: !state.up, checkedAt: now };
+  }
+  const fails = state.fails + 1;
+  // Already reported as down: stay down, no change, no frame.
+  if (!state.up) return { up: false, fails, changed: false, checkedAt: now };
+  // Crossing the threshold is a change; a single failure below it is not.
+  const down = fails >= threshold;
+  return { up: !down, fails, changed: down, checkedAt: now };
+}

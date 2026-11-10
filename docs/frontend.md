@@ -228,8 +228,21 @@ inspector shows the raw ISO and epoch values for anyone who needs UTC.
 
 Each header cell carries a 7px drag handle on its right edge (`role="separator"`).
 Dragging sets a width for that column only; widths are persisted per table in
-`localStorage` (`fw:colw:alerts`, `fw:colw:events`) and a **reset columns** link
-restores the defaults.
+`localStorage` (`fw:colw:alerts`, `fw:colw:events`, `fw:colw:all`, `fw:colw:closed`).
+
+**Widths are keyed by column LABEL, never by index.** They used to be keyed by
+position, which is silently wrong the moment a column is added or removed: deleting
+the "Msg count" column shifted every index past it, so an operator's saved widths
+came back applied one column to the left. Nothing errored — the table just returned
+with the wrong columns wide. A name-keyed entry for a column that no longer exists is
+simply ignored, and a new column starts at its default.
+
+A stored layout in the old index-keyed shape is migrated once on load, so an
+existing layout is not thrown away on upgrade.
+
+**There is no "reset columns" button.** It only existed to recover from that
+bug. With names as keys there is nothing to recover from, and a control that exists
+to undo a data-corruption bug is a poor use of a header.
 
 Three deliberate choices:
 
@@ -295,7 +308,7 @@ not sent to the gateway and they do not affect `applied` handling.
 | Selected tab | `alerts`, `events`, `closed` | `alerts` | `localStorage['fw:tab']` |
 
 Column widths are persisted separately per table (`fw:colw:alerts`,
-`fw:colw:events`, `fw:colw:closed` — §4).
+`fw:colw:events`, `fw:colw:all`, `fw:colw:closed` — §4), keyed by column label.
 
 The selected tab is persisted because it is a **workspace preference, not
 transient UI state**: an operator working the Closed tab should not be reset to
@@ -478,6 +491,46 @@ survives a reload, reaches the full 7-day retention, and can be asked for a spec
 window. Search is over the fetched page (bounded, so it stays instant); the window
 is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
+**Two chips joined by a line: connection → database.** They are separate because
+they fail separately — the socket can be perfectly healthy while the gateway's reads
+fail, which is a stale board behind a green chip. The line between them shows the
+COMBINED state (`linkState` in `lib.js`), so "everything is fine" is one glance rather
+than two readings:
+
+| Line | Meaning |
+|---|---|
+| green, pulsing | socket connected **and** database readable |
+| red, static | either side has definitely failed |
+| grey, static | not known yet — nothing attempted, or no health report received |
+
+Three states, not two, because "not told yet" is neither healthy nor broken.
+Rendering unknown as red would cry wolf on every page load; rendering it green would
+be a lie. A **dropped socket is red, not grey**: we know the path is down, and dressing
+a definite failure up as uncertainty helps nobody.
+
+The pulse runs **only** when green. A slow pulse reads as "this path is live"; pulsing
+a failure would add motion at the moment an operator needs to concentrate. It is
+disabled entirely under `prefers-reduced-motion`, since it carries no information the
+colour and the chips do not already carry.
+
+The connection chip is a MUI `Chip` labelled with the socket state, which has five
+values:
+
+| Value | Colour | Meaning |
+|---|---|---|
+| `idle` | amber outline | before the first connect attempt |
+| `connecting` | amber outline | first attempt in flight |
+| `connected` | green filled | subscribed; snapshot delivered, live frames flowing |
+| `reconnecting` | amber outline | dropped, backoff retry in progress |
+| `misconfigured` | red outline | `wsUrl` empty — will never connect |
+
+It was `open` until recently, which read as the **Open alerts** tab directly
+underneath it; the value was renamed rather than relabelled, so no comparison is left
+referring to a state name that no longer exists.
+
+The chip reports the SOCKET, not the cluster: it can read `connected` while Dragonfly
+is down and the board is stale.
+
 The tab bar is a real `role=tablist` with `aria-selected` and Arrow key
 navigation. The active tab is marked by **both** a colour change and an underline,
 because colour alone fails for anyone who cannot separate the two hues and an
@@ -563,7 +616,7 @@ quiet week.
 
 **The auto-load effect depends on the connection status, not just the tab.** On a
 reload with this tab already selected the effect runs *before* the socket opens;
-without the `status === 'open'` guard the request was dropped and nothing changed,
+without the `status === 'connected'` guard the request was dropped and nothing changed,
 so the effect never ran again and the list stayed empty until `refresh` was
 pressed.
 

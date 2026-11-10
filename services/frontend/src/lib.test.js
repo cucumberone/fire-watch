@@ -28,6 +28,7 @@ import {
   isTimeField,
   filterEvents,
   tabBadgeCount,
+  linkState,
   formatTimeValue,
 } from './lib.js';
 
@@ -883,4 +884,22 @@ test('the All events badge is 0 when its own list is empty, whatever Closed hold
   const counts = { alerts: 5, events: 77, allEvents: 0, closed: 2 };
   assert.equal(tabBadgeCount('all', counts), 0);
   assert.equal(tabBadgeCount('closed', counts), 2);
+});
+
+// ---------------------------------------------- the chip link reflects BOTH chips
+test('the link is ok only when the socket AND the database are healthy', () => {
+  // The whole point of the pair: a connected socket with failing reads is a stale
+  // board behind a green chip.
+  assert.equal(linkState('connected', true), 'ok');
+  assert.equal(linkState('connected', false), 'bad', 'socket fine, database down');
+  assert.equal(linkState('reconnecting', true), 'bad', 'database fine, socket down');
+  assert.equal(linkState('reconnecting', false), 'bad');
+});
+
+test('an unreported database state is unknown, not ok and not bad', () => {
+  // Rendering unknown as red would cry wolf on every page load; rendering it green
+  // would be a lie.
+  assert.equal(linkState('connected', null), 'unknown');
+  assert.equal(linkState('connected', undefined), 'unknown');
+  assert.equal(linkState('idle', null), 'unknown');
 });

@@ -361,6 +361,35 @@ event to `fw:idx:evt:all` in the same step as `fw:idx:src:{source}`. An operator
 close writes its CLEAR there too, and an operator delete removes the member —
 otherwise a deleted event would stay listed and resolve to nothing.
 
+### 5.7 Database health reporting
+
+The gateway probes Dragonfly with a `PING` every `FW_DB_PROBE_MS` (10s) and pushes
+`{"op":"db","up":bool,"checkedAt":ms}` to every client **when the reported state
+changes**. The initial value rides in `hello`.
+
+**Why the gateway probes rather than each client.** One `PING` per pod per interval
+instead of one per browser tab. More importantly it is the only way to show a
+*transition*: a client that is merely connected has no idea whether the gateway's
+reads are working. `fw_ws_ready` and `fw_db_up` are separate gauges for the same
+reason — "can serve sockets" and "can read" are different questions, and a pod that
+is ready while its reads fail serves a stale board.
+
+**Why the failure threshold.** `FW_DB_FAIL_THRESHOLD` (default 3) consecutive
+failures before the state is reported down. A single failed `PING` is not proof of an
+outage: a demoted master, a Sentinel re-resolve and a brief network blip are
+indistinguishable. Reporting the first failure makes the indicator flicker on noise,
+which trains an operator to ignore it — worse than not having it. Recovery is
+immediate on the first success, and the counter resets so a later outage is judged
+from zero.
+
+The rule is `foldDbProbe` in `subscription.js`, extracted and tested directly: a
+timer body cannot be tested without waiting 30 seconds, and getting this wrong means
+either flicker or a chip that never turns red.
+
+**Every failed probe is logged at `warn`**, not just the threshold crossing. A
+database the gateway cannot reach is never routine; the threshold decides when to
+*tell clients*, not when to log. Only transitions emit `info`/`error`.
+
 ## 4. Resource guardrails per connection
 
 | Limit | Default | Reason |

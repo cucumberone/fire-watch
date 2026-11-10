@@ -25,6 +25,7 @@ import {
   eventFrame,
   alertFrame,
   shouldFanOut,
+  foldDbProbe,
 } from './subscription.js';
 import {
   validateAck,
@@ -60,6 +61,21 @@ let ready = false;
 let connCount = 0;
 let msgsOut = 0;
 
+/**
+ * Dragonfly health, as last probed.
+ *
+ * `dbUp` is what clients render. `dbFails` counts CONSECUTIVE failures: a single
+ * failed PING is not proof of an outage (a demoted master, a Sentinel re-resolve and
+ * a brief network blip are indistinguishable), and a chip that flickers red on noise
+ * trains an operator to ignore it.
+ *
+ * Starts optimistically `true`: the gateway refuses to become ready until it has
+ * subscribed, so a client cannot connect before the first successful read.
+ */
+let dbUp = true;
+let dbFails = 0;
+let dbCheckedAt = null;
+
 // ------------------------------------------------------------------ HTTP health
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/livez') {
@@ -78,7 +94,13 @@ const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/plain' }).end(
       `# TYPE fw_ws_connections gauge\nfw_ws_connections ${connCount}\n` +
       `# TYPE fw_ws_msgs_out_total counter\nfw_ws_msgs_out_total ${msgsOut}\n` +
-      `# TYPE fw_ws_ready gauge\nfw_ws_ready ${ready ? 1 : 0}\n`,
+      `# TYPE fw_ws_ready gauge\nfw_ws_ready ${ready ? 1 : 0}\n` +
+      // Exported separately from fw_ws_ready on purpose: they answer different
+      // questions. `ready` is "can this pod serve sockets"; `db_up` is "can it
+      // read". A pod that is ready while its reads fail serves a stale board, and
+      // that used to be invisible to monitoring.
+      `# TYPE fw_db_up gauge\nfw_db_up ${dbUp ? 1 : 0}\n` +
+      `# TYPE fw_db_consecutive_failures gauge\nfw_db_consecutive_failures ${dbFails}\n`,
     );
     return;
   }
@@ -263,6 +285,9 @@ wss.on('connection', (ws, req) => {
       server: `ws-gateway-${POD_NAME}`,
       backfill: backfilled,
       truncated,
+      // The database state as of this connect, so a client that joins while
+      // Dragonfly is down does not have to wait for the next probe to find out.
+      db: { up: dbUp, checkedAt: dbCheckedAt },
     }));
   });
 
@@ -848,6 +873,53 @@ async function handleAlertMessage(raw) {
     return;
   }
   const frame = alertFrame(parsed.key, parsed.applied);
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+  }
+}
+
+// ------------------------------------------------------------------ db health
+//
+// Probes Dragonfly and pushes the result to clients when it CHANGES.
+//
+// Why the gateway probes rather than each client: one PING per pod per interval
+// instead of one per browser tab, and it is the only way to show a TRANSITION —
+// a client that is merely connected has no idea whether the gateway's reads are
+// working.
+//
+// Why push on change rather than every probe: an unchanged status is not worth a
+// frame to every socket every 10 seconds. The initial value arrives in `hello`.
+setInterval(async () => {
+  const ok = await reader.ping();
+  const next = foldDbProbe(
+    { up: dbUp, fails: dbFails }, ok, cfg.dbFailThreshold, Date.now(),
+  );
+
+  dbFails = next.fails;
+  dbCheckedAt = next.checkedAt;
+
+  if (!ok) {
+    // Log every failure: a database the gateway cannot reach is never routine.
+    // The threshold only decides when to TELL CLIENTS, not when to log.
+    log.warn('dragonfly ping failed', {
+      consecutive: dbFails, threshold: cfg.dbFailThreshold,
+    });
+  }
+
+  if (!next.changed) return;
+
+  dbUp = next.up;
+  if (dbUp) {
+    log.info('dragonfly reachable again');
+  } else {
+    log.error('dragonfly reported DOWN to clients', { failures: dbFails });
+  }
+  broadcastDbState();
+}, cfg.dbProbeMs).unref();
+
+/** Fan out the current database state to every connected client. */
+function broadcastDbState() {
+  const frame = JSON.stringify({ op: 'db', up: dbUp, checkedAt: dbCheckedAt });
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
   }

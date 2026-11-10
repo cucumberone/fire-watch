@@ -225,11 +225,44 @@ tr.retirement td { opacity:.55; }
    duplicate that carried no event, so there is nothing to colour it by.
    Without this rule the badge would be unstyled rather than obviously unknown. */
 .sev-unknown  { background:var(--row-unknown);     color:var(--row-unknown-fg); }
-.status { font-size:.75rem; padding:.1rem .5rem; border-radius:999px;
-          background:var(--row-unknown); color:var(--row-unknown-fg); }
-.status-open { background:#16a34a; color:#fff; }
-.status-reconnecting, .status-connecting { background:#f59e0b; color:#1a1a1a; }
-.status-misconfigured { background:#dc2626; color:#fff; }
+/* The connection chip is a MUI Chip now, so the .status* rules that used to style
+   it are gone. Keeping dead rules is how a later change "fixes" a class that no
+   longer exists. */
+/* The line between the connection chip and the database chip.
+
+   A 2px rule with a dot at each end, so it reads as a link rather than a divider.
+   Its colour is the COMBINED health of the two chips — green only when both are
+   healthy, amber when either is not yet known, red when either has failed. */
+.healthlink { position:relative; display:inline-block; width:40px; height:3px;
+              border-radius:2px; background:var(--dim); flex:0 0 auto;
+              /* centred on the chips' vertical mid-line — as a flex item it defaults
+                 to stretch/top, which pinned the rule to the top edge of the chips. */
+              align-self:center; margin:0 .5rem; }
+.healthlink::before, .healthlink::after { content:''; position:absolute; top:50%;
+              width:7px; height:7px; border-radius:50%; background:inherit;
+              transform:translateY(-50%); }
+.healthlink::before { left:0; }
+.healthlink::after  { right:0; }
+.healthlink-ok   { background:#16a34a; }
+.healthlink-bad  { background:#dc2626; }
+.healthlink-unknown { background:var(--dim); }
+
+/* Pulse only when everything is healthy.
+
+   A slow, low-contrast pulse reads as "this path is live". Pulsing a FAILURE would
+   trade the operator's attention for decoration at exactly the moment they need to
+   concentrate, so red and amber are deliberately static.
+
+   Motion is disabled outright under prefers-reduced-motion: an indefinite animation
+   is one of the most common triggers for vestibular discomfort, and this one carries
+   no information that the colour and the chips do not already carry. */
+@media (prefers-reduced-motion: no-preference) {
+  .healthlink-ok { animation:healthlink-pulse 2.4s ease-in-out infinite; }
+}
+@keyframes healthlink-pulse {
+  0%, 100% { opacity:1; }
+  50%      { opacity:.35; }
+}
 .notice { font-size:.8rem; color:var(--notice); }
 .error { color:var(--error); }
 .link { background:none; border:0; color:var(--accent); cursor:pointer; font-size:.75rem;

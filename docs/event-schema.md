@@ -159,6 +159,44 @@ Required fields are enforced from the schema, so step 1 alone starts rejecting
 requests that omit a newly required field. That is intentional: the contract is the
 file, not a description of the file.
 
+### 5.1 The schema must be in the image
+Because the file is read **at runtime**, it has to be packaged with the ingress.
+Two things make that non-obvious, and both were wrong on the first attempt:
+
+**The build context must be the repo root.** `schemas/` is a sibling of
+`services/http-ingress`, and a Docker build cannot copy from outside its context.
+The workflow therefore builds with `context: .` and paths like
+`COPY services/http-ingress/src ./src`. A root `.dockerignore` keeps that context
+from uploading every service's `node_modules`.
+
+**The destination is `/schemas`, not `/app/schemas`.** `normalise.js` resolves the
+file as `join(dirname(import.meta.url), '..', '..', '..', 'schemas', ...)`, which
+from `/app/src` climbs to `/`. The Dockerfile therefore uses an absolute
+destination:
+
+```dockerfile
+COPY schemas /schemas
+```
+
+`COPY schemas ./schemas` would silently land at `/app/schemas` and leave the
+resolved path missing.
+
+The failure mode when this is wrong is worth stating, because it does not look like
+a packaging error:
+
+```
+POST /events  →  400 {"error":"invalid_event",
+                      "message":"event[0]: ENOENT: no such file or directory,
+                                 open '/schemas/event-ingest.schema.json'"}
+```
+
+The pod is `Running`, `Ready`, the probes pass, and the log shows a normal startup.
+Only requests fail, and the message describes the producer's event as invalid — so
+the natural conclusion is a bad payload rather than a broken image. To stop that
+happening again the ingress validates the schema **before it starts listening** and
+exits non-zero if it cannot load it, turning a silently degraded container into a
+crash loop the pod status reports.
+
 ## 6. Verification
 
 ```bash

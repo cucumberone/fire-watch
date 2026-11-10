@@ -1,0 +1,39 @@
+# Root build context hygiene.
+#
+# The http-ingress image is built from the REPO ROOT rather than from
+# services/http-ingress, because it must contain schemas/event-ingest.schema.json
+# (the ingress reads that file at runtime — docs/event-schema.md). A build context
+# cannot reference a sibling directory, so the root is the only option.
+#
+# Consequence: without this file, every build uploads node_modules for all five
+# services, the whole git history, and the docs. That is slow, and stale modules
+# inside the context can shadow the ones the Dockerfile installs.
+#
+# Only these paths are actually needed by the Dockerfiles:
+#   services/<svc>/package.json, services/<svc>/src, schemas/
+
+node_modules/
+**/node_modules/
+
+# VCS and CI
+.git/
+.github/
+
+# Local state and secrets
+.env
+.env.*
+*.log
+npm-debug.log*
+
+# Not needed to build any image
+docs/
+k8s/
+scripts/
+AGENTS.md
+README.md
+LICENSE
+
+# Build output
+**/dist/
+**/coverage/
+.DS_Store

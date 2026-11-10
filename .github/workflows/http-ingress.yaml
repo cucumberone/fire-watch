@@ -117,7 +117,13 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: services/http-ingress
+          # Repo root, NOT services/http-ingress: the image must contain
+          # schemas/event-ingest.schema.json, which the ingress reads at runtime
+          # (docs/event-schema.md). A context of services/http-ingress cannot
+          # reference a sibling directory, and the resulting image starts happily
+          # and then rejects every EVT_* request with ENOENT. .dockerignore at the
+          # root keeps the context from ballooning.
+          context: .
           file: services/http-ingress/Dockerfile
           # Always push: a manual build that did not publish would be pointless.
           push: true

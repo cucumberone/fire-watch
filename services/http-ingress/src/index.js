@@ -28,7 +28,7 @@ import http from 'node:http';
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { ConfirmPool } from './confirm.js';
-import { normaliseBatch, messageProperties, BadRequest } from './normalise.js';
+import { normaliseBatch, messageProperties, BadRequest, requiredFields, schemaFields } from './normalise.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
@@ -191,6 +191,27 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function main() {
+  // Load the ingest contract BEFORE listening.
+  //
+  // It is read from disk at runtime (docs/event-schema.md), so an image that was
+  // built without schemas/ starts perfectly and then answers every EVT_* request
+  // with "400 invalid_event: ENOENT". That is indistinguishable from a producer
+  // sending a bad payload, and it cost real debugging time. Failing here turns a
+  // silently degraded container into an obvious crash loop that the readiness
+  // probe and the pod status both report immediately.
+  try {
+    log.info('ingest schema loaded', {
+      fields: schemaFields().length,
+      required: requiredFields().join(','),
+    });
+  } catch (err) {
+    log.error('cannot load the ingest schema; refusing to start', {
+      err: String(err),
+      hint: 'the image must contain /schemas/event-ingest.schema.json',
+    });
+    process.exit(1);
+  }
+
   log.info('http-ingress starting', {
     port: cfg.port,
     path: cfg.eventPath,

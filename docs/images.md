@@ -112,12 +112,45 @@ is printed in the step summary — so what is running is always a tag a human ch
 | `worker` | `services/worker` | Node 22, multi-stage, non-root |
 | `ws-gateway` | `services/ws-gateway` | Node 22 |
 | `frontend` | `services/frontend` | nginx-unprivileged; **requires `dist/` to be built first** |
-| `http-ingress` | `services/http-ingress` | nginx + Node, publisher confirms |
+| `http-ingress` | **repo root (`.`)** | needs `schemas/`, which is outside the service directory — see §2.1 |
 | `sentinel-bridge` | `services/sentinel-bridge` | Node 22 |
 
-The context is the **service directory**, not the repo root. Each image needs only its own `package.json` and `src`, and a narrow context keeps the build upload small. Every service has a `.dockerignore` excluding `node_modules/` and `.env*`.
+With one exception (below), the context is the **service directory**, not the repo
+root. A narrow context keeps the build upload small. Every service has a
+`.dockerignore` excluding `node_modules/` and `.env*`.
 
-### 2.1 The frontend exception
+### 2.1 The http-ingress exception: it needs a sibling directory
+
+`http-ingress` reads `schemas/event-ingest.schema.json` **at runtime**
+([event-schema.md](event-schema.md) §5.1), so `schemas/` has to be inside the
+image. A build cannot copy from outside its own context, so this is the one image
+built from the repo root:
+
+```yaml
+context: .
+file: services/http-ingress/Dockerfile
+```
+
+Its Dockerfile paths are therefore root-relative, and the schema uses an
+**absolute** destination because the code resolves `/schemas/…` and not
+`/app/schemas/…`:
+
+```dockerfile
+COPY services/http-ingress/src ./src
+COPY schemas /schemas
+```
+
+A root `.dockerignore` exists only to keep this context small; it is not used by
+the other builds.
+
+The failure mode when either path is wrong is deceptive: the pod starts, passes
+its probes, and then rejects every `EVT_*` request with
+`400 invalid_event: ENOENT … /schemas/event-ingest.schema.json` — which reads as a
+bad payload rather than a packaging bug. The ingress now validates the schema
+before it starts listening and exits non-zero, so the mistake surfaces as a crash
+loop instead.
+
+### 2.2 The frontend exception
 
 `dist/` is git-ignored, so it never exists on a fresh checkout — the Dockerfile's `COPY dist/` would fail. The frontend workflow therefore builds it inside the run:
 

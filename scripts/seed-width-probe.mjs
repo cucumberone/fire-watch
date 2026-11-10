@@ -62,21 +62,34 @@ if (!nodeIp) {
 const url = `http://${nodeIp}:30900/events`;
 
 const SOURCES = ['shop', 'db', 'net', 'auth'];
-const SEVERITIES = ['CRITICAL', 'WARNING', 'FATAL'];
+// Severities exactly as a real producer reports them. The ingress maps these
+// onto the internal scale (CRITICAL/MAJOR -> CRITICAL, MINOR/WARNING -> WARNING,
+// ...), so the generator should speak the producer's language, not the board's.
+const SEVERITIES = ['CRITICAL', 'MAJOR', 'MINOR', 'WARNING'];
 
 const events = [];
 for (let i = 1; i <= COUNT; i += 1) {
   const n = String(i).padStart(3, '0');
+  const device = SOURCES[i % SOURCES.length];
   events.push({
-    id: `${CLOSE ? 'wpclose' : 'wp'}-${n}`,
-    source: SOURCES[i % SOURCES.length],
-    type: `wcheck-${n}`,
-    severity: CLOSE ? 'CLOSE' : SEVERITIES[i % SEVERITIES.length],
-    payload: {
-      msg: CLOSE
-        ? `Resolved: width probe ${n}`
-        : `Width probe ${n}: a deliberately long summary line so the column has to flex and the layout can be judged`,
-    },
+    EVT_Device: device,
+    EVT_EventKey: `wcheck-${n}`,
+    // A stable identifier, so a re-run of this script is a content DUPLICATE and
+    // is absorbed rather than creating a second row. That is the behaviour the
+    // board must show, so the generator must not paper over it.
+    EVT_Identifier: `wp-${n}`,
+    EVT_Severity: CLOSE ? 'CLEAR' : SEVERITIES[i % SEVERITIES.length],
+    EVT_Summary: CLOSE
+      ? `Resolved: width probe ${n}`
+      : `Width probe ${n}: a deliberately long summary line so the column has to flex and the layout can be judged`,
+    EVT_Details: CLOSE
+      ? `Width probe ${n} reported clear by the source.`
+      : `--- width probe ${n} ---\ndevice: ${device}\ncolumn: widening check\n` +
+        'This is the expandable detail body, which is long enough to wrap.',
+    EVT_Agent: 'WidthProbe',
+    EVT_AgentOwner: 'AM-000001',
+    EVT_Environment: 'development',
+    EVT_URL: `https://example.invalid/probe/${n}`,
   });
 }
 

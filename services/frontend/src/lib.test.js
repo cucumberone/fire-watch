@@ -344,59 +344,69 @@ test('toViewEvent rejects a nonsense count instead of rendering NaN', () => {
   }
 });
 
-test('toViewEvent maps the five enriched worker fields', () => {
+test('toViewEvent maps the five enriched producer fields', () => {
   const view = toViewEvent({
     payload: {
-      CIF: 'cif-991',
-      AlarmIDKey: 'key-abc',
-      AlarmOwner: 'ops-team',
-      AutoClose: true,
-      SupportGroupName: 'Network Core',
+      EVT_Device: 'core-sw-07',
+      EVT_Agent: 'Prometheus',
+      EVT_AgentOwner: 'AM-000042',
+      EVT_EventKey: 'net.link.down',
+      EVT_Environment: 'production',
     },
   });
-  assert.equal(view.cif, 'cif-991');
-  assert.equal(view.alarmIdKey, 'key-abc');
-  assert.equal(view.alarmOwner, 'ops-team');
-  assert.equal(view.autoClose, 'yes', 'a boolean must render as yes, not true');
-  assert.equal(view.supportGroupName, 'Network Core');
+  assert.equal(view.device, 'core-sw-07');
+  assert.equal(view.agent, 'Prometheus');
+  assert.equal(view.agentOwner, 'AM-000042');
+  assert.equal(view.eventKey, 'net.link.down');
+  assert.equal(view.environment, 'production');
 });
 
-test('toViewEvent accepts every AlarmIDKey ID-casing variant', () => {
-  // "ID" is an acronym, so upstream may send it capitalised in different ways.
-  for (const wire of ['AlarmIDKey', 'AlarmIdKey', 'alarmIDKey', 'alarmIdKey', 'alarm_id_key']) {
-    const view = toViewEvent({ payload: { [wire]: 'k1' } });
-    assert.equal(view.alarmIdKey, 'k1', wire);
-  }
+test('toViewEvent tolerates lowerCamel spellings of the same fields', () => {
+  // A producer that has already normalised its own casing should still render.
+  const view = toViewEvent({
+    payload: {
+      device: 'd1',
+      agent: 'a1',
+      agentOwner: 'o1',
+      eventKey: 'k1',
+      environment: 'stage',
+    },
+  });
+  assert.equal(view.device, 'd1');
+  assert.equal(view.agent, 'a1');
+  assert.equal(view.agentOwner, 'o1');
+  assert.equal(view.eventKey, 'k1');
+  assert.equal(view.environment, 'stage');
 });
 
-test('toViewEvent does not confuse AlarmIDKey with AlarmOwner', () => {
-  const view = toViewEvent({ payload: { AlarmIDKey: 'k1' } });
-  assert.equal(view.alarmIdKey, 'k1');
-  assert.equal(view.alarmOwner, '', 'only the ID key was sent');
+test('toViewEvent does not confuse the event key with the agent owner', () => {
+  const view = toViewEvent({ payload: { EVT_EventKey: 'k1' } });
+  assert.equal(view.eventKey, 'k1');
+  assert.equal(view.agentOwner, '', 'only the event key was sent');
 });
 
-test('toViewEvent leaves enriched fields empty when the worker did not add them', () => {
+test('toViewEvent leaves enriched fields empty when the producer did not send them', () => {
   const view = toViewEvent({ payload: { msg: 'x' } });
   for (const f of ENRICHED_FIELDS) {
     assert.equal(view[f.key], '', f.key);
   }
 });
 
-test('ENRICHED_FIELDS matches the wire casing the workers emit', () => {
+test('ENRICHED_FIELDS covers exactly the fields the inspector relies on', () => {
   const view = toViewEvent({
     payload: {
-      cif: 'lower',          // not the documented casing, but tolerated
-      alarm_id_key: 'snake key',
-      alarm_owner: 'snake',
-      auto_close: false,
-      support_group_name: 'snake group',
+      EVT_Device: 'd',
+      EVT_Agent: 'a',
+      EVT_AgentOwner: 'o',
+      EVT_EventKey: 'k',
+      EVT_Environment: 'e',
     },
   });
-  assert.equal(view.cif, 'lower');
-  assert.equal(view.alarmIdKey, 'snake key');
-  assert.equal(view.alarmOwner, 'snake');
-  assert.equal(view.autoClose, 'no');
-  assert.equal(view.supportGroupName, 'snake group');
+  for (const f of ENRICHED_FIELDS) {
+    assert.ok(f.key in view, `${f.key} is mapped`);
+    assert.ok(f.wire.includes(`EVT_${f.key[0].toUpperCase()}${f.key.slice(1)}`),
+      `${f.key} lists the EVT_ wire spelling`);
+  }
 });
 
 // ------------------------------------------------------------------- inspector

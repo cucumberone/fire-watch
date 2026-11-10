@@ -151,3 +151,95 @@ test('source and severity are exposed as headers for routing and debugging', () 
   assert.equal(p.headers['x-event-severity'], 'FATAL');
   assert.equal(p.headers['x-ingress-source'], 'http');
 });
+
+// ------------------------------------------------- upstream schema (EVT_*)
+// The producer contract. Field names are mapped once, here, so the rest of the
+// system speaks one language and a schema change touches this file only.
+const upstream = (over = {}) => ({
+  EVT_Device: 'core-sw-07',
+  EVT_EventKey: 'net.link.down',
+  EVT_Identifier: 'own-id-1',
+  EVT_Severity: 'CRITICAL',
+  EVT_Summary: 'link is down',
+  EVT_Details: 'Gi0/24 lost carrier',
+  EVT_Agent: 'Prometheus',
+  EVT_AgentOwner: 'AM-000042',
+  EVT_Environment: 'production',
+  ...over,
+});
+
+test('the upstream schema maps onto the canonical envelope', () => {
+  const e = normaliseEvent(upstream(), opts);
+  assert.equal(e.id, 'own-id-1');
+  // The alert key is device + event key: what the producer guarantees identifies
+  // an alarm.
+  assert.equal(e.source, 'core-sw-07');
+  assert.equal(e.type, 'net.link.down');
+  assert.equal(e.severity, 'CRITICAL');
+  assert.equal(e.payload.msg, 'link is down');
+  assert.equal(e.payload.msgc, 'Gi0/24 lost carrier');
+  assert.equal(e.payload.EVT_Agent, 'Prometheus');
+  assert.equal(e.payload.EVT_AgentOwner, 'AM-000042');
+  assert.equal(e.payload.EVT_Environment, 'production');
+});
+
+test('severity is mapped from the producer scale onto the internal one', () => {
+  const map = {
+    CRITICAL: 'CRITICAL',
+    MAJOR: 'CRITICAL',
+    MINOR: 'WARNING',
+    WARNING: 'WARNING',
+    INDETERMINATE: 'WARNING',
+    INFORMATION: 'HARMLESS',
+    // The resolution signals. These RETIRE, which is the important mapping: the
+    // schema has no CLOSE, so CLEAR is what ends an episode.
+    CLEAR: 'CLOSE',
+    HARMLESS: 'CLOSE',
+  };
+  for (const [from, to] of Object.entries(map)) {
+    const e = normaliseEvent(upstream({ EVT_Severity: from }), opts);
+    assert.equal(e.severity, to, `${from} -> ${to}`);
+  }
+});
+
+test('the producer severity is preserved for display', () => {
+  const e = normaliseEvent(upstream({ EVT_Severity: 'MINOR' }), opts);
+  assert.equal(e.severity, 'WARNING', 'internal severity');
+  assert.equal(e.payload.EVT_Severity, 'MINOR', 'original kept for the inspector');
+});
+
+test('every required field is enforced', () => {
+  for (const field of ['EVT_Device', 'EVT_EventKey', 'EVT_Severity', 'EVT_Summary', 'EVT_AgentOwner', 'EVT_Agent']) {
+    const raw = upstream();
+    delete raw[field];
+    assert.throws(() => normaliseEvent(raw, opts), BadRequest, `${field} must be required`);
+  }
+});
+
+test('a blank required field is rejected, not treated as present', () => {
+  assert.throws(() => normaliseEvent(upstream({ EVT_Device: '   ' }), opts), BadRequest);
+});
+
+test('an unknown severity is rejected with the allowed list', () => {
+  assert.throws(
+    () => normaliseEvent(upstream({ EVT_Severity: 'SPICY' }), opts),
+    (err) => err instanceof BadRequest && /EVT_Severity must be one of/.test(err.message),
+  );
+});
+
+test('a blank identifier is generated rather than rejected', () => {
+  const e = normaliseEvent(upstream({ EVT_Identifier: '' }), opts);
+  assert.equal(e.id, 'gen-id');
+});
+
+test('optional fields are omitted from the payload when blank', () => {
+  const e = normaliseEvent(upstream({ EVT_Environment: '', EVT_URL: undefined }), opts);
+  assert.equal('EVT_Environment' in e.payload, false);
+  assert.equal('EVT_URL' in e.payload, false);
+});
+
+test('a batch of upstream events is normalised together', () => {
+  const batch = normaliseBatch([upstream(), upstream({ EVT_EventKey: 'other' })], opts);
+  assert.equal(batch.length, 2);
+  assert.equal(batch[1].type, 'other');
+});

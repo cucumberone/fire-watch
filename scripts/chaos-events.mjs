@@ -33,8 +33,9 @@
  * 1. The alert key is `source:type` (services/worker/src/config.js). Two events
  *    with the same pair are the SAME alert, not two alerts. To get N distinct
  *    alerts the script therefore gives every opening event a unique type.
- * 2. `HARMLESS` retires an alert exactly like `CLOSE` (see the fold script). It
- *    must NOT be used in phase 1, or alerts close the moment they open.
+ * 2. `CLEAR` and `HARMLESS` retire an alert (the ingress maps both onto the
+ *    internal CLOSE severity). They must NOT be used in phase 1, or alerts close
+ *    the moment they open.
  *
  * Usage
  * -----
@@ -69,8 +70,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // --------------------------------------------------------------------- config
 const SOURCES = ['shop', 'db', 'net', 'auth', 'mail', 'edge'];
-// Opening severities. Deliberately excludes HARMLESS, which retires an alert.
-const OPEN_SEVERITIES = ['CRITICAL', 'WARNING', 'FATAL'];
+// Opening severities, as a producer reports them. Excludes CLEAR/HARMLESS,
+// which RETIRE an alert — using one here would close the alert the moment it
+// opened, and the drill would prove nothing.
+const OPEN_SEVERITIES = ['CRITICAL', 'MAJOR', 'MINOR', 'WARNING'];
 
 const DEFAULTS = {
   count: 200,          // distinct alerts opened in phase 1
@@ -261,36 +264,35 @@ function buildOpenEvents(cfg, random) {
   for (let i = 0; i < cfg.count; i += 1) {
     const n = String(i + 1).padStart(3, '0');
     const severity = OPEN_SEVERITIES[Math.floor(random() * OPEN_SEVERITIES.length)];
-    const source = SOURCES[Math.floor(random() * SOURCES.length)];
+    const device = SOURCES[Math.floor(random() * SOURCES.length)];
     events.push({
-      id: `chaos-open-${n}`,
-      source,
-      type: `check-${n}`,          // unique -> unique alert key
-      severity,
-      payload: {
-        msg: `Chaos drill ${n}/${cfg.count}: ${source} check-${n} reports ${severity}`,
-        // Helpful context for the operator reading the inspector.
-        drill: 'open',
-        ordinal: i + 1,
-      },
+      // The upstream schema. The alert key is `EVT_Device:EVT_EventKey`, so a
+      // unique EVT_EventKey per event is what gives N distinct alerts.
+      EVT_Device: device,
+      EVT_EventKey: `check-${n}`,
+      EVT_Identifier: `chaos-open-${n}`,
+      EVT_Severity: severity,
+      EVT_Summary: `Chaos drill ${n}/${cfg.count}: ${device} check-${n} reports ${severity}`,
+      EVT_Details: `Chaos drill opening event ${i + 1} of ${cfg.count}`,
+      EVT_Agent: 'ChaosDrill',
+      EVT_AgentOwner: 'AM-000001',
+      EVT_Environment: 'development',
     });
   }
   return events;
 }
 
 /**
- * Pick a fraction of the opening events and re-send them, labelled so a human
- * can tell an intentional copy from an accident.
+ * Pick a fraction of the opening events and re-send them.
  *
- * What makes a copy a DUPLICATE depends on `--same-id`:
+ * Both modes now land on the same outcome, because dedup is on CONTENT:
  *
- *   default      the copy gets a fresh id. It is a distinct event with the same
- *                payload, so the fold counts it: Count and Last occurrence both
- *                move. This is the realistic case — a producer re-reporting the
- *                same condition — and it is why `count` grows during a storm.
- *   --same-id    the copy keeps the original id. The fold cannot tell it from a
- *                redelivery, so it returns 0 and drops it: Count and Last
- *                occurrence do not move. This is the path that proves dedup.
+ *   default      identical content, fresh EVT_Identifier -> absorbed by the
+ *                original record. Count increments, Last occurrence moves, and no
+ *                second record is stored.
+ *   --same-id    identical content, same EVT_Identifier -> identical outcome. The
+ *                flag is retained only to demonstrate that the message id is not
+ *                what dedup keys on.
  */
 function buildOpenDuplicates(events, cfg, random) {
   const picks = [];
@@ -304,55 +306,52 @@ function buildOpenDuplicates(events, cfg, random) {
   }
   return picks.map((evt, i) => ({
     ...evt,
-    // A fresh id makes this a NEW event carrying the same payload; keeping the
-    // id makes it a genuine duplicate the fold must drop.
-    id: cfg.sameId ? evt.id : `${evt.id}-copy${i + 1}`,
-    payload: {
-      ...evt.payload,
-      // Written into Summary so it shows up in the UI.
-      msg: `[COPY of ${evt.id}] ${evt.payload.msg}`,
-      copy_of: evt.id,
-      drill: cfg.sameId ? 'open-duplicate-same-id' : 'open-copy-new-id',
-    },
+    // A fresh identifier makes this a new MESSAGE carrying the same content;
+    // keeping it makes it the same message. Either way the content matches, so
+    // the original record absorbs it.
+    EVT_Identifier: cfg.sameId
+      ? evt.EVT_Identifier
+      : `${evt.EVT_Identifier}-copy${i + 1}`,
+    // NOTE: EVT_Summary is part of the fingerprint, so it must stay IDENTICAL or
+    // the copy becomes a different condition and gets its own record — which
+    // would make the drill test the wrong thing.
   }));
 }
 
 /**
- * Build the CLOSE events — one per opening event, matching its source and type so
- * it retires exactly that alert.
+ * Build the CLEAR events — one per opening event, matching its device and event
+ * key so it retires exactly that alert.
+ *
+ * `CLEAR` is the upstream schema's resolution signal; the ingress maps it onto
+ * the internal CLOSE severity.
  */
 function buildCloseEvents(openEvents) {
   return openEvents.map((evt) => ({
-    id: `chaos-close-${evt.type.replace('check-', '')}`,
-    source: evt.source,
-    type: evt.type,
-    severity: 'CLOSE',
-    payload: {
-      msg: `Resolved: ${evt.source} check ${evt.type} recovered`,
-      drill: 'close',
-      closes: evt.id,
-    },
+    EVT_Device: evt.EVT_Device,
+    EVT_EventKey: evt.EVT_EventKey,
+    EVT_Identifier: `chaos-clear-${evt.EVT_EventKey.replace('check-', '')}`,
+    EVT_Severity: 'CLEAR',
+    EVT_Summary: `Resolved: ${evt.EVT_Device} check ${evt.EVT_EventKey} recovered`,
+    EVT_Details: 'Chaos drill resolution',
+    EVT_Agent: 'ChaosDrill',
+    EVT_AgentOwner: 'AM-000001',
+    EVT_Environment: 'development',
   }));
 }
 
-/** Duplicate a fraction of the CLOSE events, each 2-6 times. */
+/** Duplicate a fraction of the CLEAR events, each 2-6 times. */
 function buildCloseDuplicates(closeEvents, cfg, random) {
   const out = [];
   const repeats = [];
   for (const evt of closeEvents) {
     if (random() >= cfg.closeDuplicates) continue;
     const n = cfg.minRepeats + Math.floor(random() * (cfg.maxRepeats - cfg.minRepeats + 1));
-    repeats.push({ id: evt.id, times: n });
+    repeats.push({ id: evt.EVT_Identifier, times: n });
     for (let k = 0; k < n; k += 1) {
       out.push({
         ...evt,
-        // Same id: a re-sent CLOSE must be idempotent, not a new event.
-        payload: {
-          ...evt.payload,
-          msg: `[DUPLICATE ${k + 1}/${n} of ${evt.id}] ${evt.payload.msg}`,
-          duplicate_of: evt.id,
-          drill: 'close-duplicate',
-        },
+        // Same content, so it is absorbed: a re-sent CLEAR must be idempotent,
+        // not a new event.
       });
     }
   }

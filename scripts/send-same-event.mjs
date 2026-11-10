@@ -37,34 +37,33 @@ import { execFileSync } from 'node:child_process';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
- * The event template. `id` is fixed — that is what makes run 2+ a duplicate —
- * but `ts` is stamped at execution time so the board shows when you actually ran
- * the script rather than a hard-coded date.
+ * The event template, in the upstream schema.
  *
- * This does NOT weaken the duplicate test: the worker dedupes on event ID, not on
- * the timestamp. A changing ts only means the stored record differs between runs,
- * which is the honest representation of "the same event was sent again just now".
+ * `EVT_Identifier` is FIXED so the message identity is stable, and `EVT_EventKey`
+ * is fixed so the alert identity (`device:eventKey`) is stable. Both matter, but
+ * for different reasons now that dedup is on CONTENT:
+ *
+ *   - the content fingerprint covers EVT_Device, EVT_EventKey, the mapped severity
+ *     and the payload (which includes EVT_Summary/EVT_Details). Those never change
+ *     here, so every run after the first is a content duplicate and is absorbed:
+ *     the original record's count increments and its Last occurrence moves.
+ *   - `--new-id` changes only EVT_Identifier, which is NOT part of the fingerprint,
+ *     so it proves that a fresh message id changes nothing — dedup is on content.
  */
 const EVENT = {
-  // Constant, so the second and later runs are duplicates.
-  id: 'static-probe-0001',
-  source: 'probe',
-  type: 'static.probe',
-  severity: 'WARNING',
-  // Stamped below, at execution time.
-  ts: '',
-  payload: {
-    msg: 'Static probe event: identical on every run',
-    CIF: 'CIF-0001',
-    AlarmIDKey: 'ALM-STATIC-0001',
-    AlarmOwner: 'probe-owner',
-    AutoClose: false,
-    SupportGroupName: 'Probe Support',
-  },
+  EVT_Device: 'probe-device',
+  EVT_EventKey: 'static.probe',
+  // Constant, so the same logical message is re-sent. `--new-id` overrides it.
+  EVT_Identifier: 'static-probe-0001',
+  // A source severity, not an internal one. WARNING passes through unchanged.
+  EVT_Severity: 'WARNING',
+  EVT_Summary: 'Static probe event: identical on every run',
+  EVT_Details: 'The expandable detail body for the static probe.',
+  EVT_Agent: 'FireWatchProbe',
+  EVT_AgentOwner: 'AM-000001',
+  EVT_Environment: 'development',
+  EVT_URL: 'https://example.invalid/probe/static',
 };
-
-// Stamp the producer timestamp now, so the record reflects when this run happened.
-EVENT.ts = new Date().toISOString();
 function dotenv() {
   try {
     const out = {};
@@ -146,13 +145,15 @@ const url = get('--url', `http://${nodeIp}:30900/events`);
  * impossible by default would leave no way to test the gate. So both behaviours
  * exist, and the flag decides which one you are exercising:
  *
- *   default    same id      -> dropped on re-run (dedup proof)
- *   --new-id   unique id    -> counted on every run (occurrence proof)
+ *   default    same content -> absorbed by the original record (count++, Last moves)
+ *   --new-id   fresh EVT_Identifier -> identical outcome, because the id is NOT
+ *              part of the content fingerprint
  *
- * The alert key (`source:type`) never changes, so both runs land on the SAME row.
+ * The alert key is `EVT_Device:EVT_EventKey` (see services/http-ingress/src/normalise.js),
+ * and it never changes here, so every run lands on the SAME row.
  */
 const thisRun = NEW_ID
-  ? { ...EVENT, id: `${EVENT.id}-${Date.now()}` }
+  ? { ...EVENT, EVT_Identifier: `${EVENT.EVT_Identifier}-${Date.now()}` }
   : EVENT;
 
 const body = COUNT === 1 ? thisRun : Array.from({ length: COUNT }, () => thisRun);
@@ -161,7 +162,7 @@ const body = COUNT === 1 ? thisRun : Array.from({ length: COUNT }, () => thisRun
 /**
  * Delete everything this event owns, so the next run is a first run again.
  *
- * All four keys matter:
+ * All five keys matter:
  *
  *   fw:evt:{id}            the stored record (and the transport-dedup gate)
  *   fw:fp:{fingerprint}    the CONTENT-dedup gate — while this exists, a re-run
@@ -184,20 +185,17 @@ if (RESET) {
     process.exit(2);
   }
   const ns = env.NAMESPACE || 'fire-watch-lab';
-  const key = `${EVENT.source}:${EVENT.type}`;
-  // The fingerprint has to be computed exactly as the worker computes it, or this
-  // deletes a key that does not exist and the re-run is still absorbed. Import the
-  // real function rather than re-deriving the hash here.
+  // The alert key and the fingerprint must be computed by the SAME code the
+  // ingress and worker use, or this deletes keys that do not exist and the
+  // re-run is still absorbed. Import the real functions rather than re-deriving.
+  const { fromUpstream } = await import('../services/http-ingress/src/normalise.js');
   const { contentFingerprint } = await import('../services/worker/src/event.js');
-  const fp = contentFingerprint({
-    source: EVENT.source,
-    type: EVENT.type,
-    severity: EVENT.severity,
-    payload: EVENT.payload,
-  });
+  const canonical = fromUpstream(EVENT);
+  const key = `${canonical.source}:${canonical.type}`;
+  const fp = contentFingerprint(canonical);
   const script = [
     `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw del`,
-    `fw:evt:${EVENT.id}`,
+    `fw:evt:${canonical.id}`,
     // The content-dedup gate. Without this, a re-run is absorbed by the original
     // record instead of creating a new one, which is correct behaviour but not
     // what --reset is being asked for.
@@ -224,7 +222,7 @@ if (RESET) {
     console.error(`send-same-event.mjs: --reset produced no confirmation: ${out}`);
     process.exit(1);
   }
-  console.log(`reset: cleared event ${EVENT.id} and alert ${key}`);
+  console.log(`reset: cleared event ${canonical.id} and alert ${key}`);
 }
 
 const res = await fetch(url, {
@@ -235,18 +233,17 @@ const res = await fetch(url, {
 });
 const text = await res.text();
 
+const sentAs = (await import('../services/http-ingress/src/normalise.js')).fromUpstream(thisRun);
 console.log(`sent to ${url} -> HTTP ${res.status} ${text}`);
-console.log(`event id: ${thisRun.id}   alert key: ${thisRun.source}:${thisRun.type}`);
+console.log(`event id: ${sentAs.id}   alert key: ${sentAs.source}:${sentAs.type}   severity: ${sentAs.severity}`);
 if (NEW_ID) {
   console.log(
-    COUNT > 1
-      ? `${COUNT} copies all share ONE fresh id, so exactly one is stored and the rest are dropped.`
-      : 'New id: this run is a distinct event, so count rises and Last occurrence moves.',
+    'Fresh EVT_Identifier, identical content: still absorbed by the original record — the id is not part of the fingerprint.',
   );
 } else {
   console.log(
     COUNT > 1
-      ? `${COUNT} copies of the SAME id: the first is stored, the rest are dropped.`
+      ? `${COUNT} copies of identical content: the fold counts every one, and only one record exists.`
       : 'Same content: the original record absorbs this run — count increments and Last occurrence moves, and no second record is stored.',
   );
 }

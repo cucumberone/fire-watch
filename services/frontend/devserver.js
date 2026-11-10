@@ -53,13 +53,13 @@ const now = Date.now();
 const SOURCES = ['edge-gw-01', 'edge-gw-02', 'core-sw-07', 'sensor-rack-a'];
 const TYPES = ['link.down', 'power.fault', 'telemetry.temperature', 'disk.smart'];
 
-// The workers enrich these onto every event (docs/workers.md); the mock has to
-// populate them or the screenshot would not show what production shows.
+// The upstream payload fields a real producer sends; the mock must populate them
+// or the enriched columns would be empty in every screenshot.
 const ENRICH = [
-  { CIF: 'CIF-1042', AlarmIDKey: 'ALM-9F2-1042', AlarmOwner: 'net-ops', AutoClose: false, SupportGroupName: 'Network Core' },
-  { CIF: 'CIF-2291', AlarmIDKey: 'ALM-9F2-2291', AlarmOwner: 'facilities', AutoClose: true, SupportGroupName: 'Datacenter Ops' },
-  { CIF: 'CIF-7730', AlarmIDKey: 'ALM-9F2-7730', AlarmOwner: 'platform', AutoClose: false, SupportGroupName: 'Platform SRE' },
-  { CIF: 'CIF-4415', AlarmIDKey: 'ALM-9F2-4415', AlarmOwner: 'storage', AutoClose: true, SupportGroupName: 'Storage Tier 2' },
+  { EVT_Agent: 'Prometheus', EVT_AgentOwner: 'AM-000042', EVT_Device: 'core-sw-07', EVT_EventKey: 'net.link.down', EVT_Environment: 'production' },
+  { EVT_Agent: 'Zabbix', EVT_AgentOwner: 'AM-000117', EVT_Device: 'db-node-03', EVT_EventKey: 'hw.psu.voltage', EVT_Environment: 'production' },
+  { EVT_Agent: 'SNMP', EVT_AgentOwner: 'AM-000208', EVT_Device: 'sensor-rack-a', EVT_EventKey: 'env.temperature', EVT_Environment: 'stage' },
+  { EVT_Agent: 'SMARTd', EVT_AgentOwner: 'AM-000315', EVT_Device: 'edge-gw-02', EVT_EventKey: 'disk.predictive', EVT_Environment: 'development' },
 ];
 
 function mkEvent(i, overrides = {}) {

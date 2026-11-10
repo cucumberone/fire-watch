@@ -8,6 +8,16 @@
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 
+/**
+ * Internal severities.
+ *
+ * These are produced by the ingress, which maps the producer's own scale onto
+ * this one (`CLEAR`/`HARMLESS` -> `CLOSE`, `MAJOR` -> `CRITICAL`,
+ * `MINOR` -> `WARNING`, ...). See services/http-ingress/src/normalise.js.
+ *
+ * `CLOSE` and `HARMLESS` are retirement signals: the fold closes the alert and
+ * does not count them as occurrences.
+ */
 const SEVERITIES = new Set(['FATAL', 'CRITICAL', 'WARNING', 'HARMLESS', 'CLOSE']);
 const RETIREMENT = new Set(['CLOSE', 'HARMLESS']);
 

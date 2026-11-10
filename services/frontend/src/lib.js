@@ -115,19 +115,11 @@ export const WIRE_FIELD = { summary: 'msg', msgCompleteString: 'msgc' };
  * `cif` (some unrelated field) can never be mistaken for the enriched one.
  */
 export const ENRICHED_FIELDS = [
-  { key: 'cif', label: 'CIF', wire: ['CIF', 'cif'] },
-  {
-    key: 'alarmIdKey',
-    label: 'Alarm ID key',
-    wire: ['AlarmIDKey', 'AlarmIdKey', 'alarmIDKey', 'alarmIdKey', 'alarm_id_key'],
-  },
-  { key: 'alarmOwner', label: 'Alarm owner', wire: ['AlarmOwner', 'alarmOwner', 'alarm_owner'] },
-  { key: 'autoClose', label: 'Auto close', wire: ['AutoClose', 'autoClose', 'auto_close'] },
-  {
-    key: 'supportGroupName',
-    label: 'Support group',
-    wire: ['SupportGroupName', 'supportGroupName', 'support_group_name'],
-  },
+  { key: 'device', label: 'Device', wire: ['EVT_Device', 'device'] },
+  { key: 'agent', label: 'Agent', wire: ['EVT_Agent', 'agent'] },
+  { key: 'agentOwner', label: 'Agent owner', wire: ['EVT_AgentOwner', 'agentOwner'] },
+  { key: 'eventKey', label: 'Event key', wire: ['EVT_EventKey', 'eventKey'] },
+  { key: 'environment', label: 'Environment', wire: ['EVT_Environment', 'environment'] },
 ];
 
 /** gzip marker, matching services/worker/src/event.js. */
@@ -289,8 +281,16 @@ export function formatClock(ms) {
 }
 
 /** Severity ranking for sorting and display. Retirement events rank last. */
+/**
+ * Sort order for the alert table: most urgent first, retirements last.
+ *
+ * These are the INTERNAL severities. A producer's `MAJOR` arrives as `CRITICAL`
+ * and `MINOR`/`INDETERMINATE` as `WARNING`, mapped once in the ingress, so the UI
+ * never has to know the source scale.
+ */
 export const SEVERITY_RANK = { FATAL: 0, CRITICAL: 1, WARNING: 2, HARMLESS: 3, CLOSE: 4 };
 
+/** Retirement signals: these end an alert episode rather than starting one. */
 export function isRetirement(severity) {
   return severity === 'CLOSE' || severity === 'HARMLESS';
 }

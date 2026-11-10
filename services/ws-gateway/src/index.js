@@ -571,7 +571,17 @@ function handleEventMessage(raw) {
   }
 }
 
-function handleAlertMessage(raw) {
+/**
+ * Handle a fan-out message on the alerts channel.
+ *
+ * Async because an `occurrence` needs one Redis read to attach the alert's
+ * current row: the worker discarded the duplicate's copy, so the frame has no
+ * event and a client that never saw the original has nothing to render.
+ *
+ * Every rejection is caught by the caller, so a slow or failing read can never
+ * break the subscriber loop for every other client on the pod.
+ */
+async function handleAlertMessage(raw) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -613,14 +623,33 @@ function handleAlertMessage(raw) {
   // A CONTENT duplicate: the original record absorbed a repeat, so its count and
   // last_seen moved but no new event exists. Fan out the rollup only — there is no
   // event to show in the tail, which is the point (the copy was discarded).
+  //
+  // The row is attached anyway, read fresh from the alert hash. A client that has
+  // never seen this key has no other way to learn it exists: the frame carries no
+  // event, so `applyAlert` would have nothing to build a row from. That is exactly
+  // the case after a CLEAR followed by a repeat — the alert reopens, the copy is
+  // absorbed, and the only notice is this eventless frame, so the row never
+  // appeared until the next snapshot (i.e. a browser refresh).
+  //
+  // Cost is one hash read plus one event read, and only on an absorbed duplicate.
+  // If the alert is not open (already retired, or the read failed) the bare frame
+  // is still sent: a client that already has the row still moves its count, and a
+  // client without it simply stays as it was rather than inventing a row.
   if (parsed.kind === 'occurrence') {
-    const frame = alertFrame(parsed.key, parsed.applied);
+    let row = null;
+    try {
+      row = await reader.readAlert(parsed.key);
+    } catch (err) {
+      log.warn('occurrence row read failed; sending bare frame', {
+        key: parsed.key, err: String(err),
+      });
+    }
+    const frame = alertFrame(parsed.key, parsed.applied, row);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }
     return;
   }
-
   const frame = alertFrame(parsed.key, parsed.applied);
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
@@ -666,7 +695,15 @@ async function main() {
         if (reader.subscriber) {
           await reader.subscriber.subscribe(cfg.channelAlerts);
           reader.subscriber.on('message', (ch, msg) => {
-            if (ch === cfg.channelAlerts) handleAlertMessage(msg);
+            // The handler is async (an occurrence reads the alert's row), so the
+            // rejection must be handled here: an unhandled rejection inside an
+            // event emitter would take the process down and drop every client on
+            // this pod.
+            if (ch === cfg.channelAlerts) {
+              handleAlertMessage(msg).catch((err) => {
+                log.error('alert message handling failed', { err: String(err) });
+              });
+            }
           });
         }
         ready = true;

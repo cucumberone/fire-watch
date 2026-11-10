@@ -308,7 +308,21 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'alert') {
-      setAlerts((prev) => applyAlert(prev, { key: frame.key, applied: frame.applied }));
+      // A content-duplicate frame carries `row` (the alert's current state, with
+      // its newest event attached) because it has no event of its own. Without it
+      // a client that never saw the original had nothing to build a row from, so
+      // the alert stayed invisible until the next snapshot — the bug where a
+      // repeat after a CLEAR needed a browser refresh to appear.
+      const row = frame.row;
+      const rowEvent = row?.event ? toViewEvent(row.event) : undefined;
+      setAlerts((prev) => applyAlert(prev, {
+        key: frame.key,
+        applied: frame.applied,
+        event: rowEvent,
+        // The row is authoritative for a key we have not seen: it carries the
+        // real severity, first/last seen and the fold's count.
+        row,
+      }));
       // An ack frame is an `alert` frame carrying `ack` instead of `applied`.
       if ('ack' in frame) {
         setAcks((prev) => {

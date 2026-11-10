@@ -99,6 +99,42 @@ carrying every open alert the subscription matches, most recently active first,
 each with its newest event attached so the row has a Summary and the inspector has
 a full record.
 
+### 3.2 `op: alert` carrying a row
+
+`op: alert` is normally `{key, applied}` and nothing else. The event that caused it
+arrives on its own `op: event` frame, so attaching the record here would duplicate
+the payload on the hot path.
+
+There is one case where that is not enough: a **content duplicate**. The worker
+discards the copy and publishes `{kind:'occurrence', key, applied}` with no event
+([event-lifecycle.md](event-lifecycle.md) §5.4), so a client that has never seen
+this alert key receives a frame it cannot render a row from. The alert is genuinely
+open in Dragonfly, but the board shows nothing until the next snapshot — which is
+why a repeat after a CLEAR appeared only after a browser refresh.
+
+So for an `occurrence` the gateway reads the alert hash **once** and attaches it:
+
+```json
+{"op":"alert","key":"src:type","applied":1,
+ "row":{"severity":"WARNING","firstSeen":…,"lastSeen":…,"count":3,
+        "event":{ …newest record, or null if it expired… }}}
+```
+
+- cost is one `HMGET` plus one `GET` of the newest event record, and only on an
+  absorbed duplicate — the common path is untouched
+- `readAlert` returns `null` when the key is not in `fw:idx:alert:open`, so a
+  retired alert can never be resurrected as a live row
+- if the read fails the bare frame is still sent: a client that already has the row
+  moves its count, and one without it stays as it was rather than inventing a row
+
+The client treats `row` as authoritative for a key it has not seen (it carries the
+fold's real count), and ignores it for a key it already has so the visible count
+cannot jump around ([frontend.md](frontend.md) §5.3).
+
+`handleAlertMessage` is therefore async, and its rejection is handled at the
+subscriber — an unhandled rejection inside an event emitter would take the process
+down and drop every client on the pod.
+
 ### 3.3 `op: resync` — repairing a board that missed a frame
 
 The snapshot is only sent on `subscribe`, which happens once per connection. That
@@ -147,7 +183,7 @@ The client sends `resync`:
 `resyncSeconds: 0` disables the timer; the reconnect and visibility triggers stay.
 
 Cost is the same as a connect snapshot: three round trips regardless of alert
-count (§3.2), so a one-minute interval per client is negligible.
+count (§3.4), so a one-minute interval per client is negligible.
 
 #### Deploy skew: a newer page against an older gateway
 
@@ -196,7 +232,7 @@ guards both index writes behind `if has_index`, so a worker running newer code
 against an older cached script (or the reverse, during a rolling update) degrades
 to "no index" instead of failing every event.
 
-### 3.2 Snapshot cost: three round trips, measured
+### 3.4 Snapshot cost: three round trips, measured
 
 The snapshot runs on **every** connect, so the number of round trips must not grow
 with the number of open alerts. This was got wrong first and had to be measured —

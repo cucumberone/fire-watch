@@ -559,3 +559,48 @@ test('a row is never left without a severity', () => {
     assert.ok(row.severity.length > 0);
   }
 });
+
+// ------------------- a repeat after a CLEAR must appear without a page refresh
+test('an occurrence frame carrying a server row CREATES the missing row', () => {
+  // The reported bug: probe -> CLEAR retires the alert -> probe again. The
+  // repeat is absorbed as a content duplicate, so the frame has no event. Before
+  // the row was attached, a client that had dropped the alert on the CLEAR had
+  // nothing to rebuild from and the row only appeared on the next snapshot,
+  // i.e. a browser refresh.
+  const out = applyAlert(new Map(), {
+    key: 'probe-device:static.probe',
+    applied: 1,
+    row: {
+      key: 'probe-device:static.probe',
+      severity: 'WARNING',
+      firstSeen: 1000,
+      lastSeen: 2000,
+      count: 4,
+      event: { id: 'static-probe-0001', severity: 'WARNING', brokerTs: 2000 },
+    },
+  });
+  assert.equal(out.size, 1);
+  const row = out.get('probe-device:static.probe');
+  assert.equal(row.severity, 'WARNING');
+  assert.equal(row.firstSeen, 1000);
+  assert.equal(row.lastSeen, 2000);
+  assert.ok(row.count >= 4);              // server's count, plus this occurrence
+  assert.ok(row.event);                   // so the Summary column is filled
+});
+
+test('a server row never blanks a known severity', () => {
+  const first = applyAlert(new Map(), {
+    key: 'd:k', applied: 1, event: { severity: 'FATAL', brokerTs: 10 },
+  });
+  const out = applyAlert(first, { key: 'd:k', applied: 1, row: { count: 9 } });
+  assert.equal(out.get('d:k').severity, 'FATAL');
+  assert.equal(out.get('d:k').firstSeen, first.get('d:k').firstSeen);
+});
+
+test('row-supplied event fills the Summary when the frame has none', () => {
+  const out = applyAlert(new Map(), {
+    key: 'd:k', applied: 1,
+    row: { severity: 'WARNING', count: 1, event: { id: 'e1', brokerTs: 5 } },
+  });
+  assert.equal(out.get('d:k').event.id, 'e1');
+});

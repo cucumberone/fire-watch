@@ -185,3 +185,25 @@ test('alertFrame is keyed and carries the applied code', () => {
   assert.equal(f.key, 'a:t');
   assert.equal(f.applied, 3);
 });
+
+test('alertFrame stays minimal when no row is supplied', () => {
+  // The hot path: every applied event already carries its own `op: event` frame,
+  // so attaching a row here would duplicate the payload for every event.
+  const f = JSON.parse(alertFrame('a:t', 1));
+  assert.deepEqual(Object.keys(f).sort(), ['applied', 'key', 'op']);
+});
+
+test('alertFrame attaches the row when given one', () => {
+  // A content duplicate has no event of its own, so the row is the only way a
+  // client that never saw the original can render anything.
+  const row = {
+    key: 'a:t', severity: 'WARNING', firstSeen: 1, lastSeen: 2, count: 7,
+    event: { id: 'e1', source: 'a', type: 't' },
+  };
+  const f = JSON.parse(alertFrame('a:t', 1, row));
+  assert.equal(f.op, 'alert');
+  assert.equal(f.applied, 1);
+  assert.equal(f.row.count, 7);
+  assert.equal(f.row.severity, 'WARNING');
+  assert.equal(f.row.event.id, 'e1');
+});

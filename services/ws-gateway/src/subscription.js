@@ -131,6 +131,17 @@ export function eventFrame(event, applied) {
   return JSON.stringify({ op: 'event', event, applied });
 }
 
-export function alertFrame(key, applied) {
-  return JSON.stringify({ op: 'alert', key, applied });
+/**
+ * An `op: alert` frame.
+ *
+ * `row` is optional and carries the alert's current state, including its newest
+ * event record. It is present when the server can supply it — notably for a
+ * content-duplicate occurrence, where the frame has no event of its own and a
+ * client that has never seen the key has nothing to render. Omitting it keeps the
+ * frame small on the hot path (every applied event already carries its event on a
+ * separate `op: event` frame).
+ */
+export function alertFrame(key, applied, row) {
+  if (!row) return JSON.stringify({ op: 'alert', key, applied });
+  return JSON.stringify({ op: 'alert', key, applied, row });
 }

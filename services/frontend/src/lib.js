@@ -322,7 +322,20 @@ export function severityRowClass(severity, extra) {
  *
  * Returns a NEW map; never mutates the input.
  */
-export function applyAlert(map, { key, applied, event }) {
+/**
+ * Fold one `op: alert` frame into the alert map.
+ *
+ * @param {Map} map
+ * @param {object} frame
+ * @param {string} frame.key
+ * @param {number} frame.applied  1/2 applied, 3 retired, 0/undef ignored
+ * @param {object} [frame.event]  the event that caused it, when there is one
+ * @param {object} [frame.row]    the alert's CURRENT state from the server:
+ *   `{ severity, firstSeen, lastSeen, count, event }`. Sent for a content
+ *   duplicate, which has no event of its own — without it a client that never saw
+ *   the original has nothing to render a row from.
+ */
+export function applyAlert(map, { key, applied, event, row }) {
   const next = new Map(map);
   if (applied === 0 || applied === null || applied === undefined) {
     // Stale, backfill, or a DUPLICATE the fold dropped. Duplicates are removed
@@ -339,38 +352,46 @@ export function applyAlert(map, { key, applied, event }) {
     // build (which emitted 2 for a coalesced repeat) cannot freeze a row during
     // a rolling update. Both now mean the same thing: the event was applied.
     //
-    // A CONTENT duplicate arrives on this same path with NO event attached: the
-    // copy was discarded by the worker, so only the rollup exists. `lastSeen`
-    // then falls back to `Date.now()`, which is correct — the fold recorded the
-    // arrival at roughly now, and the alternative (keeping the old value) would
-    // make Last occurrence appear frozen, which is the bug this replaced.
+    // A CONTENT duplicate arrives on this same path with NO event of its own: the
+    // copy was discarded by the worker, so only the rollup moved. Since a recent
+    // change it carries `row`, the server's view of the alert, so even a client
+    // that has never seen this key can build the row.
     const prev = next.get(key);
-    // A row that has NEVER been seen cannot be created from a frame with no
-    // event: there is no severity, no summary and no timestamp to show, so the
-    // result is a row that renders as nothing but a key. That is how the blank
-    // page happened — `severity` stayed undefined and the Badge threw during
-    // render, unmounting the tree.
-    //
-    // This is exactly what arrives when the worker ABSORBS a content duplicate:
-    // the copy is discarded, so the gateway fans out `{kind:'occurrence'}` with
-    // no event attached. The first delivery of a condition always carries its
-    // event, so an eventless frame for an unseen key means the client missed the
-    // original — the next `resync` supplies the real row. Dropping it is safe:
-    // the alert count is owned by the fold, and ignoring a frame cannot make the
-    // server's state wrong, only this client's slightly stale until it refreshes.
-    if (!event && !prev) return next;
+
+    // A row we have never seen, with no event and no server-supplied state: there
+    // is nothing to render — no severity, no summary, no timestamp. Creating one
+    // anyway is what produced a `severity: undefined` row, and rendering that
+    // threw inside Badge and unmounted the whole tree (the blank page). The next
+    // `resync` supplies the real row, so ignoring this frame is safe: `count` is
+    // owned by the fold, so only this client is briefly stale.
+    if (!prev && !event && !row) return next;
+
+    // The server's row is authoritative where it exists, because it knows the
+    // fold's real count. Only its counts are used when we already have the row,
+    // so a repeat cannot make the visible count jump around.
+    const base = prev ?? {
+      key,
+      severity: row?.severity,
+      firstSeen: row?.firstSeen ?? event?.brokerTs ?? Date.now(),
+      lastSeen: row?.lastSeen ?? event?.brokerTs ?? Date.now(),
+      count: row?.count ?? 0,
+      event: row?.event ?? event,
+    };
+
     next.set(key, {
       key,
       // Never downgrade a known severity to undefined because a later frame had
-      // no event to read it from.
-      severity: event?.severity ?? prev?.severity,
-      firstSeen: prev?.firstSeen ?? event?.brokerTs ?? Date.now(),
-      lastSeen: event?.brokerTs ?? Date.now(),
-      count: (prev?.count ?? 0) + 1,
+      // nothing to read it from.
+      severity: event?.severity ?? row?.severity ?? prev?.severity,
+      firstSeen: prev?.firstSeen ?? row?.firstSeen ?? event?.brokerTs ?? Date.now(),
+      // A repeat IS an occurrence, so lastSeen moves even without an event: the
+      // fold recorded the arrival at roughly now.
+      lastSeen: event?.brokerTs ?? row?.lastSeen ?? Date.now(),
+      count: (prev?.count ?? row?.count ?? 0) + 1,
       // The latest applied event is the record worth inspecting: right-clicking
       // an alert row must show the enriched fields of the occurrence that put
       // the row there, not a synthetic merge of every event ever folded in.
-      event: event ?? prev?.event,
+      event: event ?? prev?.event ?? row?.event,
     });
     return next;
   }

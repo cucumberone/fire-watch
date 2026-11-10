@@ -284,6 +284,55 @@ export class DragonflyReader {
     return sha;
   }
 
+  /**
+   * Read ONE open alert, with its newest event attached, or null.
+   *
+   * Exists for the content-duplicate fan-out. The worker publishes
+   * `{kind:'occurrence', key, applied}` because the COPY was discarded — so the
+   * frame carries no event, and a client that has never seen this key has
+   * nothing to render. Without a row the alert simply never appears, which is
+   * exactly what happened after a CLEAR: the next repeat is absorbed, so the
+   * first the client hears of it is an eventless frame.
+   *
+   * Same shape as readOpenAlerts returns for one row, and the same three keys
+   * (hash, event record), so the client renders it from a single code path.
+   */
+  async readAlert(key) {
+    const c = await this.connect();
+
+    const flat = await c.evalsha(
+      await this._snapshotSha(c),
+      1,
+      `fw:alert:${key}`,
+    );
+    if (!Array.isArray(flat) || flat.length < SNAPSHOT_FIELDS.length) return null;
+
+    // A closed alert must not be resurrected as a live row: the index is the
+    // authority on what is open, and the fold removes retired alerts from it.
+    const open = await c.zscore('fw:idx:alert:open', key);
+    if (open === null || open === undefined) return null;
+
+    const n = SNAPSHOT_FIELDS.length;
+    const row = {
+      key,
+      severity: flat[0] || 'WARNING',
+      firstSeen: Number(flat[1] || 0),
+      lastSeen: Number(flat[2] || 0),
+      count: Number(flat[3] || 0),
+      lastId: flat[4] || null,
+      ackedBy: flat[5] || null,
+      ackedAt: flat[6] ? Number(flat[6]) : null,
+      event: null,
+    };
+    if (n && row.lastId) {
+      const raw = await c.get(`fw:evt:${row.lastId}`);
+      const parsed = raw ? safeParse(raw) : null;
+      if (parsed) row.event = parsed;
+      else if (raw) this.log.warn('unparseable stored event', { id: row.lastId });
+    }
+    return row;
+  }
+
   async ping() {
     try {
       const c = await this.connect();

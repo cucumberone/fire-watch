@@ -31,9 +31,15 @@ The bundle is built once and configured at runtime, because build-time env vars 
 {
   "wsUrl": "wss://ws.fire-watch.example.com",
   "apiUrl": "",
-  "backfillDefaultMinutes": 15
+  "backfillDefaultMinutes": 15,
+  "resolveWsHostFromPage": false,
+  "resyncSeconds": 60
 }
 ```
+
+`resyncSeconds` bounds how long a missed `close` frame can leave a stale row on
+screen (see [websocket-server.md](websocket-server.md) §3.3). `0` disables the
+timer; the reconnect and tab-visibility resyncs still fire.
 
 nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no-store`; hashed assets get `immutable, max-age=31536000`.
 
@@ -43,6 +49,7 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 |---|---|
 | Reconnect | jittered exponential backoff, 0.5s → 30s cap, infinite retries |
 | Resume | on reconnect, send `subscribe` with `since` = last received event broker timestamp minus 5s overlap |
+| Resync | send `resync` every `resyncSeconds`, on every reconnect, and when the tab becomes visible. A snapshot **replaces** the alert map, including when it is empty — merging would keep rows that have already retired ([websocket-server.md](websocket-server.md) §3.3) |
 | De-duplication (transport) | keyed on event `id` (overlap + at-least-once delivery can duplicate) |
 | De-duplication (occurrence) | render `count` from `op: alert` frames; never increment it per received event — the worker coalesces ([event-lifecycle.md](event-lifecycle.md) §5.4) |
 | Ordering | sort by broker timestamp, not arrival order and not producer `ts` — cross-worker delivery can invert ([event-lifecycle.md](event-lifecycle.md) §2) |

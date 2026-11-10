@@ -23,5 +23,6 @@ data:
       "wsUrl": "ws://127.0.0.1:30300",
       "apiUrl": "",
       "backfillDefaultMinutes": 15,
-      "resolveWsHostFromPage": true
+      "resolveWsHostFromPage": true,
+      "resyncSeconds": 60
     }

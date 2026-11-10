@@ -109,6 +109,40 @@ function mkEvent(i, overrides = {}) {
 // fw:alert:{key} in Dragonfly.
 const acks = new Map();
 
+/**
+ * What the mock currently considers "open".
+ *
+ * Tracked state rather than a hard-coded list, because a resync must be
+ * idempotent with respect to the live demo stream: if it answered with a fixed
+ * set it would resurrect rows the stream had just retired, and the local
+ * behaviour would disagree with the real gateway (which derives the set from
+ * `fw:idx:alert:open`). That makes the harness useless for the exact bug this
+ * feature exists to fix.
+ */
+const openAlerts = new Map();
+
+/** Apply a fold-like outcome to the mock's open set. */
+function foldMock(evt, applied) {
+  if (!evt?.source || !evt?.type) return;
+  const key = `${evt.source}:${evt.type}`;
+  if (applied === 3) { openAlerts.delete(key); return; }
+  if (applied === 1 || applied === 2) {
+    const prev = openAlerts.get(key);
+    const now = evt.brokerTs ?? Date.now();
+    openAlerts.set(key, {
+      key,
+      severity: evt.severity,
+      firstSeen: prev ? prev.firstSeen : now,
+      lastSeen: now,
+      count: prev ? prev.count + 1 : 1,
+    });
+  }
+}
+
+function mockOpenAlerts() {
+  return [...openAlerts.values()];
+}
+
 wss.on('connection', async (ws) => {
   ws.on('message', async (raw) => {
     let frameIn;
@@ -150,6 +184,16 @@ wss.on('connection', async (ws) => {
       return;
     }
 
+    // ---- op: resync — re-send the authoritative open set, mirroring
+    // handleResync in the gateway. The real one reads fw:idx:alert:open; this
+    // mock has no alert store, so it reports whatever the demo believes is open.
+    // The point of supporting it at all is that the client must not sit waiting
+    // for a reply that never comes when developing locally.
+    if (frameIn.op === 'resync') {
+      ws.send(JSON.stringify({ op: 'snapshot', alerts: mockOpenAlerts() }));
+      return;
+    }
+
     if (frameIn.op !== 'subscribe') return;
 
     // Backfill: a mix of open alerts and history.
@@ -173,6 +217,7 @@ wss.on('connection', async (ws) => {
     for (const a of alerts) {
       for (let k = 0; k < a.count; k += 1) {
         const evt = mkEvent(0, { id: `${a.id}-${k}`, source: a.source, type: a.type, severity: a.severity });
+        foldMock(evt, 1);
         ws.send(JSON.stringify({ op: 'event', event: evt, applied: 1 }));
       }
       await new Promise((r) => setTimeout(r, 20));
@@ -216,6 +261,7 @@ wss.on('connection', async (ws) => {
         brokerTs: Date.now(),
         ts: new Date().toISOString(),
       });
+      foldMock(evt, applied);
       ws.send(JSON.stringify({ op: 'event', event: evt, applied }));
       n += 1;
     }, 1800);

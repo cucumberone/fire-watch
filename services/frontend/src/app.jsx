@@ -340,13 +340,18 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'snapshot') {
-      // The state of the world as of connect. Without this the board is empty on
-      // load until something new fires, because events only create rows as they
-      // arrive — a reload would look like a dead cluster.
+      // The state of the world as of connect, or as of the last resync. Without
+      // this the board is empty on load until something new fires, because events
+      // only create rows as they arrive — a reload would look like a dead cluster.
       //
       // A snapshot REPLACES the alert map rather than merging into it: it is the
       // full open set, so a row it omits is genuinely closed. Merging would
       // resurrect rows retired while the socket was down.
+      //
+      // `alerts` may be an EMPTY array, and that is a real answer, not a missing
+      // one. Bailing out on an empty snapshot (as an earlier length check did)
+      // left rows on screen that no longer existed — the stale-board bug that
+      // only a browser refresh cleared.
       if (!Array.isArray(frame.alerts)) return;
       const next = new Map();
       for (const row of frame.alerts) {
@@ -436,6 +441,14 @@ function useSocket(config) {
       if (knownKeysRef.current.length > 0) {
         ws.send(JSON.stringify({ op: 'alerts', keys: knownKeysRef.current.slice(0, MAX_ACK_KEYS) }));
       }
+
+      // A reconnect follows a window in which frames were definitely missed, so
+      // the board is resynced straight away rather than waiting for the next
+      // timer tick. `subscribe` above already sends a snapshot, so this is
+      // redundant on the happy path — but it costs one small frame and covers
+      // the case where the subscribe was accepted while the snapshot read was
+      // still in flight and returned nothing.
+      ws.send(JSON.stringify({ op: 'resync' }));
     };
 
     ws.onmessage = (msg) => {
@@ -491,6 +504,53 @@ function useSocket(config) {
     }, 400);
     return () => clearTimeout(t);
   }, [alerts]);
+
+  /**
+   * Periodic resync of the open-alert set.
+   *
+   * The live stream is best-effort in one direction: a `close` fan-out frame that
+   * is lost leaves a retired row on screen until something else touches it. The
+   * observed failure was a row that disappeared on a browser refresh but not on
+   * its own — meaning the alert HAD retired in Dragonfly and the frame telling
+   * this client had not arrived (a missed pong, a dropped pub/sub message across
+   * a reconnect, a throttled tab).
+   *
+   * React cannot "reload" a websocket; the equivalent is to re-ask for the
+   * authoritative set and replace local state with it, which is exactly what the
+   * `snapshot` handler already does on connect. So this sends `resync` on a timer
+   * and lets the existing snapshot path do the work — no second code path, no
+   * merge rules, nothing that can disagree with a fresh page load.
+   *
+   * Interval is deliberately not tight: the cost is one Redis read of the open
+   * index plus an HMGET per alert, and a stale row is an annoyance rather than an
+   * emergency. Five minutes bounds the staleness while keeping the gateway idle
+   * for a quiet board. A resync is also sent immediately on reconnect, because
+   * the disconnect window is when frames are most likely to have been missed.
+   */
+  useEffect(() => {
+    if (!config) return undefined;
+    const ms = (config.resyncSeconds ?? 300) * 1000;
+    if (!(ms > 0)) return undefined;   // 0 disables it
+    const tick = () => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ op: 'resync' }));
+      }
+    };
+    const id = setInterval(tick, ms);
+    // A backgrounded tab has its timers throttled by the browser, so the interval
+    // above can be minutes late — and that is the state an operator returns to.
+    // Resync the moment the tab is visible again instead of waiting for the next
+    // tick.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [config]);
 
   /**
    * Acknowledge an alert.

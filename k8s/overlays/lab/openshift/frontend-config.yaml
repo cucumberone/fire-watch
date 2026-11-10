@@ -15,5 +15,6 @@ data:
       "wsUrl": "wss://ws.fire-watch-lab.apps.lab.local",
       "apiUrl": "",
       "backfillDefaultMinutes": 15,
-      "resolveWsHostFromPage": false
+      "resolveWsHostFromPage": false,
+      "resyncSeconds": 60
     }

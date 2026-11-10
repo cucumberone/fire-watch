@@ -159,6 +159,11 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (frame.op === 'resync') {
+      await handleResync(conn, frame, send);
+      return;
+    }
+
     if (frame.op !== 'subscribe') {
       send(JSON.stringify({ op: 'error', code: 'bad_op', message: `unknown op ${frame.op}` }));
       return;
@@ -182,29 +187,7 @@ wss.on('connection', (ws, req) => {
     // right now" is not a time-windowed question. A client that connects to a
     // quiet cluster would otherwise show an empty board forever, because the
     // event replay only produces rows as new events arrive.
-    let snapshot = 0;
-    try {
-      // readOpenAlerts already batches its reads: it returns every alert with its
-      // event attached, in two round trips. Do NOT loop over the rows calling
-      // reader.readEvent() here — that is O(alerts) round trips on every connect
-      // and measured ~1.1s for 199 alerts (see the cost note on readOpenAlerts).
-      const open = await reader.readOpenAlerts(cfg.alertSnapshotMax);
-      const alerts = [];
-      for (const a of open) {
-        // Only the alerts the client asked about. An unfiltered subscribe means
-        // "everything", which is the common case.
-        if (!matchesAlertSubscription(verdict.sub, a.key)) continue;
-        alerts.push(a);
-      }
-      if (alerts.length > 0) {
-        send(JSON.stringify({ op: 'snapshot', alerts }));
-        snapshot = alerts.length;
-      }
-    } catch (err) {
-      // A snapshot failure must not break the live stream: the client still gets
-      // live frames, it simply opens with an empty board.
-      log.warn('alert snapshot failed', { err: String(err) });
-    }
+    const snapshot = await sendSnapshot(verdict.sub, send);
 
     // ---- backfill, bounded
     const plan = backfillPlan(verdict.sub, Date.now(), cfg.backfillMax);
@@ -457,6 +440,83 @@ async function handleDelete(conn, frame, send) {
     }));
   } catch (err) {
     log.error('delete broadcast failed after a durable delete', { id: verdict.id, err: String(err) });
+  }
+}
+
+/**
+ * Send the current open-alert set as a `snapshot` frame.
+ *
+ * Shared by `subscribe` and `resync` so there is exactly one definition of "what
+ * the board should contain". Two copies would drift, and the drift would show up
+ * as a resync that quietly disagrees with a fresh reload — the hardest kind of
+ * bug to notice, because both paths look correct in isolation.
+ *
+ * An EMPTY result is always sent, not suppressed. The client treats a snapshot as
+ * authoritative and replaces its alert map with it, so "nothing is firing" is a
+ * meaningful answer that must reach the client; omitting it would leave stale
+ * rows that only a browser refresh clears.
+ *
+ * Returns the number of rows sent.
+ */
+async function sendSnapshot(sub, send) {
+  try {
+    // readOpenAlerts already batches its reads: it returns every alert with its
+    // event attached, in two round trips. Do NOT loop over the rows calling
+    // reader.readEvent() here — that is O(alerts) round trips on every connect
+    // and measured ~1.1s for 199 alerts (see the cost note on readOpenAlerts).
+    const open = await reader.readOpenAlerts(cfg.alertSnapshotMax);
+    const alerts = [];
+    for (const a of open) {
+      // Only the alerts the client asked about. An unfiltered subscribe means
+      // "everything", which is the common case.
+      if (matchesAlertSubscription(sub, a.key)) alerts.push(a);
+    }
+    send(JSON.stringify({ op: 'snapshot', alerts }));
+    return alerts.length;
+  } catch (err) {
+    // A snapshot failure must not break the live stream: the client still gets
+    // live frames, it simply opens with an empty board.
+    log.warn('alert snapshot failed', { err: String(err) });
+    return -1;
+  }
+}
+
+/**
+ * Re-send the snapshot on the client's existing subscription.
+ *
+ * Why this exists as its own op rather than "just send subscribe again": every
+ * subscribe appends to `conn.subscriptions`, and the gateway caps those
+ * (`FW_MAX_SUBSCRIPTIONS`, default 20). A client that resynced periodically
+ * would exhaust that budget and then be unable to subscribe at all — and it
+ * would also re-run the bounded backfill on every resync, re-sending events the
+ * client already has.
+ *
+ * The client-side race that makes this necessary:
+ *
+ *   T0  client renders row X              (X is open)
+ *   T1  worker retires X, publishes the fan-out frame
+ *   T2  the frame is lost — a missed
+ *       client->server pong, a dropped
+ *       pub/sub message on a reconnect,
+ *       a laptop sleep, a tab throttled
+ *   T3  client still shows X forever
+ *
+ * Rebuilding the board from the source of truth is the only fix that does not
+ * depend on having received every frame. A browser refresh already does exactly
+ * that; a resync makes the refresh unnecessary.
+ *
+ * No subscription required: a client that has not subscribed has nothing to
+ * resync, and `sub` would be undefined. Tolerating it (rather than erroring)
+ * keeps the op safe to fire blindly from a timer.
+ */
+async function handleResync(conn, frame, send) {
+  const sub = conn.subscriptions[0] || { sources: [], types: [], since: null };
+  const rows = await sendSnapshot(sub, send);
+  // Echo the count back so the client can log/settle on the result. `-1` means
+  // the read failed and the snapshot the client already has is still its best
+  // information — deliberately not an error frame, because the board is intact.
+  if (rows >= 0 && frame.ack === true) {
+    send(JSON.stringify({ op: 'resynced', alerts: rows }));
   }
 }
 

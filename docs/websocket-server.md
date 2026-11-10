@@ -63,13 +63,14 @@ Rules:
 
 ### 3.0 Client → server ops
 
-Three ops a client may send after `subscribe`:
+Four ops a client may send after `subscribe`:
 
 | Op | Frame | Effect |
 |---|---|---|
 | `ack` | `{"op":"ack","key":"source:type"}` | claim the episode; first ack wins ([acknowledge.md](acknowledge.md) §4) |
 | `close` | `{"op":"close","key":"source:type"}` | retire the alert as an operator ([acknowledge.md](acknowledge.md) §8.1) |
 | `alerts` | `{"op":"alerts","keys":[...]}` | re-read ack state for the displayed rows |
+| `resync` | `{"op":"resync"}` | re-send the open-alert snapshot (§3.3) |
 
 `close` is confirmed with `{"op":"alert","key":…,"applied":3}` — the same frame a
 source-sent CLOSE produces — so no client needs a second code path to retire a
@@ -97,6 +98,56 @@ So on every `subscribe` the gateway sends `op: snapshot` **before** `hello`,
 carrying every open alert the subscription matches, most recently active first,
 each with its newest event attached so the row has a Summary and the inspector has
 a full record.
+
+### 3.3 `op: resync` — repairing a board that missed a frame
+
+The snapshot is only sent on `subscribe`, which happens once per connection. That
+left a real failure mode, observed in the lab:
+
+```
+T0  client renders row X                        X is open
+T1  worker retires X, publishes the fan-out
+T2  that frame never reaches this client        (missed pong -> socket closed,
+                                                 dropped pub/sub message across a
+                                                 reconnect, throttled background
+                                                 tab, laptop sleep)
+T3  the client shows X forever
+```
+
+The symptom is a row that disappears on a browser refresh but not on its own —
+which is exactly what a refresh fixes: it re-subscribes and receives a fresh
+snapshot. Nothing is wrong in Dragonfly; the client simply never learned.
+
+`{"op":"resync"}` re-sends the snapshot on the connection's **existing**
+subscription. It is not "send `subscribe` again", for two reasons:
+
+- every `subscribe` appends to `conn.subscriptions`, and those are capped by
+  `FW_MAX_SUBSCRIPTIONS` (default 20). A client that resynced on a timer would
+  exhaust the budget and then be unable to subscribe at all.
+- `subscribe` also re-runs the bounded backfill, re-sending events the client
+  already has.
+
+No subscription is required. A client with none gets the unfiltered set, which is
+what an unsubscribed client would have received anyway; erroring instead would
+make the op unsafe to fire blindly from a timer.
+
+**An empty snapshot is always sent**, never suppressed. The client replaces its
+alert map with the snapshot, so "nothing is firing" is a real answer that has to
+reach the client. An earlier version only sent the frame when `alerts.length > 0`,
+and that single condition is what made stale rows possible: a resync at the moment
+everything had closed would have returned nothing and left the old rows untouched.
+
+The client sends `resync`:
+
+- every `resyncSeconds` (runtime config, default 60),
+- immediately on reconnect, since the disconnect window is when frames go missing,
+- when the tab becomes visible again, because a backgrounded tab has its timers
+  throttled and an operator returning to it is the common case.
+
+`resyncSeconds: 0` disables the timer; the reconnect and visibility triggers stay.
+
+Cost is the same as a connect snapshot: three round trips regardless of alert
+count (§3.2), so a one-minute interval per client is negligible.
 
 Two consequences worth stating:
 

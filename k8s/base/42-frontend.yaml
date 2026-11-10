@@ -151,7 +151,8 @@ data:
       "wsUrl": "wss://ws.fire-watch.example.com",
       "apiUrl": "",
       "backfillDefaultMinutes": 15,
-      "resolveWsHostFromPage": false
+      "resolveWsHostFromPage": false,
+      "resyncSeconds": 60
     }
 ---
 apiVersion: v1

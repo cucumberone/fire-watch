@@ -355,8 +355,51 @@ async function handleClose(conn, frame, send) {
     return;
   }
 
+  if (result.status === 'already') {
+    // Two operators clicked Close. The first write wins and the second learns who
+    // actually closed it, rather than overwriting the author and timestamp. The
+    // client still gets a close frame so its row disappears.
+    log.debug('alert already closed', { key: verdict.key, by: result.by });
+    send(closeFrame(verdict.key));
+    return;
+  }
+
   // Confirm to the originator, then fan out to the other pods.
   send(closeFrame(verdict.key));
+
+  // The close wrote a real CLEAR event record, so broadcast it like any other
+  // event: the live tail shows the closure next to the CLEAR a source would have
+  // sent, and it appears in the retention window with an author. `applied: 3`
+  // matches what the fold returns for a retirement, so clients treat it
+  // identically.
+  //
+  // A fan-out failure is logged but not fatal: the record is already durable in
+  // Dragonfly and the Closed tab is a query, so it will show there regardless.
+  if (result.eventId) {
+    try {
+      await reader.publish(cfg.channelEvents, JSON.stringify({
+        event: {
+          id: result.eventId,
+          source: verdict.key.slice(0, Math.max(0, verdict.key.indexOf(':'))),
+          type: verdict.key.slice(verdict.key.indexOf(':') + 1),
+          severity: 'CLOSE',
+          ts: new Date(result.at).toISOString(),
+          brokerTs: result.at,
+          operatorClose: true,
+          payload: {
+            msg: `Closed by ${result.by}`,
+            EVT_Severity: 'CLEAR',
+            EVT_Agent: result.by,
+          },
+        },
+        applied: 3,
+      }));
+    } catch (err) {
+      log.error('close event broadcast failed after a durable write', {
+        key: verdict.key, id: result.eventId, err: String(err),
+      });
+    }
+  }
 
   try {
     await reader.publish(cfg.channelAlerts, JSON.stringify({

@@ -477,6 +477,16 @@ function useSocket(config) {
           return next;
         });
       }
+      // A retirement means the Closed tab just gained a row. Mark it stale rather
+      // than re-fetching immediately: a bulk close of 40 alerts would otherwise
+      // fire 40 round trips, and the operator is not looking at the Closed tab
+      // while closing things on the Open tab. The tab reloads on next open (or on
+      // `refresh`) because `loadedAt` is cleared.
+      if (frame.applied === 3) {
+        setClosedState((prev) => (prev.alerts.length || prev.loadedAt
+          ? { ...prev, loadedAt: null }
+          : prev));
+      }
       return;
     }
     if (frame.op === 'alerts') {

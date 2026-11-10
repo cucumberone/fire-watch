@@ -553,11 +553,53 @@ export class DragonflyReader {
     }
   }
 
+  /**
+   * Close an alert as an operator.
+   *
+   * Writes FOUR things, and all four matter — an earlier version wrote only the
+   * first two, which made an operator close invisible everywhere:
+   *
+   *   1. the alert hash: `state=closed`, severity CLOSE, who closed it and when
+   *   2. `fw:alert:open:{key}` deleted, so nothing renders it as firing
+   *   3. `fw:idx:alert:closed` gets the key, scored by `closed_at` — without it
+   *      the Closed tab cannot enumerate the closure at all
+   *   4. a real `fw:evt:{id}` CLEAR record, and a member in `fw:idx:src:{source}`
+   *
+   * (4) is the non-obvious one. A source-sent CLEAR is a real event: the worker
+   * stores the record, indexes it by source, and the live tail shows it. An
+   * operator close that only flipped the hash left the retention window with no
+   * record of WHY the alert ended — the Closed tab could show the row but not a
+   * summary or an author, and the audit trail had a gap exactly where a human
+   * made a decision.
+   *
+   * Written server-side rather than synthesised by each client, so every client
+   * and the audit trail see byte-identical history.
+   *
+   * The event id is derived from the alert key and the close time, so a retried
+   * close (or two operators racing) collapses onto ONE record instead of
+   * producing duplicates.
+   */
   async closeAlert(hashKey, by, nowMs, ttlMs, indexKey = 'fw:idx:alert:open', bareKey = '') {
+    const alertKey = bareKey || hashKey.replace(/^fw:alert:/i, '');
+    // `source:type` — the alert key's halves, split on the FIRST colon because a
+    // type may legitimately contain colons while a source may not.
+    const sep = alertKey.indexOf(':');
+    const source = sep === -1 ? alertKey : alertKey.slice(0, sep);
+    const type = sep === -1 ? '' : alertKey.slice(sep + 1);
+
     const script = `
       if redis.call('EXISTS', KEYS[1]) == 0 then
         return {'missing'}
       end
+
+      -- Nothing to do if it is already closed: a second operator clicking Close
+      -- must not overwrite the original author or timestamp.
+      local state = redis.call('HGET', KEYS[1], 'state')
+      if state == 'closed' then
+        return {'already', redis.call('HGET', KEYS[1], 'closed_by') or '',
+                redis.call('HGET', KEYS[1], 'closed_at') or '0'}
+      end
+
       redis.call('DEL', KEYS[2])
       redis.call('ZREM', KEYS[3], ARGV[4])
       redis.call('HSET', KEYS[1],
@@ -566,31 +608,73 @@ export class DragonflyReader {
         'closed_by', ARGV[1],
         'closed_at', ARGV[2],
         'watermark', ARGV[2],
-        'watermark_id', ARGV[3])
+        'watermark_id', ARGV[3],
+        'last_id', ARGV[6])
       redis.call('HDEL', KEYS[1], 'acked_by', 'acked_at')
       redis.call('PEXPIRE', KEYS[1], ARGV[5])
+
+      -- The closed index. Scored by closed_at, which is what the tab sorts and
+      -- filters on.
+      redis.call('ZADD', KEYS[4], ARGV[2], ARGV[4])
+
+      -- The CLEAR event record, so the closure exists in history and the tail.
+      -- NX: a retried close must not rewrite a record that already exists.
+      redis.call('SET', KEYS[5], ARGV[7], 'EX', ARGV[5], 'NX')
+      redis.call('ZADD', KEYS[6], ARGV[2], ARGV[6])
+
+      -- Carry the severity forward as the producer value so the badge shows
+      -- CLEAR rather than the internal CLOSE (docs/frontend.md §5.1).
       return {'closed', ARGV[1], ARGV[2]}
     `;
     const openKey = hashKey.replace(/^fw:alert:/, 'fw:alert:open:');
+    // Deterministic: same alert + same millisecond -> same id.
+    const eventId = `operator-clear-${alertKey.replace(/[^a-zA-Z0-9._-]/g, '_')}-${nowMs}`;
+    const eventRecord = JSON.stringify({
+      id: eventId,
+      source,
+      type,
+      severity: 'CLOSE',
+      ts: new Date(nowMs).toISOString(),
+      payload: {
+        msg: `Closed by ${by}`,
+        EVT_Severity: 'CLEAR',
+        EVT_Device: source,
+        EVT_EventKey: type,
+        // There is no producer here, so name the actor as the agent. It is the
+        // truth, and it keeps the enriched columns populated.
+        EVT_Agent: by,
+        EVT_AgentOwner: '',
+      },
+      operatorClose: true,
+      brokerTs: nowMs,
+    });
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const c = await this.connect();
       try {
         const res = await c.eval(
           script,
-          3,
+          6,
           hashKey,
           openKey,
           indexKey,
+          'fw:idx:alert:closed',
+          `fw:evt:${eventId}`,
+          `fw:idx:src:${source}`,
           by,
           String(nowMs),
           `operator-close-${nowMs}`,
-          bareKey || hashKey.replace(/^fw:alert:/, ''),
+          alertKey,
           String(ttlMs),
+          eventId,
+          eventRecord,
         );
         const [status, closedBy, closedAt] = res;
         if (status === 'missing') return { status: 'missing' };
-        return { status: 'closed', by: closedBy, at: Number(closedAt) };
+        if (status === 'already') {
+          return { status: 'already', by: closedBy, at: Number(closedAt) };
+        }
+        return { status: 'closed', by: closedBy, at: Number(closedAt), eventId };
       } catch (err) {
         const msg = String(err?.message || err);
         const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');

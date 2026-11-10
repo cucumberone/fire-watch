@@ -152,3 +152,82 @@ test('readAlert returns null when the key is not in the open index', async () =>
   const row = await readerWith(client).readAlert('a:b');
   assert.equal(row, null);
 });
+
+// ---------------------------------------- operator close must be a real event
+/**
+ * Fake client that records the EVAL keys/argv, so the close script's contract can
+ * be asserted. The previous version of closeAlert wrote only the hash and the open
+ * index, so an operator close was invisible in the Closed tab AND in the retention
+ * window — it existed only as a state flag.
+ */
+function fakeEvalClient(result = ['closed', 'alice', '1000']) {
+  const calls = [];
+  return {
+    calls,
+    async eval(script, numKeys, ...args) {
+      calls.push({ script, numKeys, args });
+      return result;
+    },
+  };
+}
+
+function evalReader(client) {
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+  return r;
+}
+
+test('closeAlert writes the closed index, the event record and the source index', async () => {
+  const client = fakeEvalClient();
+  const key = 'probe-device:static.probe';
+  await evalReader(client).closeAlert(`fw:alert:${key}`, 'alice', 1000, 604800000);
+
+  const call = client.calls[0];
+  assert.equal(call.numKeys, 6, 'six keys: hash, open, open-index, closed-index, event, source-index');
+  assert.equal(call.args[0], `fw:alert:${key}`);
+  assert.equal(call.args[3], 'fw:idx:alert:closed', 'the Closed tab enumerates from this');
+  assert.match(call.args[4], /^fw:evt:operator-clear-/, 'a real event record id');
+  assert.equal(call.args[5], 'fw:idx:src:probe-device', 'indexed by source, like any event');
+});
+
+test('the close event record is a CLEAR carrying the operator as author', async () => {
+  const client = fakeEvalClient();
+  await evalReader(client).closeAlert('fw:alert:a:b', 'alice', 1000, 604800000);
+
+  // `eval` is called as (script, numKeys, ...keys, ...argv), so `args` is
+  // [6 keys, by, nowMs, watermarkId, alertKey, ttl, eventId, eventRecord] —
+  // the JSON record is the LAST element.
+  const record = JSON.parse(client.calls[0].args[12]);
+  assert.equal(record.severity, 'CLOSE', 'internal severity, so the fold treats it as retirement');
+  assert.equal(record.payload.EVT_Severity, 'CLEAR', 'the badge shows what a producer would send');
+  assert.equal(record.payload.EVT_Agent, 'alice', 'a human closed it, and that is recorded');
+  assert.equal(record.source, 'a');
+  assert.equal(record.type, 'b');
+  assert.equal(record.operatorClose, true);
+});
+
+test('the event id is deterministic, so a retried close cannot duplicate', async () => {
+  const k = 'fw:alert:a:b';
+  const c1 = fakeEvalClient();
+  const c2 = fakeEvalClient();
+  await evalReader(c1).closeAlert(k, 'alice', 1000, 604800000);
+  await evalReader(c2).closeAlert(k, 'alice', 1000, 604800000);
+  assert.equal(c1.calls[0].args[4], c2.calls[0].args[4]);
+});
+
+test('a type containing a colon splits on the FIRST colon only', async () => {
+  const client = fakeEvalClient();
+  await evalReader(client).closeAlert('fw:alert:dev:hw:psu', 'bob', 5, 1000);
+  const record = JSON.parse(client.calls[0].args[12]);
+  assert.equal(record.source, 'dev');
+  assert.equal(record.type, 'hw:psu');
+  assert.equal(client.calls[0].args[5], 'fw:idx:src:dev');
+});
+
+test('an already-closed alert reports who closed it instead of overwriting', async () => {
+  const client = fakeEvalClient(['already', 'alice', '900']);
+  const res = await evalReader(client).closeAlert('fw:alert:a:b', 'bob', 1000, 1000);
+  assert.equal(res.status, 'already');
+  assert.equal(res.by, 'alice', 'the original author is preserved');
+  assert.equal(res.at, 900);
+});

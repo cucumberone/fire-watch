@@ -131,23 +131,45 @@ An already-acked alert still shows the item, disabled and labelled `Acked by <na
 
 The menu carries **Acknowledge**, **Close** and **Information**. Close is an
 operator-initiated retirement, and it deliberately ends in the *same state a
-CLOSE event from the source produces*:
+CLEAR event from the source produces* — including a real event record:
 
 | Write | Why it cannot be skipped |
 |---|---|
 | `DEL fw:alert:open:{key}` | otherwise the alert still reads as firing |
 | `ZREM fw:idx:alert:open` | otherwise the snapshot resurrects a closed alert on every client's next page load — a phantom row nobody can clear |
-| `HSET state=closed severity=CLOSE closed_by=… closed_at=…` | the record itself |
+| `ZADD fw:idx:alert:closed` | otherwise the **Closed tab cannot enumerate the closure at all** |
+| `SET fw:evt:{id}` + `ZADD fw:idx:src:{source}` | a real CLEAR record, so the closure exists in history, the retention window and the live tail |
+| `HSET state=closed severity=CLOSE closed_by=… closed_at=… last_id=…` | the record itself, now pointing at the close event |
 | `HDEL acked_by acked_at` | the ack belonged to the episode that has just ended |
 
-All four happen in one Lua script, for the same reason the fold is atomic: a
-crash between the hash write and the index removal leaves exactly the phantom row
-above. Verified against Dragonfly: after the call, `state=closed`, the open flag is
-gone and the index entry is removed.
+All six happen in one Lua script, for the same reason the fold is atomic: a crash
+between the hash write and the index removal leaves exactly the phantom row above.
 
-The broadcast frame is `op: alert` with `applied: 3` — the same frame a
-source-sent CLOSE produces — so clients retire the row through the path they
-already have, with no new code path.
+**Why the event record is the interesting one.** An earlier version wrote only the
+first, second and last rows — it flipped the hash and moved the indexes. The alert
+disappeared and that looked correct, but the closure existed nowhere else: no
+entry in the retention window, no summary, no author, and a gap in the audit
+trail exactly where a human made a decision. It also could not appear in the
+Closed tab, which enumerates from an index no part of that write maintained.
+
+The record is a normal event with `severity: CLOSE` and
+`payload.EVT_Severity: CLEAR`, so it flows through the same paths as a
+source-sent retirement: the badge renders `CLEAR`, the fold treats it as a
+retirement, and `EVT_Agent` names the operator because a human *is* the producer
+in this case.
+
+The id is `operator-clear-{sanitised-key}-{ms}` — deterministic, so a retried
+close or two operators racing collapse onto one record instead of duplicating
+history. `SET … NX` backs that up.
+
+**Already-closed alerts.** A second operator clicking Close gets
+`status: 'already'` plus the original author and timestamp. The first write wins;
+nobody overwrites the record of who actually closed it.
+
+The broadcast is two frames: `op: alert` with `applied: 3` (retire the row, the
+same frame a source CLOSE produces) and `op: event` with `applied: 3` (show the
+CLEAR in the live tail). The client also marks the Closed tab stale, so it
+re-fetches on next open rather than after every single close in a bulk action.
 
 **Bulk actions.** Rows select with a plain click, `Shift+click` for a range and
 `Ctrl/Cmd+click` to toggle, and a selection bar offers `Acknowledge N` and

@@ -1155,6 +1155,33 @@ function App() {
                           title: 'Retire these alerts. Same end state as a CLOSE event from the source',
                           run: () => bulk('close', targets),
                         },
+                        {
+                          // Delete targets the event RECORD behind this alert,
+                          // not the alert itself: an alert is an aggregate over
+                          // many events, and "remove the alert" is Close.
+                          //
+                          // Only offered when the row's backing event is known.
+                          // An alert loaded from a snapshot may have no `event`
+                          // attached (its record expired), and offering a delete
+                          // that cannot resolve an id would be a menu item that
+                          // always errors.
+                          label: targets.length > 1
+                            ? `Delete ${targets.length} event(s)`
+                            : 'Delete event',
+                          disabled: !a.event?.id && targets.length === 1,
+                          title: targets.length > 1
+                            ? 'Permanently delete the event record behind each selected alert'
+                            : (a.event?.id
+                              ? `Permanently delete event ${a.event.id}. Cannot be undone.`
+                              : 'No event record is attached to this alert'),
+                          run: () => {
+                            const ids = targets
+                              .map((k) => alerts.get(k)?.event?.id)
+                              .filter(Boolean);
+                            for (const id of ids) deleteEvent(id);
+                          },
+                          danger: true,
+                        },
                       ],
                     )}
                   />

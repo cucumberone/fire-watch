@@ -36,21 +36,31 @@ shrink-wraps:
 - `MuiTabs` (with `variant="scrollable"`) shrink-wraps its labels, so it needs
   `width: 100%` too, and the Toolbar above it inherits the same shrink without it
 
-**`<Stack alignItems>` is silently ignored in MUI v9.** The prop is accepted without
-a warning and the computed style stays `align-items: normal`, so every control row
-renders top-stretched instead of centred — a 38px `TextField` next to a 29px
-`IconButton` leaves the icon 8px above the input's mid-line. Nine call sites had this
-and all nine were no-ops. Put alignment in `sx`:
+**One separator, then a dark-green band.** The tab strip used to end with a 1px
+border and the AppBar with another, 13px apart, with dead background between them.
+The band (`--band:#14532d`, 6px, on `MuiTabs.list`) replaces both: it is the single
+divider between the tabs and the data, and it is the app's accent rather than a grey
+rule, so the boundary reads as part of the design.
 
-```jsx
-<Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>  // correct
-<Stack direction="row" spacing={1} alignItems="center">             // silently nothing
-```
+The band needs **10px of `padding-bottom` on `MuiTabs.list`** to detach it from the
+selected tab. A tab fills the list's content box, so without padding the rounded
+green fill of the selected tab sits directly on the band and the two run together as
+one thick block. The gap is deliberately wider than the band: at 6px the eye reads the
+fill-plus-band as a single striped rule instead of as a fill and a separate separator.
 
-`direction` and `spacing` still work as props. This is the third bug in this class —
-after `MuiToolbar` needing an explicit `width` and `.healthlink` needing an explicit
-`align-self` — so the pattern to remember is: **if MUI output looks untouched, read
-the computed style rather than the JSX.**
+Three MUI v9 details make this fiddly, and all three fail **silently**:
+
+| Mistake | Symptom |
+|---|---|
+| styling `MuiTabs.flexContainer` | no effect — the slot was renamed to `list` in v9 |
+| `<Stack alignItems="center">` as a prop | computed style stays `normal`; use `sx` |
+| a plain `header { }` rule in `build.js` | MUI's AppBar **is** a `<header>`, so pre-MUI chrome CSS re-arms against it |
+
+The third one was the actual cause of the double line: `build.js` still carried a
+pre-MUI `header { padding-bottom:.75rem; border-bottom:1px solid; gap:1rem }`, which
+drew the lower border and the 12px void. The lesson generalises — a component rename
+can silently re-arm dead CSS — so the rule is gone and anything the top bar needs
+lives in the theme, scoped to the component that owns it.
 
 The CSP already allowed `style-src 'unsafe-inline'`, which is what emotion's
 runtime style injection requires, so no CSP change was needed.
@@ -507,6 +517,26 @@ survives a reload, reaches the full 7-day retention, and can be asked for a spec
 window. Search is over the fetched page (bounded, so it stays instant); the window
 is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
+**Two filters on one row, severity first.** The severity picker leads because it is
+the coarse cut an operator makes before typing anything — "only the criticals in the
+last 24 hours". Its options are derived from the loaded rows (`eventSeverities`) so a
+two-event window does not offer eight severities that match nothing, and the option
+labels are the **displayed** ones, because those are the names on the badges.
+
+That last point is the whole rule of the filter: **it matches the label the badge
+renders**, `displaySeverity` falling back to the internal name. Matching the stored
+`severity` as well looked helpful and was actively wrong — `MAJOR` maps down to
+internal `CRITICAL` on ingest, so selecting `CRITICAL` returned rows badged `MAJOR`.
+An operator who picks a value and gets rows showing a different one concludes the
+filter is broken. One label, one meaning.
+
+The mock had a matching defect: `mkEvent` derived `payload.EVT_Severity` from its
+index and then let `overrides.severity` replace the stored severity, so the live
+stream emitted `severity:'CRITICAL'` with `EVT_Severity:'MINOR'` — a badge that
+contradicted its own row. That made the filter look broken in the harness while it
+was correct in production. A fixture that contradicts itself hides the bug it exists
+to exercise, which is why the producer value is now derived from the final severity.
+
 **The tab is a query that stays live.** A query alone was a still photograph of a
 live board: it answered once, on first open, and the list and its badge then sat at
 whatever the count was at that instant. An operator watching the tab saw nothing
@@ -531,12 +561,24 @@ than assigned: it only covers up to `untilMs`, so replacing the list wholesale
 discarded anything that landed during the round trip and the list visibly went
 backwards a moment after the operator saw it move.
 
-**No heading and no count chip in the pane header.** The tab strip sits directly
-above and already names the pane, and its badge already carries the count. A heading
+**No heading and no count chip in a pane header.** The tab strip sits directly above
+and already names the pane, and its badge already carries the count. A heading
 restating the selected tab is the one control on screen that tells the operator
 nothing, and on a live tab the two counts could disagree for a frame — two numbers
-side by side, one of them stale, is worse than one. The pane header is therefore only
-the controls: the window picker and the refresh button.
+side by side, one of them stale, is worse than one.
+
+This applies to all four panes. **Open alerts** lost its whole header row, because
+after the heading and chip were removed there was nothing left in it — an empty 40px
+band of vertical space above the data. **Live events** kept its row for the
+`N of last 500` chip, which is NOT redundant with the badge: it carries the buffer
+LIMIT, the difference between "all of it" and "the newest slice", which matters when
+reading a tail. **Closed** and **All events** keep a row for their own controls.
+
+**The refresh button belongs next to the control it re-runs**, not pushed to the far
+right. On the Closed tab that is the severity picker: the button re-reads the list
+that the picker filters, so they are one group. The `N of M loaded` caption is what
+stays at the right edge — it is a status line, not a control, and separating it from
+the buttons is what makes the grouping read correctly.
 
 **Two chips joined by a line: connection → database.** They are separate because
 they fail separately — the socket can be perfectly healthy while the gateway's reads
@@ -671,6 +713,12 @@ what the server actually holds, which also corrects drift and the case where a
 Because the rows lag the count, the pane says so explicitly with a `stale` chip
 when `loadedAt` is null. Without it the chip and the list disagree and both read
 as wrong, rather than one reading as out of date.
+
+**There is no count chip in the pane.** It showed `closed.count`, which is exactly
+what the tab badge shows — two numbers for one thing, and on a busy board they
+disagree for the length of a fetch, so one of them is always behind. The badge is
+the live one and it is already visible; `N of M loaded` in the filter row reports
+what was actually read, which is the different question.
 
 Two loading states, deliberately distinct: "Nothing has closed in the last 7 days"
 is a real answer (the list was fetched), whereas "Open this tab to load" means it

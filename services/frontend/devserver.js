@@ -69,14 +69,29 @@ function mkEvent(i, overrides = {}) {
   // `payload.EVT_Severity`, exactly as the real ingress preserves it — without
   // this the mock showed `CLOSE`, a value no producer ever sends, because the
   // badge falls back to the internal name when the original is absent.
-  const internal = ['CRITICAL', 'WARNING', 'FATAL', 'HARMLESS', 'CLOSE'][i % 5];
+  const derived = ['CRITICAL', 'WARNING', 'FATAL', 'HARMLESS', 'CLOSE'][i % 5];
+  // The severity the event ACTUALLY carries. An override wins, so the producer
+  // value below must be derived from THIS, not from the index.
+  //
+  // Deriving it from the index meant an overridden event kept the producer
+  // severity belonging to a completely different row: the live stream sends
+  // `severity: 'CRITICAL'` with `payload.EVT_Severity: 'MINOR'`, so the badge said
+  // MINOR while the row was CRITICAL. The severity FILTER then looked broken —
+  // selecting CRITICAL matched rows badged MINOR — when the filter was correct and
+  // the fixture was lying. A harness that contradicts itself hides the bug it is
+  // meant to exercise.
+  const internal = overrides.severity ?? derived;
   const producerSeverity = {
     CRITICAL: 'MAJOR',
+    MAJOR: 'CRITICAL',
     WARNING: 'MINOR',
+    MINOR: 'WARNING',
     FATAL: 'CRITICAL',
     HARMLESS: 'INFORMATION',
+    INFORMATION: 'HARMLESS',
     CLOSE: 'CLEAR',
-  }[internal];
+    CLEAR: 'CLOSE',
+  }[internal] ?? internal;
   return {
     id: `evt-${i}`,
     source: SOURCES[i % SOURCES.length],

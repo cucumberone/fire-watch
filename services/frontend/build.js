@@ -50,6 +50,11 @@ const css = `
   --row-close:#d9f2e1;       --row-close-fg:#14532d;
   --row-unknown:#f4f4f5;     --row-unknown-fg:#3f3f46;
   --pre-bg:rgba(127,127,127,.12);
+  /* The band separating the tab strip from the panes. One value for both themes:
+     it is an ACCENT, not a surface, so it must not fade into the dark background
+     or shout on the light one. Dark enough to read as a rule, green enough to read
+     as ours. */
+  --band:#14532d;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -68,6 +73,7 @@ const css = `
     --row-close:#0f2b1b;       --row-close-fg:#bbf7d0;
     --row-unknown:#27272a;     --row-unknown-fg:#d4d4d8;
     --pre-bg:rgba(127,127,127,.18);
+    --band:#14532d;
   }
 }
 :root[data-theme="dark"] {
@@ -86,6 +92,7 @@ const css = `
   --row-close:#0f2b1b;       --row-close-fg:#bbf7d0;
   --row-unknown:#27272a;     --row-unknown-fg:#d4d4d8;
   --pre-bg:rgba(127,127,127,.18);
+  --band:#14532d;
 }
 * { box-sizing: border-box; }
 body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -93,8 +100,13 @@ body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 /* The drawer is in the flow, so no bottom padding is needed to clear it. */
 h1 { font-size:1.25rem; margin:0; }
 h2 { font-size:1rem; margin:2rem 0 .5rem; font-weight:600; }
-header { display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
-         border-bottom:1px solid var(--line); padding-bottom:.75rem; }
+/* NO header RULE HERE. There used to be one — pre-MUI chrome, from when the
+   top bar was hand-rolled. MUI's AppBar renders an actual <header> element, so that
+   rule kept applying and its padding-bottom/border-bottom/gap drew a SECOND
+   separator 13px below the tab strip's own border, with a 12px void between them.
+   The symptom looked like a styling bug in the AppBar; the cause was dead CSS that
+   a component rename silently re-armed. Anything the top bar needs now lives in
+   the MUI theme, where it is scoped to the component that owns it. */
 .controls { margin-left:auto; display:flex; gap:.6rem; align-items:center; font-size:.8rem; }
 /* Icon toggles. A real <button> with aria-pressed, not a styled checkbox:
    the native control cannot be dressed up without faking its box, and a fake

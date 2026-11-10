@@ -28,6 +28,7 @@ import {
   closedSeverities,
   isTimeField,
   filterEvents,
+  eventSeverities,
   tabBadgeCount,
   linkState,
   formatTimeValue,
@@ -880,10 +881,41 @@ test('filterEvents is case-insensitive and tolerates empty input', () => {
   assert.deepEqual(filterEvents([], 'x'), []);
 });
 
-test('filterEvents searches the producer severity as well as the internal one', () => {
-  const list = [{ id: 'e1', severity: 'CLOSE', displaySeverity: 'CLEAR' }];
-  assert.equal(filterEvents(list, 'clear').length, 1);
-  assert.equal(filterEvents(list, 'close').length, 1);
+test('eventSeverities offers what the badge SHOWS, from the data only', () => {
+  // The badge renders displaySeverity, so offering internal names would give the
+  // operator `CLOSE` as an option for a row labelled `CLEAR`.
+  const list = [
+    { id: 'a', severity: 'CLOSE', displaySeverity: 'CLEAR' },
+    { id: 'b', severity: 'CRITICAL', displaySeverity: 'MAJOR' },
+    { id: 'c', severity: 'CRITICAL', displaySeverity: 'MAJOR' },
+    { id: 'd', severity: 'WARNING' },   // no producer value: falls back
+  ];
+  assert.deepEqual(eventSeverities(list), ['CLEAR', 'MAJOR', 'WARNING']);
+  assert.deepEqual(eventSeverities([]), []);
+  assert.deepEqual(eventSeverities(null), []);
+});
+
+test('filterEvents applies the severity cut and the text cut together', () => {
+  const list = [
+    { id: 'a', severity: 'CRITICAL', displaySeverity: 'MAJOR', summary: 'psu fault' },
+    { id: 'b', severity: 'WARNING', displaySeverity: 'MINOR', summary: 'link flap' },
+    { id: 'c', severity: 'CLOSE', displaySeverity: 'CLEAR', summary: 'link restored' },
+  ];
+  assert.equal(filterEvents(list, '', '').length, 3, 'no cut at all');
+  assert.deepEqual(filterEvents(list, '', 'MAJOR').map((e) => e.id), ['a']);
+  // Selecting a DISPLAYED label matches only rows showing it. `MAJOR` maps down to
+  // internal CRITICAL, so matching the internal field too would have pulled in `a`
+  // when the operator asked for CRITICAL — a filter that returns rows labelled
+  // something else.
+  assert.deepEqual(filterEvents(list, '', 'CRITICAL'), []);
+  assert.deepEqual(filterEvents(list, '', 'CLEAR').map((e) => e.id), ['c']);
+  // The internal name is not an offered option and does not match either.
+  assert.deepEqual(filterEvents(list, '', 'CLOSE'), []);
+  // A row with no producer value falls back to the internal name, which is what its
+  // badge renders, so that label is selectable.
+  assert.deepEqual(filterEvents([{ id: 'x', severity: 'WARNING' }], '', 'WARNING').map((e) => e.id), ['x']);
+  assert.deepEqual(filterEvents(list, 'link', 'MINOR').map((e) => e.id), ['b']);
+  assert.deepEqual(filterEvents(list, 'psu', 'MINOR'), []);
 });
 
 // ------------------------------------------- tab badges are per-tab, never shared

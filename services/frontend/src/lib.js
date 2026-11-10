@@ -605,6 +605,26 @@ export function closedSeverities(rows) {
 }
 
 /**
+ * Distinct severities present in the All Events rows, for the filter's options.
+ *
+ * Returns what the operator SEES — `displaySeverity`, the producer's own value —
+ * rather than the internal one. The badge renders the producer's name, so an option
+ * list of internal names would offer `CLOSE` for rows labelled `CLEAR`; picking what
+ * you can see has to work.
+ *
+ * Derived from the data, not a fixed list: a window of two events should not offer
+ * eight severities that match nothing.
+ */
+export function eventSeverities(events) {
+  const set = new Set();
+  for (const e of events || []) {
+    const sev = e?.displaySeverity || e?.severity;
+    if (sev) set.add(sev);
+  }
+  return [...set].sort();
+}
+
+/**
  * Filter the All Events rows.
  *
  * Same shape as `filterClosedAlerts` and for the same reason: pure and exported so
@@ -614,12 +634,25 @@ export function closedSeverities(rows) {
  *
  * @param {Array} events   view events (already through `toViewEvent`)
  * @param {string} text    free text, case-insensitive
+ * @param {string} severity  exact severity, or '' for all. Matched against the
+ *   label the BADGE renders — `displaySeverity`, falling back to the internal one
+ *   when the producer sent none.
+ *
+ *   Matching the internal field as well looked helpful and was not: the option list
+ *   is built from displayed labels, so selecting `CRITICAL` matched every row whose
+ *   stored severity was CRITICAL — including rows badged `MAJOR`, because MAJOR maps
+ *   down to CRITICAL on ingest. The operator picks a value and gets rows showing a
+ *   different one, which reads as a broken filter. One label, one meaning.
  */
-export function filterEvents(events, text) {
+export function filterEvents(events, text, severity) {
   const needle = String(text || '').trim().toLowerCase();
   const list = events || [];
-  if (!needle) return list;
-  return list.filter((e) => {
+  const want = String(severity || '');
+  const bySeverity = want
+    ? list.filter((e) => (e.displaySeverity || e.severity) === want)
+    : list;
+  if (!needle) return bySeverity;
+  return bySeverity.filter((e) => {
     const hay = [
       e.id, e.source, e.type, e.severity, e.displaySeverity,
       e.summary, e.device, e.agent, e.agentOwner, e.eventKey, e.environment,

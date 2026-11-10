@@ -41,6 +41,7 @@ import {
   filterClosedAlerts,
   closedSeverities,
   filterEvents,
+  eventSeverities,
   tabBadgeCount,
   linkState,
   insertAllEvent,
@@ -191,8 +192,14 @@ function buildTheme(mode) {
       MuiAppBar: {
         defaultProps: { elevation: 0, color: 'default' },
         styleOverrides: {
-          root: { borderBottom: '1px solid', borderColor: 'divider',
-                  backgroundImage: 'none' },
+          root: {
+            // No border on the AppBar itself: the tab strip's band IS the
+            // separator (see MuiTabs below). Two lines with a gap between them
+            // read as an accident, not as a frame.
+            backgroundImage: 'none',
+            // A tight column so the band can sit flush under the tab strip.
+            padding: 0,
+          },
         },
       },
       MuiToolbar: {
@@ -239,13 +246,30 @@ function buildTheme(mode) {
           // width:100% because a scrollable Tabs strip shrink-wraps its content;
           // without it the bar (and the Toolbar above it) collapse to the width
           // of the tab labels and sit centred in the AppBar.
-          root: { minHeight: 40, width: '100%', borderBottom: '1px solid',
-                  borderColor: 'divider' },
+          root: { minHeight: 40, width: '100%' },
           // The indicator is HIDDEN because the selected tab now carries a filled
           // background. Keeping both would draw a 2px underline directly beneath a
           // rounded fill, which reads as a rendering seam rather than as emphasis —
           // two signals for the same state, one of them ugly.
           indicator: { display: 'none' },
+          // `list` carries the band, not `root`: root is the flex COLUMN that also
+          // holds the scroller's overflow, and a border there is drawn over the
+          // scroll area. The slot was renamed from `flexContainer` in v9 — styling
+          // `flexContainer` silently does nothing, the same class of silent no-op
+          // as the Stack `alignItems` prop. The band is a 6px dark-green rule that
+          // replaces BOTH the old tab underline and the AppBar border, so there is
+          // exactly one separator between the tabs and the data.
+          //
+          // `paddingBottom` is what detaches the band from the selected tab. A tab
+          // fills the list's content box, so with no padding its rounded green fill
+          // sat directly on the band and the two colours ran together as one thick
+          // block. 10px, not 6: at 6 the gap was the same thickness as the band, so
+          // the eye read the pair as one striped rule rather than a fill and a
+          // separate separator.
+          list: {
+            paddingBottom: 10,
+            borderBottom: '6px solid var(--band)',
+          },
         },
       },
       MuiButton: { defaultProps: { size: 'small', disableElevation: true } },
@@ -1576,9 +1600,16 @@ function App() {
   // All Events filter. Same reasoning as the Closed tab: the page is bounded, so
   // filtering client-side keeps typing instant.
   const [eventFilter, setEventFilter] = useState('');
+  const [eventSeverity, setEventSeverity] = useState('');
   const allEventRows = useMemo(
-    () => filterEvents(allEvents.events, eventFilter),
-    [allEvents.events, eventFilter],
+    () => filterEvents(allEvents.events, eventFilter, eventSeverity),
+    [allEvents.events, eventFilter, eventSeverity],
+  );
+  // Options come from the DATA, not a fixed list of eight severities: a window that
+  // holds two events should not offer six options that match nothing.
+  const eventSeverityOptions = useMemo(
+    () => eventSeverities(allEvents.events),
+    [allEvents.events],
   );
 
   const closedRows = useMemo(
@@ -1864,11 +1895,10 @@ function App() {
       <Box role="tabpanel" id="panel-alerts" aria-labelledby="tab-alerts"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
-        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
-          <Typography variant="h2">Open alerts</Typography>
-          <Chip label={sortedAlerts.length} size="small" variant="outlined" />
-          <Box sx={{ flex: 1 }} />
-        </Stack>
+        {/* No heading and no count chip: the tab strip sits directly above and its
+            badge already carries both the name and the number. The row held
+            nothing else, so it is gone rather than left as an empty 40px band of
+            vertical space above the data. */}
         {/* No selection banner by design. Selecting rows is purely a pointer
             state; every action lives in the right-click menu, which is where the
             operator already goes for a single row. A toolbar that appears on
@@ -1986,8 +2016,11 @@ function App() {
       <Box role="tabpanel" id="panel-events" aria-labelledby="tab-events"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
+        {/* No heading: the tab above names the pane. The chip stays because
+            "75 of last 500" carries the buffer LIMIT, which the badge does not
+            show — it is the difference between "all of it" and "the newest
+            slice", and that distinction matters when reading a tail. */}
         <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
-          <Typography variant="h2">Live events</Typography>
           <Chip label={`${shownEvents.length} of last ${EVENT_LIMIT}`} size="small" variant="outlined" />
           {paused ? <Chip label="paused" size="small" color="warning" /> : null}
           <Box sx={{ flex: 1 }} />
@@ -2120,13 +2153,31 @@ function App() {
               the data on a screen whose whole job is showing rows. The `flex: 1`
               with a `maxWidth` lets it absorb the free space up to a readable
               width, pushing the refresh button to the right edge. */}
+          {/* Severity picker FIRST on the row, then free text. Severity is the coarse
+              cut an operator makes before typing anything — "only the criticals in
+              the last 24 hours" — and putting it after the search box made it read
+              as an afterthought, below the fold on a narrow window. */}
+          <FormControl sx={{ width: 150, flex: '0 0 auto' }}>
+            <InputLabel id="evt-sev-label">Severity</InputLabel>
+            <Select
+              labelId="evt-sev-label"
+              label="Severity"
+              value={eventSeverity}
+              onChange={(e) => setEventSeverity(e.target.value)}
+            >
+              <MenuItem value="">All severities</MenuItem>
+              {eventSeverityOptions.map((sev) => (
+                <MenuItem key={sev} value={sev}>{sev}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <TextField
             type="search"
             value={eventFilter}
             onChange={(e) => setEventFilter(e.target.value)}
             placeholder="Filter by key, device, severity, summary, agent…"
             inputProps={{ 'aria-label': 'Filter all events' }}
-            sx={{ flex: '1 1 320px', minWidth: 200, maxWidth: 520 }}
+            sx={{ flex: '1 1 260px', minWidth: 0, maxWidth: 460 }}
           />
           <Tooltip title={allEvents.loading ? 'Loading…' : 'Re-read this window'}>
             {/* marginLeft:auto, not a flex spacer: a spacer Box and the search
@@ -2168,7 +2219,9 @@ function App() {
           </Typography>
         ) : allEventRows.length === 0 ? (
           <Typography variant="body2" color="text.secondary">
-            No events match the filter.
+            No events match the {eventFilter.trim() && eventSeverity
+              ? 'filter and severity'
+              : eventSeverity ? 'selected severity' : 'filter'}.
           </Typography>
         ) : (
           <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
@@ -2238,30 +2291,22 @@ function App() {
       <Box role="tabpanel" id="panel-closed" aria-labelledby="tab-closed"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
+        {/* No heading: the tab above names the pane. The chips stay — "last 7
+            days" is the WINDOW, which the tab badge does not show, and "stale"
+            describes the fetched list rather than the badge's live count.
+            The count chip is GONE: it duplicated the tab badge, and the badge is
+            the one that moves the moment something closes, so the two disagreed
+            for the length of a fetch — two numbers for one thing, one of them
+            behind. `N of M loaded` in the filter row already reports what was
+            actually read. */}
         <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
-          <Typography variant="h2">Closed</Typography>
           <Chip label={`last 7 days`} size="small" variant="outlined" />
-          <Chip label={closed.count} size="small" variant="outlined" />
           {/* Stale means "closures have happened since these rows were read".
               Without saying so, the chip and the list disagree and both look
               wrong rather than one looking out of date. */}
           {closed.loadedAt ? null : (
             <Chip label="stale" size="small" color="warning" variant="outlined" />
           )}
-          <Box sx={{ flex: 1 }} />
-          <Tooltip title={closed.loading ? 'Loading…' : 'Re-read the closed list'}>
-            <span>
-              <IconButton
-                size="small"
-                onClick={loadClosed}
-                disabled={closed.loading}
-                aria-label="Reload closed alerts"
-                sx={{ flex: '0 0 auto' }}
-              >
-                {closed.loading ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
-              </IconButton>
-            </span>
-          </Tooltip>
         </Stack>
 
         {/* Search. Client-side, over the rows already fetched, because the window
@@ -2299,6 +2344,19 @@ function App() {
               clear
             </Button>
           ) : null}
+          <Tooltip title={closed.loading ? 'Loading…' : 'Re-read the closed list'}>
+            <span style={{ display: 'flex', alignItems: 'center' }}>
+              <IconButton
+                size="small"
+                onClick={loadClosed}
+                disabled={closed.loading}
+                aria-label="Reload closed alerts"
+                sx={{ flex: '0 0 auto' }}
+              >
+                {closed.loading ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
+              </IconButton>
+            </span>
+          </Tooltip>
           <Box sx={{ flex: 1 }} />
           <Typography variant="caption" color="text.secondary">
             {closedRows.length} of {closed.alerts.length} loaded

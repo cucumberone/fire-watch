@@ -249,6 +249,51 @@ Trade-off: `Always` needs the registry reachable on every container start. Once
 production pins an immutable tag or digest (§7), `IfNotPresent` becomes correct
 again, because the tag then *is* the identity. Until then, `Always`.
 
+## 7.2 Weekly purge of old versions
+
+`.github/workflows/purge-image-versions.yaml` deletes old GHCR versions every
+Monday at 03:17 UTC, keeping **only the version currently tagged `latest`** for
+each of the five services.
+
+Run it manually with `dry_run` (the default) to see what it would remove.
+
+### It contradicts §7, and that has to be a choice
+
+§7 tells production to pin a Deployment to `sha-<short>` or a digest. This workflow
+**deletes those tags**. A production deployment pinned to a sha tag will break on
+the next purge — and because every Deployment sets `imagePullPolicy: Always`
+(§7.1), the pod cannot fall back to a cached layer: it goes into
+`ImagePullBackOff`, and GHCR has no undelete.
+
+So this is only coherent while everything deploys `latest`. Before production pins
+anything, either:
+
+- stop running the purge, or
+- run it with `keep_referenced: true`, which reads the Deployments in the namespace
+  and keeps every tag they reference.
+
+`keep_referenced` needs cluster access the workflow does not have today, so it is
+off by default and fails loudly if kubectl is unavailable rather than silently
+purging more than intended.
+
+### Guards
+
+Deletion is irreversible and a `latest` tag is **opt-in** per build, so a naive
+"not tagged latest" rule would empty a package whose builds never pushed `latest`.
+Four checks prevent that:
+
+| Guard | Why |
+|---|---|
+| no version tagged `latest` → skip the package **and fail the job** | otherwise every version matches "not latest" and the package is emptied |
+| a package with one version is left alone | nothing to gain, everything to lose |
+| `dry_run` defaults to **true** on manual dispatch | the destructive path is an explicit choice; a *scheduled* run uses `false`, or it would do nothing forever |
+| a failed delete fails the job | a weekly job that half-works and reports success is how growth goes unnoticed until the storage quota |
+
+Two implementation details worth keeping: the delete loop reads from a here-doc
+rather than a pipe (a piped loop runs in a subshell and `fail=1` inside it is
+discarded), and the package name is URL-encoded in the API path (`fire-watch%2Fworker`)
+because an unencoded slash 404s and reads as "package does not exist".
+
 ## 8. Deliberate omissions
 
 | Omitted | Why |

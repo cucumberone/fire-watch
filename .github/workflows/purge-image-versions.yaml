@@ -1,0 +1,229 @@
+name: purge image versions
+
+# Deletes old versions of this repository's GHCR packages, keeping ONLY the
+# version currently tagged `latest` for each service.
+#
+#   ghcr.io/cucumberone/fire-watch/{worker,ws-gateway,frontend,http-ingress,sentinel-bridge}
+#
+# ## Why this needs more care than it looks
+#
+# **Deletion is irreversible.** GHCR has no undelete: a purged version is gone, and
+# the images are private, so there is no upstream to re-pull from.
+#
+# That would still be recoverable if a node has the layer cached — except every
+# Deployment here sets `imagePullPolicy: Always`, so a container start ALWAYS goes
+# to the registry. A deleted tag therefore cannot be served from cache; the pod
+# goes into ImagePullBackOff.
+#
+# ## The conflict with docs/images.md §7
+#
+# §7 tells production to PIN a deployment to `sha-<short>` or a digest, because
+# `latest` is mutable and "anything that moves latest silently changes what a
+# restarted pod runs". This workflow deletes those pinned tags.
+#
+# So: as configured, a production deployment pinned to a sha tag WILL break on the
+# next purge. That is not a theoretical risk — it is the documented pinning
+# strategy. If production starts pinning, this workflow must stop keeping only
+# `latest` and instead keep every version a live Deployment references.
+#
+# The `keep_referenced` input exists for exactly that: it reads the Deployments in
+# the target namespace and keeps every image they reference. It is not the default
+# because it needs cluster access this workflow does not have today.
+#
+# ## Safeguards
+#
+# 1. `dry_run` defaults to true on manual dispatch. A schedule fires with it
+#    false (a scheduled run would otherwise do nothing, forever).
+# 2. Refuses to delete ANYTHING for a package when no version carries `latest`.
+#    Without that check, a package whose `latest` was never pushed — every build
+#    has `push_latest` opt-in — would match "not tagged latest" on every version
+#    and be emptied.
+# 3. Refuses to delete the last remaining version of a package.
+# 4. Runs fail loudly. A weekly job that silently does nothing looks identical to
+#    one that is working, which is how untagged-version growth goes unnoticed
+#    until the org hits its storage limit.
+
+on:
+  schedule:
+    # Mondays 03:17 UTC. Off the hour on purpose: `0 * * * *` is when everyone
+    # schedules, and the purge does not need to be prompt.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be deleted, delete nothing
+        type: boolean
+        # Default true: the destructive path should be an explicit choice.
+        default: true
+      keep_referenced:
+        description: Also keep versions referenced by Deployments (requires cluster access)
+        type: boolean
+        default: false
+      namespace:
+        description: Namespace to read Deployment images from (only with keep_referenced)
+        type: string
+        default: fire-watch
+
+# One purge at a time, and never cancelled halfway: an interrupted delete just
+# leaves more behind, but two overlapping runs could both decide a version is
+# deletable and race.
+concurrency:
+  group: purge-image-versions
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Deleting a package VERSION needs `packages: write`. `read` is not enough and
+  # fails with 403 that reads like an auth problem rather than a permission one.
+  packages: write
+
+env:
+  # Lowercase and hard-coded, matching the IMAGE env in the five build workflows.
+  OWNER: cucumberone
+  PREFIX: fire-watch
+  SERVICES: >-
+    worker ws-gateway frontend http-ingress sentinel-bridge
+
+jobs:
+  purge:
+    name: purge ${{ inputs.dry_run == false && 'LIVE' || 'dry-run' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain the run
+        run: |
+          echo "services : $(echo $SERVICES | tr '\n' ' ')"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "trigger  : schedule (deletes for real)"
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "trigger  : manual, DRY RUN — nothing will be deleted"
+          else
+            echo "trigger  : manual, LIVE — versions will be deleted"
+          fi
+
+      - name: Purge old versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+          KEEP_REFERENCED: ${{ inputs.keep_referenced || 'false' }}
+          NAMESPACE: ${{ inputs.namespace || 'fire-watch' }}
+        run: |
+          set -euo pipefail
+
+          # Which versions must survive, beyond `latest`. Populated only when
+          # keep_referenced is on; a pinned sha tag lands here.
+          #
+          # Initialised empty: `set -u` would abort the whole step on the FIRST
+          # package when the flag is off, because the variable is otherwise never
+          # assigned. That failed the scheduled run outright.
+          referenced=""
+          if [ "$KEEP_REFERENCED" = "true" ]; then
+            if ! command -v kubectl >/dev/null 2>&1; then
+              echo "::error::keep_referenced needs kubectl and a kubeconfig; neither is available in this job"
+              exit 1
+            fi
+            # Every image an existing Deployment actually references, reduced to
+            # its tag. Digests are not tags and cannot be matched here, which is
+            # another reason to prefer pinning by tag.
+            referenced=$(kubectl -n "$NAMESPACE" get deploy -o jsonpath \
+              '{range .items[*]}{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}{end}' \
+              | sed 's/.*://' | sort -u)
+            echo "referenced tags:"; echo "$referenced" | sed 's/^/  /'
+          fi
+
+          fail=0
+          summary=""
+
+          for svc in $SERVICES; do
+            # The GHCR package name is the path after the owner: `fire-watch/worker`.
+            # It must be URL-encoded — an unencoded slash 404s, which reads as
+            # "package does not exist" rather than "bad URL".
+            pkg="${PREFIX}/${svc}"
+            enc="${PREFIX}%2F${svc}"
+            echo
+            echo "=== ${OWNER}/${pkg} ==="
+
+            versions=$(gh api --paginate \
+              "/orgs/${OWNER}/packages/container/${enc}/versions?per_page=100" 2>/dev/null) || {
+                echo "::error::could not list versions for ${pkg} — check that the package exists and that GITHUB_TOKEN can read it"
+                fail=1
+                continue
+            }
+
+            total=$(echo "$versions" | jq 'length')
+            if [ "$total" -eq 0 ]; then
+              echo "  no versions; nothing to do"
+              continue
+            fi
+
+            # A version is "the latest" if ANY of its tags is exactly `latest`.
+            latest_id=$(echo "$versions" | jq -r '
+              [ .[] | select(.metadata.container.tags | index("latest")) | .id ] | first // empty
+            ')
+
+            # ---- guard 1: no `latest` means we cannot know what to keep -------
+            if [ -z "$latest_id" ]; then
+              echo "::error::${pkg} has no version tagged 'latest'. Refusing to delete: every build makes sha-/manual- tags optional-but-always, and 'latest' is opt-in, so 'not latest' would match EVERY version and empty the package."
+              fail=1
+              continue
+            fi
+
+            # ---- guard 2: never empty a package --------------------------------
+            if [ "$total" -le 1 ]; then
+              echo "  single version (${latest_id}); nothing to purge"
+              continue
+            fi
+
+            # Build the delete list: everything except the latest version, and
+            # (when asked) except any version whose tags are referenced by a
+            # Deployment.
+            to_delete=$(echo "$versions" | jq -c --arg latest "$latest_id" --arg refs "$referenced" '
+              ($refs | split("\n") | map(select(length > 0))) as $keepTags
+              | [ .[]
+                  | select(.id != ($latest | tonumber))
+                  | select( ((.metadata.container.tags // []) | any(. as $t | $keepTags | index($t)) ) | not )
+                  | { id, tags: (.metadata.container.tags // []) }
+                ]
+            ')
+
+            n=$(echo "$to_delete" | jq 'length')
+            echo "  ${total} version(s), keeping ${latest_id} (latest) => ${n} to delete"
+            echo "$to_delete" | jq -r '.[] | "    id=\(.id) tags=[\(.tags | join(","))]"'
+
+            if [ "$DRY_RUN" = "true" ]; then
+              summary="${summary}| ${svc} | ${total} | ${n} | dry run |\n"
+              continue
+            fi
+
+            deleted=0
+            # `while read` over a HERE-DOC, not a pipe. A piped loop runs in a
+            # subshell, so `fail=1` on a failed delete would be discarded and the
+            # step would report success while having silently skipped versions.
+            # (`mapfile` would also work, but it is bash 4+ and this has to run
+            # under whatever bash the runner provides.)
+            while IFS= read -r vid; do
+              [ -n "$vid" ] || continue
+              if gh api -X DELETE \
+                "/orgs/${OWNER}/packages/container/${enc}/versions/${vid}" >/dev/null 2>&1; then
+                echo "    deleted ${vid}"
+                deleted=$((deleted + 1))
+              else
+                echo "::error::failed to delete ${pkg} version ${vid}"
+                fail=1
+              fi
+            done <<< "$(echo "$to_delete" | jq -r '.[].id')"
+            summary="${summary}| ${svc} | ${total} | ${deleted} | deleted |\n"
+          done
+
+          {
+            echo "### GHCR purge"
+            if [ "$DRY_RUN" = "true" ]; then echo "_dry run — nothing was deleted_"; fi
+            echo
+            echo "| service | versions | candidates | result |"
+            echo "|---|---|---|---|"
+            printf "$summary"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more packages could not be processed; see the log above"
+            exit 1
+          fi

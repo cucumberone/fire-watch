@@ -515,6 +515,18 @@ tested directly rather than through a rendered table):
 `truncated` from the server is surfaced as a notice rather than a silent cut: a
 busy week must not look smaller than it is.
 
+**The tab badge counts closures, not loaded rows.** `closedState` carries a
+separate `count` that a retirement frame increments immediately, so the badge is
+honest the moment something closes. Deriving it from `alerts.length` made it look
+frozen until the tab was opened, because the badge was reporting "rows I happen to
+have fetched" rather than "closures that have happened". A fetch resets `count` to
+what the server actually holds, which also corrects drift and the case where a
+`truncated` page caps `alerts`.
+
+Because the rows lag the count, the pane says so explicitly with a `stale` chip
+when `loadedAt` is null. Without it the chip and the list disagree and both read
+as wrong, rather than one reading as out of date.
+
 Two loading states, deliberately distinct: "Nothing has closed in the last 7 days"
 is a real answer (the list was fetched), whereas "Open this tab to load" means it
 has not been fetched yet. Conflating them would make an unfetched tab look like a

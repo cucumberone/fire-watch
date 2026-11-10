@@ -401,8 +401,16 @@ function useSocket(config) {
   // The Closed tab's data. Held here rather than in the tab component so it
   // survives switching tabs — re-fetching 7 days of closures every time the
   // operator flips between tabs would be both slow and pointless.
+  //
+  // `count` exists separately from `alerts.length` because the two can disagree:
+  // a retirement increments `count` IMMEDIATELY (so the tab badge is honest the
+  // moment something closes) while `alerts` only catches up on the next fetch.
+  // Deriving the badge from `alerts.length` made it look frozen until the tab was
+  // opened — the badge was reporting "rows I happen to have loaded", not "closures
+  // that have happened".
   const [closedState, setClosedState] = useState({
-    alerts: [], loading: false, error: null, truncated: false, loadedAt: null,
+    alerts: [], count: 0, loading: false, error: null, truncated: false,
+    loadedAt: null,
   });
 
   const wsRef = useRef(null);
@@ -477,15 +485,22 @@ function useSocket(config) {
           return next;
         });
       }
-      // A retirement means the Closed tab just gained a row. Mark it stale rather
-      // than re-fetching immediately: a bulk close of 40 alerts would otherwise
-      // fire 40 round trips, and the operator is not looking at the Closed tab
-      // while closing things on the Open tab. The tab reloads on next open (or on
-      // `refresh`) because `loadedAt` is cleared.
+      // A retirement means the Closed tab just gained a row.
+      //
+      // `count` moves NOW so the tab badge is honest without waiting for a fetch.
+      // `loadedAt` is cleared so the list re-fetches on next open — the rows
+      // themselves are not appended here because the frame does not carry the
+      // closure metadata (closedAt / closedBy) the tab needs, and inventing it
+      // would show a row that disagrees with the server.
       if (frame.applied === 3) {
-        setClosedState((prev) => (prev.alerts.length || prev.loadedAt
-          ? { ...prev, loadedAt: null }
-          : prev));
+        setClosedState((prev) => ({
+          ...prev,
+          // Only count it if we know the closure is new to us. An alert that was
+          // never in the loaded set still increments: the badge tracks closures
+          // observed, not closures that happen to be on screen.
+          count: prev.count + 1,
+          loadedAt: null,
+        }));
       }
       return;
     }
@@ -516,6 +531,11 @@ function useSocket(config) {
       }
       setClosedState({
         alerts: next,
+        // A fetch is authoritative: it resets the count to what the server
+        // actually holds, correcting any drift from closures observed while the
+        // tab was open (or a `truncated` page, where `alerts` is capped but the
+        // real total is larger).
+        count: next.length,
         loading: false,
         error: null,
         truncated: Boolean(frame.truncated),
@@ -1518,9 +1538,13 @@ function App() {
             aria-label="Views"
           >
             {TABS.map((t) => {
+              // The Closed badge reads `closed.count`, not `alerts.length`: the
+              // count moves the moment something closes, while the rows only
+              // catch up on the next fetch. Using the row count made the badge
+              // look frozen until the tab was opened.
               const count = t.id === 'alerts' ? sortedAlerts.length
                 : t.id === 'events' ? shownEvents.length
-                : closed.alerts.length;
+                : closed.count;
               return (
                 <Tab
                   key={t.id}
@@ -1789,7 +1813,13 @@ function App() {
         <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
           <Typography variant="h2">Closed</Typography>
           <Chip label={`last 7 days`} size="small" variant="outlined" />
-          <Chip label={closedRows.length} size="small" variant="outlined" />
+          <Chip label={closed.count} size="small" variant="outlined" />
+          {/* Stale means "closures have happened since these rows were read".
+              Without saying so, the chip and the list disagree and both look
+              wrong rather than one looking out of date. */}
+          {closed.loadedAt ? null : (
+            <Chip label="stale" size="small" color="warning" variant="outlined" />
+          )}
           <Box sx={{ flex: 1 }} />
           <Button startIcon={<RefreshIcon />} onClick={resetClosedWidths}
                   sx={{ whiteSpace: 'nowrap', flex: '0 0 auto' }}>
@@ -1842,7 +1872,7 @@ function App() {
           ) : null}
           <Box sx={{ flex: 1 }} />
           <Typography variant="caption" color="text.secondary">
-            {closedRows.length} of {closed.alerts.length}
+            {closedRows.length} of {closed.alerts.length} loaded
           </Typography>
         </Stack>
 

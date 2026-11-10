@@ -126,7 +126,7 @@ With ten columns the drawer is horizontally tight, so:
   unreadable, and a timestamp split across two lines is worse than a scrollbar.
   Cells are `white-space: nowrap` with `text-overflow: ellipsis`; the container
   scrolls horizontally. The full text of any record is available from the
-  right-click **Information** panel (§5.5).
+  right-click **Information** panel (§5.7).
 - headers may still wrap, because a wrapped header costs a line while a wrapped
   value corrupts the value
 - the tables are `table-layout: fixed` inside a `.tablewrap` with `overflow-x:
@@ -307,7 +307,70 @@ Two deliberate interactions with the always-on styles:
 
 Colour is never the only signal: the `sev` badge still carries the severity as text on every row.
 
-### 5.3 Live events drawer
+### 5.3 Eventless frames — and the blank page they caused
+
+A **content duplicate** is absorbed by the worker: the copy is discarded and only
+the rollup moves, so the gateway fans out `{kind:'occurrence', key, applied}` with
+**no event attached** ([event-lifecycle.md](event-lifecycle.md) §5.4). The client
+still has to increment that row's count — `count` is owned by the fold.
+
+The first version of `applyAlert` handled that by falling back to `undefined` for
+`severity` when the row was new. That produced a row with no severity, and the
+Badge rendered it with:
+
+```js
+<span className={`sev sev-${severity.toLowerCase()}`}>{severity}</span>
+```
+
+`severity` was `undefined`, so this threw **during render**. React unmounts the
+whole tree when a render throws, so the page went completely blank — the app
+looked crashed, and a browser refresh was the only way back. Firing
+`send-same-event.mjs` was enough to trigger it, because every repeat after the
+first is a content duplicate.
+
+Two independent fixes, because either alone would leave the other latent:
+
+1. `applyAlert` will not create a row from a frame with **no event** when the key
+   has never been seen. The first delivery of a condition always carries its
+   event, so an eventless frame for an unseen key means this client missed the
+   original — the next `resync` supplies the real row. Ignoring it cannot make the
+   server's state wrong, only this client briefly stale.
+2. `Badge` tolerates a missing severity and renders an `unknown` badge instead of
+   throwing. A single malformed frame must never be able to blank the page, so no
+   render path is allowed to assume a field is present.
+
+An eventless frame for a row that **does** already exist still increments the
+count and moves `lastSeen`, and never downgrades a known severity. Three tests in
+`lib.test.js` pin all of this, including one that walks a frame sequence and
+asserts every resulting row is renderable.
+
+### 5.4 Error boundaries: a bad row must not blank the board
+
+Fixing the one `toLowerCase` call was not enough, for a structural reason: **a
+throw during render unmounts the entire React tree.** Any malformed field,
+anywhere, took the whole page black — which reads as a crashed app and is only
+recoverable with a refresh. In a monitoring UI that is the worst possible failure,
+because it happens precisely during an incident.
+
+So there are now boundaries at two levels:
+
+| Boundary | Contains |
+|---|---|
+| around `<App>` | a failure in the shell (header, config) |
+| around each table | a failure in one pane's rows |
+
+A broken row therefore costs **one pane**, and the boundary renders a fault panel
+naming what failed. The intent is that a pane never goes silently empty: an empty
+table reads as "nothing is happening", which is the most dangerous message to send
+by accident, so the panel says explicitly that the rest of the board is still live.
+
+Deliberately no automatic retry on catch — re-rendering the same bad data would
+loop. The panel waits for the next state change or a reload.
+
+This was verified by forcing a render throw in the alert table and confirming the
+header, the other pane and the socket all stayed functional.
+
+### 5.5 Live events drawer
 
 The live tail is a bottom drawer, `max-height:45vh`, closed **on a first visit**
 and remembered afterwards (`localStorage['fw:drawerOpen']` — §5). Reasons:
@@ -344,7 +407,7 @@ A partially visible row at the bottom of `main` is the scroll boundary, not the 
 | Accessibility | the handle is a real `<button>` with `aria-expanded` and `aria-controls`; the body uses `hidden`, so it leaves the tab order and the accessibility tree when closed |
 | Reflow | not persisted — every page load starts closed |
 
-### 5.4 Pause
+### 5.6 Pause
 
 The `❚❚ Pause` button freezes the **render**, not the socket. The socket keeps draining into the buffer, so resuming shows everything that arrived while paused instead of silently skipping a window.
 
@@ -352,7 +415,7 @@ The `❚❚ Pause` button freezes the **render**, not the socket. The socket kee
 - the button is `aria-pressed` and changes to `▶ Resume` plus a `paused` marker, so a paused view is never mistaken for a quiet stream
 - the count in the handle shows the frozen length while paused; on resume it jumps to the true length, which is itself evidence that nothing was dropped
 
-### 5.5 Record inspector
+### 5.7 Record inspector
 
 Right-clicking a row in either table opens a **two-level menu**:
 
@@ -387,7 +450,7 @@ so a long value is necessarily clipped at a narrow width. The record is therefor
 read here, in a panel that can be as tall as it needs, rather than by reflowing the
 row and pushing every other column out of alignment.
 
-### 5.6 Acknowledge is a menu action, not a button
+### 5.8 Acknowledge is a menu action, not a button
 
 The `Ack` column shows *state*; the *action* lives in the right-click menu. Rationale:
 

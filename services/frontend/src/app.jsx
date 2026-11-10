@@ -672,7 +672,16 @@ function useSocket(config) {
 
 // ------------------------------------------------------------------------ UI
 function Badge({ severity }) {
-  return <span className={`sev sev-${severity.toLowerCase()}`}>{severity}</span>;
+  // Severity can be absent on a row that was incremented by a content-duplicate
+  // frame: that frame carries no event, so there is nothing to read it from
+  // (docs/frontend.md §5.3.1). Rendering `undefined` here used to throw
+  // `Cannot read properties of undefined (reading 'toLowerCase')` inside render,
+  // which unmounts the whole tree and leaves a BLANK PAGE — the failure looked
+  // like a crashed app rather than one unknown row.
+  if (severity === undefined || severity === null || severity === '') {
+    return <span className="sev sev-unknown">—</span>;
+  }
+  return <span className={`sev sev-${String(severity).toLowerCase()}`}>{severity}</span>;
 }
 
 // ---------------------------------------------------------------------- icons
@@ -1185,6 +1194,7 @@ function App() {
         {sortedAlerts.length === 0
           ? <p className="dim">No open alerts.</p>
           : (
+            <PaneBoundary name="Open alerts">
             <ScrollTable
               cols={(
                 <>
@@ -1284,6 +1294,7 @@ function App() {
                 );
               })}
             />
+            </PaneBoundary>
           )}
       </section>
       </main>
@@ -1319,6 +1330,7 @@ function App() {
           {shownEvents.length === 0
             ? <p className="dim">Nothing yet.</p>
             : (
+              <PaneBoundary name="Live events">
               <ScrollTable
                 cols={(
                   <>
@@ -1394,6 +1406,7 @@ function App() {
                   );
                 })}
               />
+              </PaneBoundary>
             )}
         </div>
       </section>
@@ -1403,4 +1416,56 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+/**
+ * Error boundary: contain a render failure instead of letting it blank the app.
+ *
+ * A throw during render unmounts the ENTIRE React tree, so one malformed field
+ * anywhere turned the whole page black — which reads as "the app crashed" and is
+ * only recoverable by a browser refresh. That is exactly what happened when a
+ * content-duplicate frame created a row with no severity and `Badge` called
+ * `toLowerCase` on `undefined` (docs/frontend.md §5.3).
+ *
+ * The specific bug is fixed at its source, but the CLASS of bug must not be able
+ * to take the page down again: a monitoring UI that goes blank during an incident
+ * is worse than one that shows an error for the part that failed. So each table
+ * is wrapped separately, meaning a broken row costs one pane and the rest of the
+ * board stays usable.
+ *
+ * Deliberately not `componentDidCatch` + retry: silently re-rendering the same
+ * bad data would loop. The panel reports and waits for the next state change.
+ */
+class PaneBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    // Kept in the console on purpose: without it the UI would be the only
+    // evidence and the stack would be lost.
+    console.error(`render failed in ${this.props.name}`, error, info?.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="pane-error" role="alert">
+          <strong>{this.props.name} failed to render.</strong>
+          <span className="dim"> {String(this.state.error?.message || this.state.error)}</span>
+          <div className="dim">The rest of the board is still live. Reload to retry this panel.</div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById('root')).render(
+  <PaneBoundary name="Fire-Watch">
+    <App />
+  </PaneBoundary>,
+);

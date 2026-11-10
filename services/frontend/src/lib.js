@@ -345,8 +345,24 @@ export function applyAlert(map, { key, applied, event }) {
     // arrival at roughly now, and the alternative (keeping the old value) would
     // make Last occurrence appear frozen, which is the bug this replaced.
     const prev = next.get(key);
+    // A row that has NEVER been seen cannot be created from a frame with no
+    // event: there is no severity, no summary and no timestamp to show, so the
+    // result is a row that renders as nothing but a key. That is how the blank
+    // page happened — `severity` stayed undefined and the Badge threw during
+    // render, unmounting the tree.
+    //
+    // This is exactly what arrives when the worker ABSORBS a content duplicate:
+    // the copy is discarded, so the gateway fans out `{kind:'occurrence'}` with
+    // no event attached. The first delivery of a condition always carries its
+    // event, so an eventless frame for an unseen key means the client missed the
+    // original — the next `resync` supplies the real row. Dropping it is safe:
+    // the alert count is owned by the fold, and ignoring a frame cannot make the
+    // server's state wrong, only this client's slightly stale until it refreshes.
+    if (!event && !prev) return next;
     next.set(key, {
       key,
+      // Never downgrade a known severity to undefined because a later frame had
+      // no event to read it from.
       severity: event?.severity ?? prev?.severity,
       firstSeen: prev?.firstSeen ?? event?.brokerTs ?? Date.now(),
       lastSeen: event?.brokerTs ?? Date.now(),

@@ -519,3 +519,43 @@ test('other error frames are never treated as an unsupported op', () => {
 test('a malformed bad_op message does not arm the disable', () => {
   assert.equal(isUnsupportedOpError({ op: 'error', code: 'bad_op', message: 'unknown operation' }, 'resync'), false);
 });
+
+// -------------------------------- the blank-page regression (content duplicates)
+test('an eventless frame for an UNSEEN key creates no row', () => {
+  // This is the exact frame the gateway fans out when the worker absorbs a
+  // content duplicate: {kind:'occurrence'} has no event attached. Creating a row
+  // from it produced one with `severity: undefined`, and rendering that threw
+  // inside Badge, which unmounted the entire tree and left a blank page.
+  const out = applyAlert(new Map(), { key: 'probe-device:static.probe', applied: 1 });
+  assert.equal(out.size, 0);
+});
+
+test('an eventless frame still increments a row that already exists', () => {
+  // The count is owned by the fold, so a repeat must move it even though the
+  // client has no event to attach.
+  const first = applyAlert(new Map(), {
+    key: 'd:probe', applied: 1,
+    event: { severity: 'WARNING', brokerTs: 1000 },
+  });
+  const out = applyAlert(first, { key: 'd:probe', applied: 1 });
+  assert.equal(out.size, 1);
+  assert.equal(out.get('d:probe').count, 2);
+  assert.equal(out.get('d:probe').severity, 'WARNING'); // never downgraded
+  assert.ok(out.get('d:probe').lastSeen > 0);
+});
+
+test('a row is never left without a severity', () => {
+  // Whatever sequence of frames arrives, every row must be renderable.
+  let map = new Map();
+  const frames = [
+    { key: 'a:b', applied: 1 },                                  // unseen, no event
+    { key: 'a:b', applied: 1, event: { severity: 'FATAL', brokerTs: 1 } },
+    { key: 'a:b', applied: 1 },                                  // repeat, no event
+    { key: 'a:b', applied: 2 },                                  // coalesced alias
+  ];
+  for (const f of frames) map = applyAlert(map, f);
+  for (const row of map.values()) {
+    assert.equal(typeof row.severity, 'string', `row ${row.key} has no severity`);
+    assert.ok(row.severity.length > 0);
+  }
+});

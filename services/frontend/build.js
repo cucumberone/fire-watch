@@ -224,6 +224,10 @@ tr.retirement td { opacity:.55; }
 .sev-warning  { background:var(--sev-warning-bg);  color:var(--sev-warning-fg); }
 .sev-harmless { background:var(--sev-harmless-bg); color:var(--sev-harmless-fg); }
 .sev-close    { background:var(--sev-close-bg);    color:var(--sev-close-fg); }
+/* A row whose severity was never learned: it was incremented by a content
+   duplicate that carried no event, so there is nothing to colour it by.
+   Without this rule the badge would be unstyled rather than obviously unknown. */
+.sev-unknown  { background:var(--row-unknown);     color:var(--row-unknown-fg); }
 .status { font-size:.75rem; padding:.1rem .5rem; border-radius:999px;
           background:var(--row-unknown); color:var(--row-unknown-fg); }
 .status-open { background:#16a34a; color:#fff; }
@@ -412,6 +416,13 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
 .inspector-hint { position:sticky; bottom:0; background:var(--bg);
                   padding:.25rem .6rem; border-top:1px solid var(--line);
                   font-size:.68rem; color:var(--dim); }
+/* A render error inside one pane. Deliberately looks like a fault report rather
+   than an empty table: an empty pane would read as "nothing is happening", which
+   during an incident is the most dangerous possible message. */
+.pane-error { margin:.5rem 0; padding:.6rem .8rem; border-radius:.3rem;
+              border:1px solid rgba(239,68,68,.5);
+              background:rgba(239,68,68,.1); font-size:.8rem; line-height:1.5; }
+.pane-error strong { color:#ef4444; }
 `;
 
 async function main() {

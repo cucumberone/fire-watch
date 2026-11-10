@@ -81,17 +81,24 @@ data:
     --    ack feature (docs/acknowledge.md §6).
     if sev == 'CLOSE' or sev == 'HARMLESS' then
       redis.call('DEL', KEYS[2])
-      -- Retirement must also drop the key from the open index, or the board
-      -- would hand a stale row to every client that connects afterwards.
-      if has_index then
-        redis.call('ZREM', KEYS[3], ARGV[5])
-        -- ...and record WHEN it closed, which is what the Closed tab sorts and
-        -- filters on. Kept in the same script so the two indexes cannot
-        -- disagree: a key is in exactly one of them.
-        if KEYS[4] ~= nil then
-          redis.call('ZADD', KEYS[4], ts, ARGV[5])
-        end
+      -- Retirement MUST move the key from the open index into the closed one,
+      -- and there is no graceful fallback. An earlier version made KEYS[4]
+      -- optional so a newer worker against an older script would not error
+      -- during a rolling update — but that turned a deployment-ordering mistake
+      -- into SILENT data loss: the worker looked healthy, alerts retired, and
+      -- the Closed tab read "nothing has closed in the last 7 days" with no
+      -- error in any log.
+      --
+      -- The check is deliberately BEFORE the has_index branch. Inside it, the
+      -- `not has_index` case could never be reached and the silent skip would
+      -- come back. Refusing the call makes the worker requeue, so a ConfigMap
+      -- that lags its worker is loud rather than invisible.
+      if not has_index or KEYS[4] == nil then
+        return redis.error_reply('alert-fold: closed index key missing ' ..
+          '(the alert-fold ConfigMap must be rolled out with the worker)')
       end
+      redis.call('ZREM', KEYS[3], ARGV[5])
+      redis.call('ZADD', KEYS[4], ts, ARGV[5])
       redis.call('HSET', KEYS[1],
         'state', 'closed',
         'severity', sev,
@@ -130,7 +137,7 @@ data:
     -- Re-opening removes it from the closed index. An alert that is firing is
     -- not closed, and leaving it listed in both tabs would be a contradiction
     -- the operator has to resolve by hand.
-    if has_index and KEYS[4] ~= nil then
+    if has_index then
       redis.call('ZREM', KEYS[4], ARGV[5])
     end
     -- Keep the open index in step. The score is the last activity, so a bounded

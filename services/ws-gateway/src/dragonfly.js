@@ -337,11 +337,26 @@ export class DragonflyReader {
     // The closure metadata is not in SNAPSHOT_FIELDS, so it costs one extra
     // batched read. `closedAt` is what the tab sorts by and `closedBy` is the id
     // of the retiring event, which is what makes the row explain itself.
-    const meta = await c.pipeline(
-      rows.map((r) => ['HMGET', `fw:alert:${r.key}`, 'state', 'closed_at', 'closed_by']),
-    ).exec();
+    //
+    // ioredis's `pipeline()` takes NO argument: it returns a builder that you
+    // queue commands onto, then `exec()`. Passing an array of command tuples
+    // throws `Cannot read properties of undefined (reading 'apply')` — which is
+    // exactly the error this produced before, and it surfaced only as
+    // `closed_failed` on the wire, so the cause was invisible from the UI.
+    const pipe = c.pipeline();
+    for (const r of rows) {
+      pipe.hmget(`fw:alert:${r.key}`, 'state', 'closed_at', 'closed_by');
+    }
+    const meta = await pipe.exec();
     meta.forEach((res, i) => {
-      const [state, closedAt, closedBy] = res?.[1] || [];
+      // `exec()` resolves to `[err, value]` tuples, so a per-command error is at
+      // index 1 of the tuple, not the tuple itself.
+      const [err, value] = res || [];
+      if (err) {
+        this.log.warn('closed metadata read failed', { key: rows[i].key, err: String(err) });
+        return;
+      }
+      const [state, closedAt, closedBy] = value || [];
       rows[i].state = state || null;
       rows[i].closedAt = closedAt ? Number(closedAt) : null;
       rows[i].closedBy = closedBy || null;

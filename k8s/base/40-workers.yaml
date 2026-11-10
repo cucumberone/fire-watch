@@ -16,6 +16,21 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: worker
+      annotations:
+        # Bumped by hand whenever `alert-fold.lua` changes.
+        #
+        # A ConfigMap volume is updated in place by kubelet, but the PROCESS is
+        # not restarted and `FoldScript` only re-reads the file when its mtime or
+        # size changes *and* its reload interval has elapsed. More importantly,
+        # applying a new ConfigMap on its own leaves the old worker running: it
+        # keeps calling the script it already loaded. Changing this value forces a
+        # rolling restart, so the fold script and the worker that calls it always
+        # ship together.
+        #
+        # This is not hypothetical. A worker that passed four keys to a three-key
+        # script retired alerts silently and wrote no closed index, so the Closed
+        # tab read "nothing has closed" with no error anywhere.
+        fire-watch/alert-fold-checksum: "2"
     spec:
       terminationGracePeriodSeconds: 60
       securityContext:

@@ -558,6 +558,7 @@ keys the table does not show.
 |---|---|
 | Source record | the untouched wire event (`evt.wire`), not the view event. Otherwise every field would appear twice, once as `payload.CIF` and once as the derived `cif` |
 | Nesting | objects and arrays are flattened to dotted / indexed paths (`payload.nested.depth`, `tags[0]`) rather than stringified — the point is to see inside `payload`, not `[object Object]` |
+| Timestamps | rendered as `YYYY-MM-DD HH:MM:SS (raw)` — the same clock the tables use, with the original value kept in parentheses. Matched by FIELD NAME (`brokerTs`, `closedAt`, `firstSeen`, `ts`, `FirstOccurrence`, …), not by sniffing values, because a bare number is ambiguous: a count of `1794319171950` and a timestamp of the same value are indistinguishable, and guessing would rewrite a legitimate number. Epoch ms, epoch seconds and ISO strings are all accepted; an unparseable value falls back to the raw string rather than printing `Invalid Date` |
 | Absent vs. null | `undefined` keys are omitted (an absent field is noise); `null` is shown, because absence and explicit null are different facts. `0` and `false` are values and are shown |
 | Still-compressed fields | labelled `[gzip, N base64 chars]` rather than dumping base64 |
 | Cycles | detected with a `WeakSet` and reported as `[circular]`; a malformed payload must never blow the stack on a right-click |

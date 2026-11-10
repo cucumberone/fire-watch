@@ -220,7 +220,72 @@ export function toViewEvent(evt) {
  * absent field is noise); `null` is shown, because absence and explicit null
  * are different facts.
  */
-export function recordEntries(record) {
+/**
+ * Field names that hold an absolute point in time.
+ *
+ * The Information panel used to show these raw, which produced a list mixing
+ * three formats: `1794319171950` (epoch ms), `2026-11-10T10:00:00.000Z` (ISO) and
+ * the human clock used everywhere else in the UI. Comparing two timestamps by eye
+ * in that list is the whole reason an operator opens it.
+ *
+ * Matched by NAME rather than by sniffing values, because a bare number is
+ * ambiguous — a count of 1794319171950 and a timestamp of the same value are
+ * indistinguishable, and guessing wrong would rewrite a legitimate number.
+ */
+const TIME_KEYS = new Set([
+  'ts', 'timestamp', 'brokerts', 'broker_ts', 'closedat', 'closed_at',
+  'firstseen', 'first_seen', 'lastseen', 'last_seen', 'ackedat', 'acked_at',
+  'firstoccurrence', 'lastoccurrence', 'closedatms', 'episodestarted',
+]);
+
+/** Is this field name a timestamp? Case- and separator-insensitive. */
+export function isTimeField(name) {
+  if (typeof name !== 'string') return false;
+  // Strip separators so `brokerTs`, `broker_ts` and `broker-ts` are one key.
+  return TIME_KEYS.has(name.toLowerCase().replace(/[_.-]/g, ''));
+}
+
+/**
+ * Render a timestamp value as `YYYY-MM-DD HH:MM:SS`, keeping the raw form beside
+ * it so nothing is lost.
+ *
+ * Accepts epoch ms and ISO strings. Returns null when the value is not a usable
+ * time, so the caller can fall back to the raw rendering rather than printing
+ * "Invalid Date".
+ */
+export function formatTimeValue(value) {
+  if (value === null || value === undefined) return null;
+
+  let ms;
+  if (typeof value === 'number') {
+    // Seconds vs milliseconds: an epoch in seconds is ~1e9, ms ~1e12. Anything
+    // below 1e11 cannot be a millisecond timestamp in this century, so it is
+    // read as seconds rather than silently resolving to 1970.
+    ms = value < 1e11 ? value * 1000 : value;
+  } else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '') return null;
+    // A pure-digit string is an epoch, not a date string. `new Date('17...')`
+    // would parse it as a year.
+    if (/^-?\d+$/.test(trimmed)) {
+      const n = Number(trimmed);
+      ms = n < 1e11 ? n * 1000 : n;
+    } else {
+      ms = Date.parse(trimmed);
+    }
+  } else {
+    return null;
+  }
+
+  if (!Number.isFinite(ms)) return null;
+  const human = formatClock(ms);
+  if (!human) return null;
+  // The raw value is kept in parentheses: the exact instant still matters when
+  // correlating with a producer's log, and hiding it would be a lossy "fix".
+  return `${human}  (${value})`;
+}
+
+export function recordEntries(record, { formatTimes = true } = {}) {
   const out = [];
   // A cycle is not expected on the wire, but right-clicking a record must never
   // be able to blow the stack — one malformed payload would blank the whole UI.
@@ -258,6 +323,20 @@ export function recordEntries(record) {
       }
       for (const k of keys) walk(value[k], path === '' ? k : `${path}.${k}`);
       return;
+    }
+    // Leaf value. `String(value)` for everything, except a field whose NAME says
+    // it is a timestamp — then show the human clock with the raw value kept in
+    // parentheses. The leaf key is the last path segment, so `payload.firstSeen`
+    // is recognised without the container name mattering.
+    if (formatTimes) {
+      const leaf = path.slice(path.lastIndexOf('.') + 1).replace(/\[\d+\]$/, '');
+      if (isTimeField(leaf)) {
+        const pretty = formatTimeValue(value);
+        if (pretty) {
+          out.push([path, pretty]);
+          return;
+        }
+      }
     }
     out.push([path, String(value)]);
   };

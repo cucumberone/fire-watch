@@ -25,6 +25,8 @@ import {
   isUnsupportedOpError,
   filterClosedAlerts,
   closedSeverities,
+  isTimeField,
+  formatTimeValue,
 } from './lib.js';
 
 const gunzip = async (bytes) => gunzipSync(Buffer.from(bytes));
@@ -779,4 +781,54 @@ test('closedSeverities lists what the data actually contains, sorted', () => {
   ];
   assert.deepEqual(closedSeverities(rows), ['CLOSE', 'HARMLESS']);
   assert.deepEqual(closedSeverities(null), []);
+});
+
+// --------------------- the Information panel renders every time the same way
+test('epoch ms, ISO and nested time fields all render as the local clock', () => {
+  const entries = recordEntries({
+    id: 'e1', brokerTs: 1794319171950, closedAt: 1794319171950,
+    ts: '2026-11-10T10:00:00.000Z',
+    payload: { FirstOccurrence: '2026-11-10T09:00:00Z' },
+  });
+  const by = Object.fromEntries(entries);
+  // Each begins with the same YYYY-MM-DD HH:MM:SS shape...
+  for (const k of ['brokerTs', 'closedAt', 'ts', 'payload.FirstOccurrence']) {
+    assert.match(by[k], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+\(/, `${k} not formatted: ${by[k]}`);
+  }
+  // ...and keeps the raw value so nothing is lost.
+  assert.match(by.brokerTs, /\(1794319171950\)$/);
+  assert.match(by.ts, /\(2026-11-10T10:00:00\.000Z\)$/);
+});
+
+test('a NON-time field keeps its raw value even if it looks like an epoch', () => {
+  // Guessing by value would rewrite a legitimate number. Matching is by name.
+  const by = Object.fromEntries(recordEntries({ count: 1794319171950, size: '1794319171950' }));
+  assert.equal(by.count, '1794319171950');
+  assert.equal(by.size, '1794319171950');
+});
+
+test('separator and case variants of a time field are recognised', () => {
+  for (const name of ['brokerTs', 'broker_ts', 'broker-ts', 'BROKERTS']) {
+    assert.equal(isTimeField(name), true, `${name} should be a time field`);
+  }
+  for (const name of ['count', 'severity', 'msg', 'id']) {
+    assert.equal(isTimeField(name), false, `${name} should not be a time field`);
+  }
+});
+
+test('a time field holding something unparseable falls back to the raw string', () => {
+  // Better a plain value than "Invalid Date".
+  const by = Object.fromEntries(recordEntries({ brokerTs: 'not-a-date' }));
+  assert.equal(by.brokerTs, 'not-a-date');
+});
+
+test('epoch SECONDS are read as seconds, not as 1970', () => {
+  const by = Object.fromEntries(recordEntries({ brokerTs: 1794319171 }));
+  assert.match(by.brokerTs, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  assert.ok(!by.brokerTs.startsWith('1970'), by.brokerTs);
+});
+
+test('formatTimes:false leaves the record completely raw', () => {
+  const by = Object.fromEntries(recordEntries({ brokerTs: 1794319171950 }, { formatTimes: false }));
+  assert.equal(by.brokerTs, '1794319171950');
 });

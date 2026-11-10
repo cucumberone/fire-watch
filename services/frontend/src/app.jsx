@@ -2781,12 +2781,34 @@ function App() {
                       .map((x) => `${x.source}:${x.type}`),
                   )];
                   const collapsing = targets.length > alertKeys.length;
+                  // Fill the alert-derived columns from the client's OWN alert map
+                  // when the row came from a live frame rather than a query.
+                  //
+                  // `op: event` carries no alert state — only `op: allEvents` replies
+                  // are enriched — so a row that arrived live showed `—` for Count and
+                  // could show a stale State, while a queried row for the same alert
+                  // showed the real numbers. Measured: the same 3-occurrence alert read
+                  // `3` from a query and `—` after one live arrival.
+                  //
+                  // The client already holds this: `alerts` is maintained from the
+                  // fold's own frames. Server-supplied values win where present, so a
+                  // query reply is still authoritative.
+                  const alertKeyForRow = e.source && e.type ? `${e.source}:${e.type}` : null;
+                  const mapRow = alertKeyForRow ? alerts.get(alertKeyForRow) : null;
+                  const enriched = e.alertCount == null && mapRow
+                    ? {
+                      ...e,
+                      alertCount: mapRow.count ?? null,
+                      alertState: e.alertState ?? (alerts.has(alertKeyForRow) ? 'open' : null),
+                      alertClosedAt: e.alertClosedAt ?? mapRow.lastSeen ?? null,
+                    }
+                    : e;
                   return (
                     <EventRow
                       // Id plus brokerTs: a stored event id is unique, but the same
                       // rule as the live tail keeps the two tables consistent.
                       key={rowKey}
-                      evt={e}
+                      evt={enriched}
                       selected={isSelected}
                       onSelect={(ev) => eventsSel.selectRow(rowKey, ev)}
                       showCount

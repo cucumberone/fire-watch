@@ -737,6 +737,14 @@ schema has no `Count` field and the ingress never adds one, so anything per-even
 render a constant 1. A cell with no alert hash renders `—`, not `0`, because an expired
 alert is unknown rather than zero.
 
+**A live arrival must fill Count from the client's own alert map.** Only
+`op: allEvents` replies are enriched with `alertCount`; an `op: event` frame carries no
+alert state. So a row that arrived live showed `—` for Count while a row for the SAME
+alert, fetched by a query, showed the real number — the same alert reading `3` or `—`
+depending on how its row got on screen. The render path now falls back to the `alerts`
+map the client already maintains from the fold's frames, with server-supplied values
+still winning where present (`docs/frontend.md` §5.5).
+
 The two tables therefore have **different column lists** despite sharing a row
 component:
 

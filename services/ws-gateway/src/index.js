@@ -29,10 +29,12 @@ import {
   validateAck,
   validateAlertQuery,
   validateClose,
+  validateDelete,
   ackAlertKey,
   normaliseAck,
   ackFrame,
   closeFrame,
+  deletedFrame,
 } from './ack.js';
 
 const cfg = loadConfig();
@@ -144,6 +146,11 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'close') {
       await handleClose(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'delete') {
+      await handleDelete(conn, frame, send);
       return;
     }
 
@@ -374,6 +381,85 @@ async function handleClose(conn, frame, send) {
   }
 }
 
+/**
+ * Permanently delete one event record.
+ *
+ * The only DESTRUCTIVE client operation in this service, and the only one that is
+ * not recoverable from anything: no AOF, no audit copy for operator deletes.
+ * docs/acknowledge.md §8.2 explains why it exists despite the project's "no data
+ * loss" rule, and why it is the one place that rule is knowingly bent.
+ *
+ * The record is read first for two reasons: to answer `missing` honestly instead
+ * of reporting a successful delete of something that was never there, and to
+ * learn the event's `source`, which names the timeline index that must also be
+ * cleaned.
+ */
+async function handleDelete(conn, frame, send) {
+  const verdict = validateDelete(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  let evt;
+  try {
+    evt = await reader.readEvent(verdict.id);
+  } catch (err) {
+    log.error('delete: read failed', { id: verdict.id, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'delete_failed',
+      message: 'could not read the event, retry',
+    }));
+    return;
+  }
+
+  if (!evt) {
+    send(JSON.stringify({
+      op: 'error',
+      code: 'no_such_event',
+      message: 'that event no longer exists',
+    }));
+    return;
+  }
+
+  try {
+    const res = await reader.deleteEvent(verdict.id, evt.source || '');
+    if (res.status === 'missing') {
+      // Lost a race with another delete. Report it rather than claiming success.
+      send(JSON.stringify({
+        op: 'error',
+        code: 'no_such_event',
+        message: 'that event no longer exists',
+      }));
+      return;
+    }
+  } catch (err) {
+    log.error('delete write failed', { id: verdict.id, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'delete_failed',
+      message: 'could not delete the event, retry',
+    }));
+    return;
+  }
+
+  // Loud on purpose: this is the one irreversible action in the system, so it
+  // leaves a trace in the gateway log naming who did it and what was destroyed.
+  log.warn('event deleted', { id: verdict.id, source: evt.source, by: verdict.by });
+
+  send(deletedFrame(verdict.id));
+
+  try {
+    await reader.publish(cfg.channelAlerts, JSON.stringify({
+      kind: 'deleted',
+      id: verdict.id,
+    }));
+  } catch (err) {
+    log.error('delete broadcast failed after a durable delete', { id: verdict.id, err: String(err) });
+  }
+}
+
 async function handleAlertQuery(conn, frame, send) {
   const verdict = validateAlertQuery(frame);
   if (!verdict.ok) {
@@ -448,6 +534,16 @@ function handleAlertMessage(raw) {
   // so clients retire the row through the path they already have.
   if (parsed.kind === 'close') {
     const frame = closeFrame(parsed.key);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
+  // A deleted event fans out by id, so every client can drop the same record
+  // from its live tail regardless of which pod handled the delete.
+  if (parsed.kind === 'deleted') {
+    const frame = deletedFrame(parsed.id);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

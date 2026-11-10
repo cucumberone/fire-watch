@@ -335,6 +335,79 @@ export class DragonflyReader {
    * Returns 'missing' when the alert hash does not exist, mirroring ackAlert:
    * closing a nonexistent alert must not create one.
    */
+  /**
+   * Permanently delete one event record.
+   *
+   * Unlike ack and close, this is DESTRUCTIVE and unrecoverable: there is no AOF
+   * (docs/dragonfly.md §6) and no audit copy for an operator delete. It exists
+   * because it was asked for, and the UI labels it accordingly.
+   *
+   * Two keys must go, and leaving either is a bug:
+   *
+   *   fw:evt:{id}            the record itself
+   *   fw:idx:src:{source}    its timeline member. ZADD members never expire on
+   *                          their own, so a leftover member is a dangling index
+   *                          entry: backfill reads the id, finds no record, and
+   *                          the event is silently missing from history in a way
+   *                          that looks like corruption.
+   *
+   * The source is needed to find the index, so the caller passes it — the record
+   * must be read first anyway to know whether the event exists at all, and that
+   * read is what makes the "missing" answer honest.
+   *
+   * The alert hash and its counters are deliberately NOT touched. An alert is an
+   * aggregate over events; deleting one event cannot be allowed to silently
+   * decrement `count`, because the fold is the only thing that owns that number
+   * and a second writer would race it. The row's count will therefore still
+   * include the deleted event until the next fold writes it.
+   */
+  async deleteEvent(id, source, indexPrefix = 'fw:idx:src:') {
+    const script = `
+      local existed = redis.call('DEL', KEYS[1])
+      redis.call('ZREM', KEYS[2], ARGV[1])
+      if existed == 0 then
+        return {'missing'}
+      end
+      return {'deleted'}
+    `;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const c = await this.connect();
+      try {
+        const res = await c.eval(
+          script,
+          2,
+          `fw:evt:${id}`,
+          `${indexPrefix}${source}`,
+          id,
+        );
+        const [status] = res;
+        return { status };
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');
+        if (!retryable || attempt === 1) throw err;
+        this.log.warn('delete hit a demoted node, re-resolving master', { err: msg });
+        await this.reset();
+      }
+    }
+    throw new Error('unreachable');
+  }
+
+  /** Read one stored event, so a delete can verify it exists and learn its source. */
+  async readEvent(id) {
+    const c = await this.connect();
+    const raw = await c.get(`fw:evt:${id}`);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // A record that does not parse is still a record; the caller only needs its
+      // source to remove the index member, so return a minimal shape.
+      return { id, source: null, unparseable: true };
+    }
+  }
+
   async closeAlert(hashKey, by, nowMs, ttlMs, indexKey = 'fw:idx:alert:open', bareKey = '') {
     const script = `
       if redis.call('EXISTS', KEYS[1]) == 0 then

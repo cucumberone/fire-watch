@@ -4,7 +4,7 @@ This repo sets up an event server.
 
 ## Tech Stack
 
-- **No data loss.** Dataloss is not accepted.
+- **No data loss.** Dataloss is not accepted. Unless operator deletes an event.
 - **OpenShift** as the target platform.
 - **100% H/A** for every component, and it must handle split brain for every component.
   - 3 replicas on different nodes.

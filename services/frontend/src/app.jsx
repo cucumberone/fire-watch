@@ -389,6 +389,14 @@ function useSocket(config) {
       if (frame.truncated) setNotice('Backfill was truncated — narrow the time window.');
       return;
     }
+    if (frame.op === 'deleted') {
+      // An event record is gone for good. Drop it from the live tail so the row
+      // stops claiming a record exists. The alert row is NOT touched: `count` is
+      // owned by the fold, and silently decrementing it here would disagree with
+      // the stored state until the next write.
+      setEvents((prev) => prev.filter((e) => e.id !== frame.id));
+      return;
+    }
     if (frame.op === 'error') {
       setNotice(`${frame.code}: ${frame.message}`);
       return;
@@ -548,7 +556,34 @@ function useSocket(config) {
     return keys.length;
   }, []);
 
-  return { status, events, alerts, acks, notice, acknowledge, bulk };
+  /**
+   * Permanently delete one event.
+   *
+   * The only irreversible action in the UI, so it asks first. `confirm()` rather
+   * than a custom dialog deliberately: the browser's modal is unmissable, cannot
+   * be dismissed by an outside click, and cannot be styled into something that
+   * looks like a normal menu item.
+   *
+   * Confirmed in the same place as ack and close — the `deleted` broadcast — so a
+   * delete made on another pod removes the row here too.
+   */
+  const deleteEvent = useCallback((id) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — delete not sent');
+      return;
+    }
+    // eslint-disable-next-line no-alert
+    const ok = window.confirm(
+      `Permanently delete event ${id}?\n\n` +
+      'This removes the stored record and cannot be undone. There is no audit ' +
+      'copy for an operator delete.',
+    );
+    if (!ok) return;
+    ws.send(JSON.stringify({ op: 'delete', id }));
+  }, []);
+
+  return { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent };
 }
 
 // ------------------------------------------------------------------------ UI
@@ -667,7 +702,9 @@ function RecordInspector({ state, onClose }) {
           {actions.map((a) => (
             <button
               key={a.label}
-              className="inspector-action"
+              // Destructive actions get their own class: an irreversible item must
+              // not look identical to Acknowledge sitting above it.
+              className={a.danger ? 'inspector-action inspector-danger' : 'inspector-action'}
               onClick={() => { a.run(); onClose(); }}
               disabled={a.disabled}
               title={a.title}
@@ -858,7 +895,7 @@ function EventRow({ evt, onContextMenu }) {
 
 function App() {
   const { config, error } = useConfig();
-  const { status, events, alerts, acks, notice, acknowledge, bulk } = useSocket(config);
+  const { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
   // The live tail is a diagnostic view, not the primary signal. Closed by
   // default so the alert table owns the screen; the count stays in the handle
@@ -1044,10 +1081,6 @@ function App() {
             reset columns
           </button>
         </h2>
-        <p className="hint dim">
-          Click to select, Shift+click for a range, Ctrl/Cmd+click to toggle.
-          Right-click for Acknowledge, Close or Information. Drag a column edge to widen it.
-        </p>
         {/* No selection banner by design. Selecting rows is purely a pointer
             state; every action lives in the right-click menu, which is where the
             operator already goes for a single row. A toolbar that appears on
@@ -1222,6 +1255,15 @@ function App() {
                             disabled: false,
                             title: `Retire ${ackKey}`,
                             run: () => bulk('close', [ackKey]),
+                          },
+                          {
+                            // On an EVENT row, delete targets this event id, not
+                            // the alert: the operator is removing one record.
+                            label: 'Delete event',
+                            disabled: false,
+                            title: `Permanently delete event ${e.id}`,
+                            run: () => deleteEvent(e.id),
+                            danger: true,
                           },
                         ],
                       )}

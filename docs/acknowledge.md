@@ -192,3 +192,71 @@ kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --no-auth-warning \
 ```
 
 Acceptance: the row is marked *and still visible*; a reload shows the ack without any local state; a re-fire shows the row un-acked.
+
+## 10. Deleting an event — the one deliberate exception
+
+`op: delete` removes a single event record **permanently**. It is the only
+irreversible action in the system, and it knowingly bends the project's "no data
+loss" rule (`AGENTS.md`). That is stated here rather than buried, because the rule
+is otherwise absolute and a reader needs to know exactly where the exception is.
+
+### 10.1 What it does, and what it cannot undo
+
+```text
+DEL  fw:evt:{id}          the record
+ZREM fw:idx:src:{source}  its timeline member
+```
+
+Both keys must go together. `ZADD` members never expire on their own, so a
+leftover index entry is a **dangling id**: backfill reads it, finds no record, and
+the event is silently missing from history in a way that looks like corruption
+rather than like a deliberate delete.
+
+What it does **not** touch, and why:
+
+| Not touched | Reason |
+|---|---|
+| `fw:alert:{key}` and its `count` | The fold owns that number. A second writer decrementing it would race the fold and produce a count that disagrees with the stored state. The row's count therefore still includes the deleted event until the next fold write — an honest visible artefact rather than a silent corruption. |
+| The RabbitMQ audit copy (`q.audit.events`) | It is a plain-text log written before the ack. There is no operator path to delete from it, so the event is **not** fully erased — only the queryable record is gone. Anyone relying on delete for compliance (GDPR-style erasure) must know this. |
+| Dragonfly snapshots | No AOF, and snapshots are retained for two hours. A deleted record can survive in a `.dfs` snapshot that is later restored. |
+
+So: gone from the board and from history, recoverable from the audit log by anyone
+with broker access.
+
+### 10.2 Why it is keyed by event id, not alert key
+
+Ack and close target `source:type` — the **alert**. Delete targets the **event**
+`id`, because an alert is an aggregate over many events and "delete this alert" is
+already `close`. Naming an event id is the only way to be unambiguous about which
+record is being destroyed.
+
+The UI confirms before sending: a `window.confirm()` naming the id, deliberately
+not a styled dialog, because a destructive action must not be dismissible by an
+accidental outside click and must not look like the menu item above it. The menu
+item itself is styled red (`inspector-danger`) for the same reason.
+
+`op: delete` appears only on **live-events rows**, where an event id exists.
+The alert table has no per-event rows to delete.
+
+### 10.3 Verification
+
+```bash
+# 1. find an event id
+kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --no-auth-warning \
+  ZRANGE fw:idx:src:probe 0 0
+
+# 2. delete it through the gateway (or right-click → Delete event)
+#    expect {"op":"deleted","id":"..."} and every client's tail drops the row
+
+# 3. both keys are gone
+kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --no-auth-warning \
+  EXISTS fw:evt:<id>                       # 0
+kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --no-auth-warning \
+  ZSCORE fw:idx:src:<source> <id>          # (nil)
+
+# 4. deleting again reports the truth instead of claiming success
+#    expect {"code":"no_such_event"}
+```
+
+Verified against the lab cluster: record `1 → 0`, index score `1000 → nil`, second
+delete `missing`.

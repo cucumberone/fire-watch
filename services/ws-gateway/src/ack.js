@@ -156,3 +156,57 @@ export function validateClose(frame) {
 export function closeFrame(key) {
   return JSON.stringify({ op: 'alert', key, applied: 3, closedBy: 'operator' });
 }
+
+/**
+ * Validate an inbound `op: delete` frame.
+ *
+ * Deletion targets an EVENT id, not an alert key — unlike ack and close. The
+ * operator is removing one record from the timeline, and an alert may be backed
+ * by many events, so an alert-shaped frame would be ambiguous about what is being
+ * destroyed.
+ *
+ * Ids are bounded the same way as alert keys, and by the same limit the ingress
+ * accepts, so a valid event can always be deleted and nothing else can.
+ */
+export const MAX_ID_LEN = MAX_KEY_LEN;
+
+export function isValidEventId(id) {
+  if (typeof id !== 'string') return false;
+  if (id.length === 0 || id.length > MAX_ID_LEN) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(id)) return false;
+  return true;
+}
+
+export function validateDelete(frame) {
+  if (!frame || frame.op !== 'delete') {
+    return { ok: false, code: 'bad_op', message: 'expected {"op":"delete"}' };
+  }
+  if (!isValidEventId(frame.id)) {
+    return {
+      ok: false,
+      code: 'bad_id',
+      message: `id must be a non-empty string of at most ${MAX_ID_LEN} chars`,
+    };
+  }
+  const by = cleanText(frame.by, MAX_BY_LEN) || ANONYMOUS;
+  return { ok: true, id: frame.id, by };
+}
+
+/** Event record key. Mirrors the worker's `keys.event()`. */
+export function eventKey(id) {
+  return `fw:evt:${id}`;
+}
+
+/**
+ * Frame telling clients an event was deleted.
+ *
+ * A distinct op rather than an `alert` frame, because the two clients that care
+ * need different things: the live tail removes the row by id, while the alert
+ * table must re-derive its count. Sending `op: deleted` lets each decide, instead
+ * of overloading `applied: 3` (which means "this alert is retired", a different
+ * statement from "this one event record no longer exists").
+ */
+export function deletedFrame(id) {
+  return JSON.stringify({ op: 'deleted', id });
+}

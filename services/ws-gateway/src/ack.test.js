@@ -11,6 +11,7 @@ import {
   ANONYMOUS,
   MAX_ALERT_QUERY_KEYS,
   MAX_KEY_LEN,
+  MAX_ID_LEN,
   ackAlertKey,
   ackFrame,
   closeFrame,
@@ -19,6 +20,9 @@ import {
   validateAck,
   validateAlertQuery,
   validateClose,
+  validateDelete,
+  deletedFrame,
+  eventKey,
 } from './ack.js';
 
 // ------------------------------------------------------------------ key rules
@@ -159,4 +163,41 @@ test('closeFrame is an alert frame with applied 3', () => {
   assert.equal(f.key, 'a:b');
   assert.equal(f.applied, 3);
   assert.equal(f.closedBy, 'operator');
+});
+
+// -------------------------------------------------------------------- delete
+// Delete is the one destructive op, so its validation is the strictest: a loose
+// id would let a client remove a record it has no business touching.
+test('validateDelete accepts an id and defaults the operator', () => {
+  const v = validateDelete({ op: 'delete', id: 'evt-123' });
+  assert.equal(v.ok, true);
+  assert.equal(v.id, 'evt-123');
+  assert.equal(v.by, ANONYMOUS);
+});
+
+test('validateDelete rejects a wrong op, empty id and over-long id', () => {
+  assert.equal(validateDelete({ op: 'ack', id: 'x' }).ok, false);
+  assert.equal(validateDelete({ op: 'delete' }).ok, false);
+  assert.equal(validateDelete({ op: 'delete', id: '' }).ok, false);
+  assert.equal(validateDelete({ op: 'delete', id: 'x'.repeat(MAX_ID_LEN + 1) }).ok, false);
+  assert.equal(validateDelete({ op: 'delete', id: 'a\u0000b' }).ok, false);
+});
+
+test('validateDelete rejects an alert key passed as an id only when malformed', () => {
+  // `source:type` is a legitimate id shape — ids are opaque strings — so it must
+  // be accepted. The distinction between an id and an alert key is what the
+  // DELETE targets, not a character rule.
+  assert.equal(validateDelete({ op: 'delete', id: 'shop:check-001' }).ok, true);
+});
+
+test('eventKey mirrors the worker key shape', () => {
+  assert.equal(eventKey('abc'), 'fw:evt:abc');
+});
+
+test('deletedFrame is a distinct op carrying the id', () => {
+  // Distinct from `alert`, because removing one event is a different statement
+  // from retiring an alert.
+  const f = JSON.parse(deletedFrame('evt-1'));
+  assert.equal(f.op, 'deleted');
+  assert.equal(f.id, 'evt-1');
 });

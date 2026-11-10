@@ -402,6 +402,13 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
                                          border-color:var(--accent); color:var(--accent); }
 .inspector-action:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
 .inspector-action:disabled { cursor:default; opacity:.7; color:var(--dim); }
+/* Destructive actions. Red text and a red border, because a permanent delete
+   sitting one row under Acknowledge must not look like it belongs to the same
+   class of action. The colour is the only warning the item gets — the modal
+   confirm is what actually stops an accident. */
+.inspector-danger { color:#ef4444; border-color:rgba(239,68,68,.5); }
+.inspector-danger:hover:not(:disabled) { background:rgba(239,68,68,.12);
+                                         border-color:#ef4444; color:#ef4444; }
 .inspector-hint { position:sticky; bottom:0; background:var(--bg);
                   padding:.25rem .6rem; border-top:1px solid var(--line);
                   font-size:.68rem; color:var(--dim); }

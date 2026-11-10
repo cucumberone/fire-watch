@@ -760,6 +760,18 @@ function EventRow({ evt, onContextMenu }) {
   // and the worker-enriched fields are already mapped by toViewEvent().
   const { summary, msgCompleteString } = evt;
   const [open, setOpen] = useState(false);
+
+  /**
+   * What the fold reveals.
+   *
+   * `msgc` when the producer sent one, otherwise the whole record — which is
+   * always worth expanding, because the row shows a clipped summary and a few
+   * enriched columns while the inspector shows everything. Previously the fold
+   * was gated on `msgc`, so an event without that optional field had no fold at
+   * all and the row appeared inert.
+   */
+  const detailText = msgCompleteString
+    || (evt.wire ? JSON.stringify(evt.wire, null, 2) : '');
   const retirement = isRetirement(evt.severity);
   const rowClass = severityRowClass(evt.severity, retirement ? 'retirement' : '');
   return (
@@ -767,17 +779,26 @@ function EventRow({ evt, onContextMenu }) {
       <tr className={rowClass} onContextMenu={onContextMenu}>
         <td><Badge severity={evt.severity} /></td>
         <td className="mono">{formatClock(evt.firstOccurrence)}</td>
-        <td className="mono">{formatClock(evt.lastOccurrence)}</td>
+        <td className="mont">{formatClock(evt.lastOccurrence)}</td>
         <td className="num">{evt.count}</td>
         <td className="summary">
           {summary || <span className="dim">—</span>}
-          {msgCompleteString ? (
+          {/*
+            The toggle is gated on there being something to reveal, not on the
+            `msgc` field existing.
+
+            `msgc` is optional: it is the "complete string" a producer may send,
+            and the ones we have do not send it at all, so gating on it meant the
+            fold never appeared for real events — while the dev harness, whose
+            mock always includes msgc, looked fine. Gate on content.
+          */}
+          {detailText ? (
             <button
               className="link"
               onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
               aria-expanded={open}
             >
-              {open ? 'hide MsgCompleteString' : 'MsgCompleteString'}
+              {open ? 'hide details' : 'details'}
             </button>
           ) : null}
         </td>
@@ -787,11 +808,11 @@ function EventRow({ evt, onContextMenu }) {
         {/* Spacer cell, matching the spacer column in the header. */}
         <td />
       </tr>
-      {open && msgCompleteString ? (
+      {open && detailText ? (
         <tr className={rowClass}>
           {/* +1 for the spacer column, or the expanded row stops short. */}
-          <td colSpan={6 + ENRICHED_FIELDS.length}>
-            <pre className="detail">{msgCompleteString}</pre>
+          <td className="detailcell" colSpan={6 + ENRICHED_FIELDS.length}>
+            <pre className="detail">{detailText}</pre>
           </td>
         </tr>
       ) : null}

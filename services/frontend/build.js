@@ -129,6 +129,11 @@ th { text-align:left; font-weight:600; color:var(--dim); border-bottom:1px solid
    reflowing it in place. */
 td { padding:.4rem .5rem; border-bottom:1px solid var(--line); vertical-align:top;
      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* The expanded detail row is the ONE cell that must not be clipped: the global
+   td rule above sets overflow:hidden so values ellipsize instead of wrapping,
+   which would cut the disclosure block off at the column width. */
+td.detailcell { overflow:visible; white-space:normal; padding:0 .5rem .6rem; }
+td.detailcell pre.detail { margin:0; max-width:none; }
 /* Headers may still wrap: a wrapped header costs one line, a wrapped value
    corrupts the value. */
 th { white-space:normal; }
@@ -282,6 +287,15 @@ main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
                display:flex; flex-direction:column; min-height:0;
                /* Matches main's gutter so both tables line up exactly. */
                scrollbar-gutter: stable; }
+/* display:flex above BEATS the user-agent's [hidden] { display:none } rule,
+   because a class selector outranks the attribute selector the browser ships.
+   The element therefore stayed laid out — 38vh of empty panel — while its
+   hidden attribute, and the chevron, said it was collapsed, so the drawer
+   looked like it would not close.
+   Restating the attribute's effect at higher specificity is what makes hidden
+   work again; nothing else here can be conditional on React state without
+   duplicating every layout rule in this block. */
+.drawer-body[hidden] { display:none; }
 /* Keep the sticky header from floating over the drawer edge. */
 .drawer-body th { top:0; }
 /* The live table is inside .tablewrap now, so the old per-column caps are gone:

@@ -659,9 +659,13 @@ function useSocket(config) {
   const [allEvents, setAllEvents] = useState({
     events: [], loading: false, error: null, truncated: false,
     range: '24h', loadedAt: null,
-    // How many events the WINDOW holds, as reported by the server. `null` until a
-    // query answers, because "we have not asked" is not "there are none".
+    // How many events the WINDOW held when the last query answered. `null` until one
+    // has, because "we have not asked" is not "there are none".
     total: null,
+    // Rows genuinely appended since that query. Kept separate from `total` so the
+    // badge can be `total + windowAdded` and therefore cannot drift from the table:
+    // anything the list already holds, or the cap drops, adds nothing here.
+    windowAdded: 0,
   });
 
   const wsRef = useRef(null);
@@ -700,18 +704,36 @@ function useSocket(config) {
       // no `applied: 0` case to skip: the tab is literally "all events", and the
       // tab would be lying if it omitted the repeats the live tail shows.
       //
-      // Appended whether or not the tab has been opened. It used to be gated on
-      // `prev.loadedAt`, so every event that arrived before the operator first
-      // opened the tab was thrown away and the badge sat at 0 while the rest of the
-      // board moved.
-      setAllEvents((prev) => ({
-        ...prev,
-        events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT),
-        // Once a query has answered, the badge counts the WINDOW, so a live arrival
-        // must move that number too — otherwise the badge freezes at whatever the
-        // last fetch said while the list visibly grows.
-        total: prev.total === null ? null : prev.total + 1,
-      }));
+      // THE BADGE AND THE LIST MOVE TOGETHER — they are derived, not incremented
+      // independently.
+      //
+      // `total` used to be `prev.total + 1` on every event frame, which was wrong in
+      // two ways that both showed as the badge outrunning the table:
+      //
+      //   1. `insertAllEvent` de-duplicates on id, so a frame the client already holds
+      //      adds NO row but still bumped the count. A redelivery, or the same record
+      //      arriving twice, drifted the two apart permanently.
+      //   2. Once the list hits `ALL_EVENTS_LIMIT` it stops growing while the count
+      //      keeps climbing.
+      //
+      // Measured before this fix: badge 464 against 396 rows, a gap that grew through
+      // a session and vanished on refresh (397/397). A count nobody can reconcile with
+      // the rows underneath it is worse than no count.
+      //
+      // Now the badge is `windowBase + rows added since the last query`, so it can only
+      // differ from the table by what the window held but the page did not carry (a
+      // `truncated` reply). That difference is real data, and it is stated in words.
+      setAllEvents((prev) => {
+        const next = insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT);
+        const added = next === prev.events ? 0 : next.length - prev.events.length;
+        return {
+          ...prev,
+          events: next,
+          // `added` is 0 for anything the list already had, or for an arrival the cap
+          // dropped — in both cases the table did not change, so the count must not.
+          windowAdded: prev.loadedAt === null ? prev.windowAdded : (prev.windowAdded ?? 0) + added,
+        };
+      });
       if (frame.applied !== null && frame.applied !== undefined) {
         const alertKey = `${evt.source}:${evt.type}`;
         // Re-opening forgets the "already counted" marker, so the NEXT retirement
@@ -853,6 +875,9 @@ function useSocket(config) {
           // recomputed from `merged`: the list is capped at ALL_EVENTS_LIMIT and
           // grows from live frames, so `merged.length` answers a different question.
           total: Number.isFinite(frame.total) ? frame.total : merged.length,
+          // A fresh query re-baselines: everything the window holds is now in `total`,
+          // so the post-query arrivals start counting from zero.
+          windowAdded: 0,
         };
       });
       return;
@@ -1012,7 +1037,13 @@ function useSocket(config) {
           events: prev.events.filter((e) => e.id !== frame.id),
           // The window no longer holds it either, so the count must follow or the
           // badge would outlive the row it was counting.
+          // The window total plus whatever has arrived since, so the badge and the
+          // table cannot drift apart. `windowAdded` counts only rows the list actually
+          // gained — see the ingest handler for why incrementing on every frame was
+          // wrong (measured gap: badge 464 vs 396 rows).
           total: prev.total === null ? null : Math.max(0, prev.total - 1),
+          // A deleted row was in the window too, so it leaves both numbers together.
+          windowAdded: Math.max(0, (prev.windowAdded ?? 0) - 1),
         }
         : prev));
       setAlerts((prev) => {
@@ -1371,7 +1402,9 @@ function useSocket(config) {
     // the PREVIOUS window: leaving it would make the badge quote a count for a
     // window the operator is no longer looking at.
     setAllEvents((prev) => ({
-      ...prev, range: nextRange, loading: true, error: null, total: null,
+      ...prev, range: nextRange, loading: true, error: null,
+      // Both describe a window that is no longer selected.
+      total: null, windowAdded: 0,
     }));
     ws.send(JSON.stringify({ op: 'allEvents', range: nextRange }));
   }, []);
@@ -2187,12 +2220,14 @@ function App() {
               const count = tabBadgeCount(t.id, {
                 alerts: sortedAlerts.length,
                 events: shownEvents.length,
-                // The server's count for the window, falling back to the rows held
-                // only while the first query is still in flight. Counting the FETCHED
-                // ROWS made the badge read 0 after a browser refresh on any other tab,
-                // because nothing had been fetched yet — and then jump to the window
-                // size only once All events was opened.
-                allEvents: allEvents.total ?? allEvents.events.length,
+                // Server window total + rows appended since that query. Deriving the
+                // badge from the fetched rows alone made it read 0 after a refresh on
+                // another tab; incrementing it per frame made it outrun the table
+                // (badge 464 vs 396 rows) because absorbed repeats added to the count
+                // but not to the list.
+                allEvents: allEvents.total === null
+                  ? allEvents.events.length
+                  : allEvents.total + (allEvents.windowAdded ?? 0),
                 closed: closed.count,
               });
               return (
@@ -2533,8 +2568,13 @@ function App() {
           <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             {allEvents.truncated ? (
               <MuiAlert severity="warning" sx={{ mb: 1 }}>
-                Showing the newest {allEvents.events.length} events in this window —
-                narrow the window or the filter to see older ones.
+                {/* State the arithmetic. The badge counts the WINDOW; this table
+                    holds the newest slice of it, so a large window legitimately shows
+                    fewer rows. Saying only "showing the newest N" left the reader to
+                    work out why the two numbers disagreed. */}
+                Showing the newest {allEvents.events.length} of{' '}
+                {(allEvents.total ?? 0) + (allEvents.windowAdded ?? 0)} events in this
+                window — narrow the window or the filter to see older ones.
               </MuiAlert>
             ) : null}
             <PaneBoundary name="All events">

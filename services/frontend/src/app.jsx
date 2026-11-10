@@ -24,6 +24,8 @@ import {
   ENRICHED_FIELDS,
   SEVERITY_RANK,
   isUnsupportedOpError,
+  filterClosedAlerts,
+  closedSeverities,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -47,6 +49,14 @@ const FRAME_BUDGET_PER_SEC = 8;
 // Column labels, defined once so the header, the colgroup and the resize state
 // cannot drift out of order. Order is documented in docs/frontend.md §4.3.
 const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
+// The Closed tab. "Closed at" is the column that matters there — it is what the
+// 7-day window is measured from and what the rows are sorted by — so it leads
+// alongside severity. Ack is absent on purpose: the ack belonged to the episode
+// and the fold deletes it when the episode ends, so a column of "—" would imply
+// a state that does not exist.
+const CLOSED_COLS = ['Severity', 'Closed at', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Key'];
+const CLOSED_DEFAULT_W = [96, 172, 172, 172, 64, 340, 240];
+
 // The enriched columns are fixed-width labels, so only the leading five are
 // user-resizable; ENRICHED_FIELDS is appended after them.
 // The live tail shows ARRIVALS, one row per delivery. Its Count column is the
@@ -78,9 +88,15 @@ const EVENT_DEFAULT_W = [96, 172, 172, 64, 340];
 // ABSENCE of a key, so a later OS change still takes effect.
 const THEME_KEY = 'fw:theme';
 const ROW_COLOR_KEY = 'fw:rowColor';
-// Whether the Live events drawer is expanded. A workspace preference, not
-// transient UI state: it survives a reload like the theme does.
-const DRAWER_KEY = 'fw:drawerOpen';
+// Which tab was last open. A workspace preference like the drawer it replaces:
+// an operator who works from the Closed tab should not be reset to Alerts every
+// reload.
+const TAB_KEY = 'fw:tab';
+const TABS = [
+  { id: 'alerts', label: 'Open alerts' },
+  { id: 'events', label: 'Live events' },
+  { id: 'closed', label: 'Closed' },
+];
 
 function readPref(key, fallback) {
   try {
@@ -280,6 +296,12 @@ function useSocket(config) {
   // that arrives on its own frames (docs/acknowledge.md §5).
   const [acks, setAcks] = useState(new Map());
   const [notice, setNotice] = useState(null);
+  // The Closed tab's data. Held here rather than in the tab component so it
+  // survives switching tabs — re-fetching 7 days of closures every time the
+  // operator flips between tabs would be both slow and pointless.
+  const [closedState, setClosedState] = useState({
+    alerts: [], loading: false, error: null, truncated: false, loadedAt: null,
+  });
 
   const wsRef = useRef(null);
   const attemptRef = useRef(0);
@@ -367,6 +389,28 @@ function useSocket(config) {
       });
       return;
     }
+    if (frame.op === 'closed') {
+      // The answer to `op: closed`. Replaces the list wholesale rather than
+      // merging: it is a windowed query, so a row it omits is outside the window,
+      // not missing from this response.
+      const rows = Array.isArray(frame.alerts) ? frame.alerts : [];
+      const next = [];
+      for (const row of rows) {
+        if (!row || typeof row.key !== 'string') continue;
+        next.push({
+          ...row,
+          event: row.event ? toViewEvent(row.event) : undefined,
+        });
+      }
+      setClosedState({
+        alerts: next,
+        loading: false,
+        error: null,
+        truncated: Boolean(frame.truncated),
+        loadedAt: Date.now(),
+      });
+      return;
+    }
     if (frame.op === 'snapshot') {
       // The state of the world as of connect, or as of the last resync. Without
       // this the board is empty on load until something new fires, because events
@@ -443,6 +487,15 @@ function useSocket(config) {
             'not support it. Reload the page to retry after the gateway is updated.',
           );
         }
+        return;
+      }
+      // A failed closed-list read belongs to that tab, not to the whole page: an
+      // operator reading the alert board should not get a banner about a tab they
+      // are not looking at.
+      if (frame.code === 'closed_failed') {
+        setClosedState((prev) => ({
+          ...prev, loading: false, error: frame.message || 'could not read closed alerts',
+        }));
         return;
       }
       setNotice(`${frame.code}: ${frame.message}`);
@@ -687,7 +740,30 @@ function useSocket(config) {
     ws.send(JSON.stringify({ op: 'delete', id }));
   }, []);
 
-  return { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent };
+  /**
+   * Ask for the recently closed alerts.
+   *
+   * A QUERY, not a stream: the Closed tab is a 7-day window that changes slowly,
+   * so it is fetched on demand (opening the tab, pressing refresh) rather than
+   * pushed. Live changes are not needed — a closure that happens while you are
+   * looking at the tab shows up on the next refresh, and the alert it came from
+   * has just left the Open tab anyway.
+   */
+  const loadClosed = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — closed list not requested');
+      return;
+    }
+    setClosedState((prev) => ({ ...prev, loading: true,
+      error: null }));
+    ws.send(JSON.stringify({ op: 'closed' }));
+  }, []);
+
+  return {
+    status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
+    loadClosed, closed: closedState,
+  };
 }
 
 // ------------------------------------------------------------------------ UI
@@ -939,6 +1015,36 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
   );
 }
 
+/**
+ * One row in the Closed tab.
+ *
+ * Distinct from AlertRow because the facts are different: the ack is gone, the
+ * meaningful timestamp is `closedAt` rather than "last occurrence", and the
+ * severity shown is the one that RETIRED the alert (a `CLEAR`), not the severity
+ * it was firing at. Reading a closed row as "this was a CLEAR alert" is the
+ * correct reading — the original severity lives in the event record, reachable
+ * through Information.
+ */
+function ClosedRow({ row, onContextMenu }) {
+  return (
+    <tr
+      className={severityRowClass(row.severity, 'retirement')}
+      onContextMenu={onContextMenu}
+    >
+      <td><Badge severity={row.severity} label={row.event?.displaySeverity} /></td>
+      <td className="mono">{formatClock(row.closedAt)}</td>
+      <td className="mono">{formatClock(row.firstSeen)}</td>
+      <td className="mono">{formatClock(row.lastSeen)}</td>
+      <td className="num">{row.count}</td>
+      <td className="summary">
+        {row.event?.summary || <span className="dim">—</span>}
+      </td>
+      <td className="mono nowrap">{row.key}</td>
+      <td />
+    </tr>
+  );
+}
+
 function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   const acked = Boolean(ack);
   return (
@@ -1040,23 +1146,17 @@ function EventRow({ evt, onContextMenu }) {
 
 function App() {
   const { config, error } = useConfig();
-  const { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent } = useSocket(config);
+  const { status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent, loadClosed, closed } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
-  // The live tail is a diagnostic view, not the primary signal. Closed by
-  // default so the alert table owns the screen; the count stays in the handle
-  // so a collapsed drawer still tells you the stream is alive.
-  //
-  // Persisted, because the drawer is a workspace preference: an operator who
-  // opened it to watch a storm should still have it open after a reload, and
-  // reopening it on every page load is pure friction. Stored as '1'/'0' rather
-  // than JSON so a stale non-JSON value cannot throw during render.
-  const [drawerOpen, setDrawerOpen] = useState(() => readPref(DRAWER_KEY, '0') === '1');
-  const toggleDrawer = useCallback(() => {
-    setDrawerOpen((open) => {
-      const next = !open;
-      writePref(DRAWER_KEY, next ? '1' : '0');
-      return next;
-    });
+  // Which tab is showing. Persisted as a workspace preference, in the same spirit
+  // as the theme: reopening the app should land where the operator left off.
+  const [tab, setTabState] = useState(() => {
+    const saved = readPref(TAB_KEY, 'alerts');
+    return TABS.some((t) => t.id === saved) ? saved : 'alerts';
+  });
+  const setTab = useCallback((id) => {
+    setTabState(id);
+    writePref(TAB_KEY, id);
   }, []);
   // Pause freezes the RENDER, not the socket. The socket keeps draining and the
   // buffer keeps accumulating, so resuming shows everything that arrived while
@@ -1078,6 +1178,52 @@ function App() {
     beginResize: beginEventResize,
     reset: resetEventWidths,
   } = useColumnWidths('events', EVENT_DEFAULT_W);
+
+  const {
+    widthOf: closedWidthOf,
+    beginResize: beginClosedResize,
+    reset: resetClosedWidths,
+  } = useColumnWidths('closed', CLOSED_DEFAULT_W);
+
+  // Closed-tab filters. Case-insensitive substring across the columns an operator
+  // can see, plus the summary text, which is where the human-readable detail
+  // lives. Deliberately client-side: the window is capped at 7 days / 500 rows,
+  // so a round trip per keystroke would make typing feel broken for no gain.
+  const [filter, setFilter] = useState('');
+  const [severityFilter, setSeverityFilter] = useState('');
+
+  const closedRows = useMemo(
+    () => filterClosedAlerts(closed.alerts, filter, severityFilter),
+    [closed.alerts, filter, severityFilter],
+  );
+
+  // Severity options come from the DATA, not a fixed list: the Closed tab shows
+  // the retirement severity, and offering options that match nothing would be a
+  // dropdown full of dead ends.
+  const closedSeverityOptions = useMemo(
+    () => closedSeverities(closed.alerts),
+    [closed.alerts],
+  );
+
+  // Load the closed list when the tab is first opened.
+  //
+  // On demand rather than on connect: a client that never opens the tab should
+  // not pay for a 7-day read, and the window changes slowly enough that a query
+  // is the right shape. The `loadedAt` guard means switching back and forth does
+  // not re-fetch — the tab has an explicit refresh for that.
+  //
+  // `status` is a dependency for a reason: on a reload with this tab already
+  // selected, the effect runs BEFORE the socket is open, `loadClosed` finds no
+  // connection and returns without setting anything — and because nothing
+  // changed, the effect would never run again. The list then stayed empty until
+  // the operator pressed refresh. Gating on `open` makes it fire at the moment
+  // the request can actually be sent.
+  useEffect(() => {
+    if (tab !== 'closed') return;
+    if (status !== 'open') return;
+    if (closed.loadedAt || closed.loading) return;
+    loadClosed();
+  }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -1227,7 +1373,56 @@ function App() {
         </div>
       </header>
 
-      <section>
+      {/*
+        Tabs, not a header plus a drawer.
+
+        The drawer forced a fixed-height shell: the alert table could never use
+        the bottom of the page, and the tail was permanently either collapsed
+        (invisible during an incident) or eating a third of the viewport. Three
+        peers also match how the data is actually used — open, arriving, and
+        already finished are parallel questions, not a primary view with an
+        accessory.
+
+        The tab bar is a real tablist: `role=tab` with `aria-selected` and arrow
+        keys, so it is navigable without a mouse.
+      */}
+      <div className="tabbar" role="tablist" aria-label="Views">
+        {TABS.map((t) => {
+          const count = t.id === 'alerts' ? sortedAlerts.length
+            : t.id === 'events' ? shownEvents.length
+            : closed.alerts.length;
+          return (
+            <button
+              key={t.id}
+              role="tab"
+              id={`tab-${t.id}`}
+              aria-selected={tab === t.id}
+              aria-controls={`panel-${t.id}`}
+              tabIndex={tab === t.id ? 0 : -1}
+              className={tab === t.id ? 'tab tab-active' : 'tab'}
+              onClick={() => setTab(t.id)}
+              onKeyDown={(e) => {
+                // Arrow keys move between tabs, as the WAI-ARIA pattern expects.
+                // Only when focus is on a tab, so typing in the Closed search box
+                // is never hijacked.
+                const i = TABS.findIndex((x) => x.id === tab);
+                if (e.key === 'ArrowRight') { e.preventDefault(); setTab(TABS[(i + 1) % TABS.length].id); }
+                if (e.key === 'ArrowLeft') { e.preventDefault(); setTab(TABS[(i - 1 + TABS.length) % TABS.length].id); }
+              }}
+            >
+              {t.label}
+              <span className="dim">{t.id === 'closed' && closed.loading ? ' …' : ` (${count})`}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {tab === 'alerts' ? (
+      <section
+        role="tabpanel"
+        id="panel-alerts"
+        aria-labelledby="tab-alerts"
+      >
         <h2>
           Open alerts <span className="dim">({sortedAlerts.length})</span>
           <button
@@ -1349,36 +1544,36 @@ function App() {
             </PaneBoundary>
           )}
       </section>
-      </main>
+      ) : null}
 
-      {/* Outside <main> so it can take real layout space at the viewport bottom
-          instead of overlaying the alert table. */}
+      {tab === 'events' ? (
       <section
-        className={drawerOpen ? 'drawer drawer-open' : 'drawer'}
-        aria-label="Live events"
+        role="tabpanel"
+        id="panel-events"
+        aria-labelledby="tab-events"
       >
-        <div className="drawer-bar">
-          <button
-            className="drawer-handle"
-            onClick={toggleDrawer}
-            aria-expanded={drawerOpen}
-            aria-controls="live-events-panel"
-          >
-            <span className="drawer-chevron" aria-hidden="true">{drawerOpen ? '▾' : '▸'}</span>
-            <span>Live events</span>
-            <span className="dim">({shownEvents.length} of last {EVENT_LIMIT})</span>
-          </button>
-          <button
-            className={paused ? 'pause pause-on' : 'pause'}
-            onClick={() => setPaused((p) => !p)}
-            aria-pressed={paused}
-            title={paused ? 'Resume the live tail' : 'Freeze the live tail'}
-          >
-            {paused ? '▶ Resume' : '❚❚ Pause'}
-          </button>
+        <h2>
+          Live events <span className="dim">({shownEvents.length} of last {EVENT_LIMIT})</span>
+          <span className="h2actions">
+            <button
+              className="link colreset"
+              onClick={resetEventWidths}
+              title="Restore the default column widths"
+            >
+              reset columns
+            </button>
+            <button
+              className={paused ? 'pause pause-on' : 'pause'}
+              onClick={() => setPaused((p) => !p)}
+              aria-pressed={paused}
+              title={paused ? 'Resume the live tail' : 'Freeze the live tail'}
+            >
+              {paused ? '▶ Resume' : '❚❚ Pause'}
+            </button>
+          </span>
           {paused ? <span className="notice">paused</span> : null}
-        </div>
-        <div className="drawer-body" id="live-events-panel" hidden={!drawerOpen}>
+        </h2>
+        <div className="panelbody" id="live-events-panel">
           {shownEvents.length === 0
             ? <p className="dim">Nothing yet.</p>
             : (
@@ -1468,6 +1663,148 @@ function App() {
             )}
         </div>
       </section>
+      ) : null}
+
+      {tab === 'closed' ? (
+      <section
+        role="tabpanel"
+        id="panel-closed"
+        aria-labelledby="tab-closed"
+      >
+        <h2>
+          Closed <span className="dim">(last 7 days, {closedRows.length})</span>
+          <span className="h2actions">
+            <button
+              className="link colreset"
+              onClick={loadClosed}
+              disabled={closed.loading}
+              title="Re-read the closed alerts from Dragonfly"
+            >
+              {closed.loading ? 'loading…' : 'refresh'}
+            </button>
+            <button
+              className="link colreset"
+              onClick={resetClosedWidths}
+              title="Restore the default column widths"
+            >
+              reset columns
+            </button>
+          </span>
+        </h2>
+
+        {/* Search. Client-side, over the rows already fetched, because the window
+            is bounded (7 days) and a server round trip per keystroke would make
+            typing feel broken. It matches every column the operator can see plus
+            the summary, so "which switch was flapping last Tuesday" is one box. */}
+        <div className="closedfilters">
+          <input
+            type="search"
+            className="filterinput"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter by key, severity, summary, agent…"
+            aria-label="Filter closed alerts"
+          />
+          <select
+            className="filterselect"
+            value={severityFilter}
+            onChange={(e) => setSeverityFilter(e.target.value)}
+            aria-label="Filter by severity"
+          >
+            <option value="">All severities</option>
+            {closedSeverityOptions.map((sev) => (
+              <option key={sev} value={sev}>{sev}</option>
+            ))}
+          </select>
+          {filter || severityFilter ? (
+            <button
+              className="link colreset"
+              onClick={() => { setFilter(''); setSeverityFilter(''); }}
+              title="Clear the filters"
+            >
+              clear
+            </button>
+          ) : null}
+          <span className="dim">
+            {closedRows.length} of {closed.alerts.length}
+          </span>
+        </div>
+
+        {closed.error ? (
+          <p className="error">Closed list failed: {closed.error}</p>
+        ) : closed.loading && closed.alerts.length === 0 ? (
+          <p className="dim">Loading…</p>
+        ) : closed.alerts.length === 0 ? (
+          <p className="dim">
+            Nothing has closed in the last 7 days.
+            {closed.loadedAt ? null : ' Open this tab to load.'}
+          </p>
+        ) : closedRows.length === 0 ? (
+          <p className="dim">No closed alerts match the filter.</p>
+        ) : (
+          <>
+            {closed.truncated ? (
+              <p className="notice">
+                Showing the {closed.alerts.length} most recent closures — narrow the
+                filter to see older ones.
+              </p>
+            ) : null}
+            <PaneBoundary name="Closed">
+              <ScrollTable
+                cols={(
+                  <>
+                    {CLOSED_COLS.map((c, i) => (
+                      <col key={c} style={{ width: `${closedWidthOf(i)}px` }} />
+                    ))}
+                    <col />
+                  </>
+                )}
+                head={(
+                  <>
+                    {CLOSED_COLS.map((label, i) => (
+                      <ResizableTh
+                        key={label}
+                        index={i}
+                        width={closedWidthOf(i)}
+                        onBegin={beginClosedResize}
+                      >
+                        {label}
+                      </ResizableTh>
+                    ))}
+                    <th />
+                  </>
+                )}
+                rows={closedRows.map((row) => (
+                  <ClosedRow
+                    key={row.key}
+                    row={row}
+                    onContextMenu={(ev) => openInspector(
+                      ev,
+                      row.event?.wire ?? row.event ?? row,
+                      row.key,
+                      [
+                        {
+                          // Re-opening is not offered: an alert is open because a
+                          // source reported it, and inventing one from the UI
+                          // would be a severity the operator made up. Acknowledge
+                          // is likewise absent — the ack was cleared when the
+                          // episode ended.
+                          label: 'Information',
+                          disabled: false,
+                          title: 'Every field of the record that closed this alert',
+                          run: () => {},
+                        },
+                      ],
+                    )}
+                  />
+                ))}
+              />
+            </PaneBoundary>
+          </>
+        )}
+      </section>
+      ) : null}
+      </main>
 
       <RecordInspector state={inspector} onClose={closeInspector} />
     </>

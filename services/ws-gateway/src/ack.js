@@ -210,3 +210,50 @@ export function eventKey(id) {
 export function deletedFrame(id) {
   return JSON.stringify({ op: 'deleted', id });
 }
+
+/**
+ * Largest number of closed alerts one request may ask for.
+ *
+ * The Closed tab shows a 7-day window; at a realistic incident rate that is a few
+ * hundred rows, so 500 covers it without letting one client ask a pod to build a
+ * response of arbitrary size.
+ */
+export const MAX_CLOSED_LIMIT = 500;
+/** Default window for the Closed tab: 7 days, matching event retention. */
+export const DEFAULT_CLOSED_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Validate `{"op":"closed"}`.
+ *
+ * Both fields are optional: an empty frame means "the default window, default
+ * limit", which is what the UI sends. Bounds are clamped rather than rejected for
+ * `limit` and `sinceMs` — a client asking for too much wants as much as exists,
+ * and refusing the whole request would leave it with an empty table for no
+ * reason. A malformed TYPE is rejected, because that is a bug rather than an
+ * over-ask.
+ */
+export function validateClosedQuery(frame, { maxLimit = MAX_CLOSED_LIMIT, now = Date.now() } = {}) {
+  if (!frame || frame.op !== 'closed') {
+    return { ok: false, code: 'bad_op', message: 'expected {"op":"closed"}' };
+  }
+
+  let limit = maxLimit;
+  if (frame.limit !== undefined) {
+    if (!Number.isFinite(frame.limit)) {
+      return { ok: false, code: 'bad_limit', message: 'limit must be a number' };
+    }
+    limit = Math.max(1, Math.min(maxLimit, Math.floor(frame.limit)));
+  }
+
+  // `sinceMs` may be an absolute epoch ms or a "window" in ms. Either way it must
+  // be finite, and a value in the future would silently return nothing.
+  let sinceMs = now - DEFAULT_CLOSED_MS;
+  if (frame.sinceMs !== undefined) {
+    if (!Number.isFinite(frame.sinceMs)) {
+      return { ok: false, code: 'bad_since', message: 'sinceMs must be a number' };
+    }
+    sinceMs = Math.min(frame.sinceMs, now);
+  }
+
+  return { ok: true, limit, sinceMs };
+}

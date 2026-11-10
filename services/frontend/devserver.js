@@ -157,6 +157,77 @@ function mockOpenAlerts() {
   return [...openAlerts.values()];
 }
 
+/**
+ * Retired alerts for the Closed tab.
+ *
+ * Populated from the same fold path that feeds the open set, so a retirement in
+ * the demo moves a key from one tab to the other rather than duplicating it —
+ * which is the invariant the real fold maintains by writing both indexes in one
+ * script.
+ */
+const closedMock = new Map();
+
+// Seeded at load, not on subscribe. Seeding inside the subscribe handler made the
+// tab's contents depend on whether `op: closed` arrived before or after the first
+// subscribe — the app asks for the list when the tab is opened, which can happen
+// first. Seeding here makes the mock deterministic.
+{
+  const seeds = [
+    { key: 'db-node-03:hw.psu.voltage', severity: 'CLOSE', at: 6 * 3600e3,
+      src: 'db-node-03', type: 'hw.psu.voltage', agent: 'Zabbix', count: 3 },
+    { key: 'core-sw-07:net.link.down', severity: 'HARMLESS', at: 26 * 3600e3,
+      src: 'core-sw-07', type: 'net.link.down', agent: 'Prometheus', count: 11 },
+    { key: 'edge-gw-02:disk.predictive', severity: 'CLOSE', at: 3 * 86400e3,
+      src: 'edge-gw-02', type: 'disk.predictive', agent: 'SMARTd', count: 1 },
+    { key: 'sensor-rack-a:env.temperature', severity: 'CLOSE', at: 5 * 86400e3,
+      src: 'sensor-rack-a', type: 'env.temperature', agent: 'SNMP', count: 6 },
+  ];
+  for (const seed of seeds) {
+    const closedAt = Date.now() - seed.at;
+    closedMock.set(seed.key, {
+      key: seed.key,
+      severity: seed.severity,
+      firstSeen: closedAt - 900e3,
+      lastSeen: closedAt - 60e3,
+      count: seed.count,
+      closedAt,
+      closedBy: 'seed-' + seed.key,
+      state: 'closed',
+      event: {
+        id: 'seed-' + seed.key, source: seed.src, type: seed.type,
+        severity: seed.severity, brokerTs: closedAt,
+        payload: {
+          EVT_Severity: seed.severity === 'CLOSE' ? 'CLEAR' : 'INFORMATION',
+          msg: seed.type + ' cleared on ' + seed.src,
+          EVT_Device: seed.src, EVT_EventKey: seed.type, EVT_Agent: seed.agent,
+          EVT_AgentOwner: 'AM-000100', EVT_Environment: 'production',
+        },
+      },
+    });
+  }
+}
+
+function retireMock(evt, applied) {
+  if (applied !== 3 || !evt?.source || !evt?.type) return;
+  const key = `${evt.source}:${evt.type}`;
+  const open = openAlerts.get(key);
+  const closedAt = evt.brokerTs ?? Date.now();
+  if (!closedMock.has(key)) {
+    closedMock.set(key, {
+      key,
+      severity: evt.severity,
+      firstSeen: open?.firstSeen ?? closedAt,
+      lastSeen: open?.lastSeen ?? closedAt,
+      count: open?.count ?? 1,
+      closedAt,
+      closedBy: evt.id ?? null,
+      state: 'closed',
+      event: { ...evt, payload: evt.payload },
+    });
+  }
+  openAlerts.delete(key);
+}
+
 wss.on('connection', async (ws) => {
   ws.on('message', async (raw) => {
     let frameIn;
@@ -205,6 +276,25 @@ wss.on('connection', async (ws) => {
     // for a reply that never comes when developing locally.
     if (frameIn.op === 'resync') {
       ws.send(JSON.stringify({ op: 'snapshot', alerts: mockOpenAlerts() }));
+      return;
+    }
+
+    // ---- op: closed — the recently retired alerts, mirroring handleClosedQuery.
+    // Built from the mock's own retired set so the tab shows something coherent
+    // with the rest of the demo, rather than a hard-coded fixture that contradicts
+    // the live stream.
+    if (frameIn.op === 'closed') {
+      const now = Date.now();
+      const rows = [...closedMock.values()]
+        .sort((a, b) => b.closedAt - a.closedAt)
+        .slice(0, Math.min(frameIn.limit || 500, 500))
+        .map((r) => ({ ...r, event: { ...r.event } }));
+      ws.send(JSON.stringify({
+        op: 'closed',
+        alerts: rows,
+        truncated: closedMock.size > rows.length,
+        sinceMs: now - 7 * 24 * 60 * 60 * 1000,
+      }));
       return;
     }
 
@@ -276,6 +366,7 @@ wss.on('connection', async (ws) => {
         ts: new Date().toISOString(),
       });
       foldMock(evt, applied);
+      retireMock(evt, applied);
       ws.send(JSON.stringify({ op: 'event', event: evt, applied }));
       n += 1;
     }, 1800);

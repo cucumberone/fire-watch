@@ -137,7 +137,7 @@ all.
 is not stored, but it did arrive and did move the rollup, so an operator watching
 the live tail should see it. Omitting it meant a producer that only ever repeats
 one event produced *no* tail frames at all — every delivery after the first was
-absorbed — so the drawer showed "Nothing yet" while alerts were open. `applied: 0`
+absorbed — so the live tail showed "Nothing yet" while alerts were open. `applied: 0`
 is what stops the client double-counting it, since the `occurrence` frame follows
 and carries the fold's own count.
 

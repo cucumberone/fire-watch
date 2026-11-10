@@ -460,3 +460,43 @@ export function isUnsupportedOpError(frame, op) {
   return frame.message.trim() === `unknown op ${op}`;
 }
 
+
+/**
+ * Filter the Closed tab's rows.
+ *
+ * Pure and exported so it can be tested without a DOM — the matching rules have
+ * enough edge cases (case, absent fields, the producer-vs-internal severity) that
+ * asserting them through a rendered table would be both slow and indirect.
+ *
+ * @param {Array} rows      closed alerts as the gateway sent them
+ * @param {string} text     free text, matched case-insensitively across every
+ *                          column the operator can see plus the summary
+ * @param {string} severity exact internal severity, or '' for all
+ */
+export function filterClosedAlerts(rows, text, severity) {
+  const needle = String(text || '').trim().toLowerCase();
+  const out = (rows || []).filter((r) => {
+    if (severity && r.severity !== severity) return false;
+    if (!needle) return true;
+    // Both the internal severity and the producer's own value are searchable:
+    // an operator searching "CLEAR" should find a row the badge shows as CLEAR,
+    // even though the stored value is CLOSE.
+    const hay = [
+      r.key, r.severity, r.event?.displaySeverity, r.event?.summary,
+      r.event?.device, r.event?.agent, r.event?.agentOwner,
+      r.event?.eventKey, r.event?.environment, r.closedBy,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(needle);
+  });
+  // Newest closure first, matching the server's order so filtering cannot silently
+  // reorder the table.
+  out.sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0));
+  return out;
+}
+
+/** Distinct severities present in the closed set, for the filter's options. */
+export function closedSeverities(rows) {
+  const set = new Set();
+  for (const r of rows || []) if (r.severity) set.add(r.severity);
+  return [...set].sort();
+}

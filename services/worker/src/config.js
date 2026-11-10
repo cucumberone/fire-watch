@@ -70,6 +70,19 @@ export const keys = {
   // activity timestamp, so a bounded read is "newest N open alerts".
   alertOpenIndex: 'fw:idx:alert:open',
   /**
+   * Index of RETIRED alerts, scored by `closed_at`.
+   *
+   * Needed because retiring an alert removes it from the open index, so without
+   * this there is no way to list what closed — the Closed tab would have to
+   * SCAN the whole keyspace, which is the unbounded scan the design forbids
+   * everywhere else.
+   *
+   * Maintained by the fold itself and not by a second write, so a key is in at
+   * most one of the two indexes: a crash between the two would otherwise leave
+   * an alert listed as both open and closed.
+   */
+  alertClosedIndex: 'fw:idx:alert:closed',
+  /**
    * Content fingerprint -> the id of the event record that owns it.
    *
    * This is the content-dedup index (event-lifecycle.md §5.5). An event whose

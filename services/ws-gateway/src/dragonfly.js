@@ -285,6 +285,87 @@ export class DragonflyReader {
   }
 
   /**
+   * Read recently RETIRED alerts, newest closure first.
+   *
+   * Backs the Closed tab. The open index cannot answer this — retiring an alert
+   * removes it from that index — so the worker's fold maintains a second zset
+   * scored by `closed_at` (docs/event-lifecycle.md §5.2).
+   *
+   * Same three round trips as readOpenAlerts, for the same reason: the hashes
+   * are read in one Lua script and the event records in one MGET, so the cost is
+   * independent of how many rows come back. An hourly full read per client is
+   * therefore fine, but it is still bounded by `limit` because a 7-day window of
+   * closures is not small.
+   *
+   * `sinceMs` filters server-side via ZRANGEBYSCORE rather than in the client, so
+   * asking for a shorter window costs strictly less work.
+   */
+  async readClosedAlerts({ sinceMs = 0, limit = 500 } = {}) {
+    const c = await this.connect();
+
+    // Newest first: ZREVRANGEBYSCORE with an inclusive lower bound.
+    const keys = await c.zrevrangebyscore(
+      'fw:idx:alert:closed',
+      '+inf',
+      `(${Math.max(0, sinceMs)}`,
+      'LIMIT', 0, Math.max(1, limit),
+    );
+    if (keys.length === 0) return [];
+
+    const flat = await c.evalsha(
+      await this._snapshotSha(c),
+      keys.length,
+      ...keys.map((k) => `fw:alert:${k}`),
+    );
+
+    const rows = [];
+    const n = SNAPSHOT_FIELDS.length;
+    for (let i = 0, r = 0; i + n - 1 < flat.length; i += n, r += 1) {
+      rows.push({
+        key: keys[r],
+        severity: flat[i] || 'WARNING',
+        firstSeen: Number(flat[i + 1] || 0),
+        lastSeen: Number(flat[i + 2] || 0),
+        count: Number(flat[i + 3] || 0),
+        lastId: flat[i + 4] || null,
+        ackedBy: flat[i + 5] || null,
+        ackedAt: flat[i + 6] ? Number(flat[i + 6]) : null,
+        event: null,
+      });
+    }
+
+    // The closure metadata is not in SNAPSHOT_FIELDS, so it costs one extra
+    // batched read. `closedAt` is what the tab sorts by and `closedBy` is the id
+    // of the retiring event, which is what makes the row explain itself.
+    const meta = await c.pipeline(
+      rows.map((r) => ['HMGET', `fw:alert:${r.key}`, 'state', 'closed_at', 'closed_by']),
+    ).exec();
+    meta.forEach((res, i) => {
+      const [state, closedAt, closedBy] = res?.[1] || [];
+      rows[i].state = state || null;
+      rows[i].closedAt = closedAt ? Number(closedAt) : null;
+      rows[i].closedBy = closedBy || null;
+    });
+
+    const wanted = [];
+    for (const row of rows) if (row.lastId) wanted.push(row.lastId);
+    if (wanted.length > 0) {
+      const raw = await c.mget(wanted.map((id) => `fw:evt:${id}`));
+      const byId = new Map();
+      wanted.forEach((id, i) => {
+        if (!raw[i]) return;
+        const parsed = safeParse(raw[i]);
+        if (parsed) byId.set(id, parsed);
+        else this.log.warn('unparseable stored event during closed read', { id });
+      });
+      for (const row of rows) {
+        if (row.lastId) row.event = byId.get(row.lastId) ?? null;
+      }
+    }
+    return rows;
+  }
+
+  /**
    * Read ONE open alert, with its newest event attached, or null.
    *
    * Exists for the content-duplicate fan-out. The worker publishes

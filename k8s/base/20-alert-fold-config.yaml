@@ -7,6 +7,7 @@
 # KEYS[1] = fw:alert:{key}
 # KEYS[2] = fw:alert:open:{key}
 # KEYS[3] = fw:idx:alert:open   (zset: alert key -> last activity ms)
+# KEYS[4] = fw:idx:alert:closed (zset: alert key -> closed_at ms)
 #
 # KEYS[3] is what makes the board survive a page reload. Without it there is no
 # way to enumerate open alerts except SCAN fw:alert:open:*, which is an
@@ -15,6 +16,11 @@
 # both the close path and the open path are already atomic here, and a crash
 # between an HSET and a separate ZADD would otherwise leave a phantom row on
 # every operator's screen forever.
+#
+# KEYS[4] is the same idea for RETIRED alerts, so the Closed tab can list the last
+# 7 days without scanning. Membership is removed when an alert re-opens: an alert
+# that is firing again is not closed, and leaving it in both indexes would show
+# the same key in two tabs.
 #
 # ARGV[1] = broker_ts_ms
 # ARGV[2] = event id
@@ -79,6 +85,12 @@ data:
       -- would hand a stale row to every client that connects afterwards.
       if has_index then
         redis.call('ZREM', KEYS[3], ARGV[5])
+        -- ...and record WHEN it closed, which is what the Closed tab sorts and
+        -- filters on. Kept in the same script so the two indexes cannot
+        -- disagree: a key is in exactly one of them.
+        if KEYS[4] ~= nil then
+          redis.call('ZADD', KEYS[4], ts, ARGV[5])
+        end
       end
       redis.call('HSET', KEYS[1],
         'state', 'closed',
@@ -115,6 +127,12 @@ data:
     end
 
     redis.call('SET', KEYS[2], '1', 'EX', 604800)
+    -- Re-opening removes it from the closed index. An alert that is firing is
+    -- not closed, and leaving it listed in both tabs would be a contradiction
+    -- the operator has to resolve by hand.
+    if has_index and KEYS[4] ~= nil then
+      redis.call('ZREM', KEYS[4], ARGV[5])
+    end
     -- Keep the open index in step. The score is the last activity, so a bounded
     -- ZREVRANGE always returns the most recently active alerts first.
     if has_index then

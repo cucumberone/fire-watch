@@ -287,37 +287,45 @@ main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
           scroll boundary, so a partially visible row reads as "more below"
           rather than as a row the drawer is covering. */
        box-shadow: inset 0 -14px 14px -14px rgba(0,0,0,.45); }
-.drawer { flex:0 0 auto; position:static;
-          background:var(--bg); border-top:1px solid var(--line);
-          box-shadow: 0 -2px 8px rgba(0,0,0,.12);
-          /* No max-width, deliberately. This used to be capped at 1200px to
-             match main, which wasted every pixel past 1200 and forced the
-             ten-column live-events table to wrap or clip. Both the drawer and
-             main now fill the viewport, so the two tables are the same width and
-             the wide table actually gets the room it needs. */
-          width:100%; margin:0 auto; }
-.drawer-handle { display:flex; align-items:center; gap:.5rem; width:100%;
-                 background:none; border:0; color:var(--fg); cursor:pointer;
-                 font:inherit; font-size:.85rem; font-weight:600;
-                 padding:.6rem 1.5rem; text-align:left; }
-.drawer-handle:hover { background:var(--pre-bg); }
-.drawer-handle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
-.drawer-chevron { font-size:.7rem; color:var(--dim); width:.75rem; }
-.drawer-body { max-height:38vh; overflow:hidden; padding:0 1.5rem 0;
-               display:flex; flex-direction:column; min-height:0;
-               /* Matches main's gutter so both tables line up exactly. */
-               scrollbar-gutter: stable; }
-/* display:flex above BEATS the user-agent's [hidden] { display:none } rule,
-   because a class selector outranks the attribute selector the browser ships.
-   The element therefore stayed laid out — 38vh of empty panel — while its
-   hidden attribute, and the chevron, said it was collapsed, so the drawer
-   looked like it would not close.
-   Restating the attribute's effect at higher specificity is what makes hidden
-   work again; nothing else here can be conditional on React state without
-   duplicating every layout rule in this block. */
-.drawer-body[hidden] { display:none; }
-/* Keep the sticky header from floating over the drawer edge. */
-.drawer-body th { top:0; }
+/* ---------------------------------------------------------------- tab bar
+
+   Replaces the old bottom drawer. The drawer competed with the alert table for
+   vertical space and could only be "open" or "invisible"; three peers can all
+   exist without any of them being hidden. The bar is a real tablist (role=tab,
+   aria-selected, arrow keys), so it is usable without a mouse. */
+.tabbar { display:flex; gap:.25rem; padding:0 1.5rem; flex:0 0 auto;
+          border-bottom:1px solid var(--line); }
+.tab { font:inherit; font-size:.82rem; font-weight:600; cursor:pointer;
+       background:none; border:0; border-bottom:2px solid transparent;
+       color:var(--dim); padding:.5rem .7rem; margin-bottom:-1px; }
+.tab:hover { color:var(--fg); }
+.tab:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+/* The active tab is marked by BOTH a colour change and an underline. Colour alone
+   fails for anyone who cannot separate the two hues, and an underline alone is
+   easy to miss on a dense screen. */
+.tab-active { color:var(--fg); border-bottom-color:var(--accent); }
+.tab .dim { font-weight:400; }
+
+/* The pane body. Replaces .drawer-body: it takes the remaining height and owns
+   the scroll, so a table can be as tall as the viewport allows. */
+.panelbody { flex:1 1 auto; min-height:0; overflow:hidden; padding:0 1.5rem .5rem;
+             display:flex; flex-direction:column; scrollbar-gutter:stable; }
+
+/* Actions that belong to the pane heading (reset columns, pause, refresh) rather
+   than to a row. Kept in the h2 so they never shift the table down the page. */
+.h2actions { display:inline-flex; align-items:center; gap:.6rem; margin-left:auto; }
+
+/* Closed-tab filters. One row above the table: a free-text box that matches every
+   visible column, plus a severity select whose options come from the data. */
+.closedfilters { display:flex; align-items:center; gap:.5rem; margin:.1rem 0 .45rem;
+                 flex-wrap:wrap; flex:0 0 auto; }
+.filterinput { font:inherit; font-size:.78rem; padding:.3rem .5rem; min-width:16rem;
+               background:var(--pre-bg); color:var(--fg);
+               border:1px solid var(--line); border-radius:.25rem; }
+.filterinput:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.filterselect { font:inherit; font-size:.78rem; padding:.3rem .4rem;
+                background:var(--pre-bg); color:var(--fg);
+                border:1px solid var(--line); border-radius:.25rem; }
 /* The live table is inside .tablewrap now, so the old per-column caps are gone:
    widths are user-controlled and nothing wraps (see the table rules above). */
 
@@ -358,9 +366,7 @@ tbody tr { cursor:default; }
    FATAL row reads as closed while the condition is still firing. The row keeps
    full contrast so it still reads as an active problem. */
 tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
-/* Handle and Pause share one bar so neither wraps onto its own line. */
-.drawer-bar { display:flex; align-items:center; gap:.75rem; padding-right:1.5rem; }
-.drawer-bar .drawer-handle { flex:1 1 auto; }
+/* Pause lives in the pane heading now, so it only needs its own styling. */
 .pause { flex:0 0 auto; font:inherit; font-size:.75rem; cursor:pointer;
          padding:.25rem .7rem; border-radius:.25rem; white-space:nowrap;
          border:1px solid var(--line); background:var(--bg); color:var(--fg); }

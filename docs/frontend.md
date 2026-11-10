@@ -63,7 +63,7 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 | Row colouring | opt-in, persisted; whole row tinted by severity with a 3px left bar. Off by default — at 1 000 events/min a fully tinted table is harder to scan |
 | Theme | `auto` (follow `prefers-color-scheme`) / `light` / `dark`, persisted in `localStorage`; `auto` is stored as the *absence* of the key so a later OS change still applies |
 | Buffering | render at most `N` rows (default 500) in the live table; older windows come from backfill |
-| Live tail | a collapsed-by-default bottom drawer, not a second page section. The alert table is the primary signal and owns the screen; the collapsed handle carries the row count so the stream is visibly alive while closed |
+| Live tail | its own **tab**, not a drawer under the alert table. See §5.5 for why the drawer was replaced |
 | Acknowledgement | an `Ack` column showing state, and the **action is a right-click menu item** on the row. State arrives on `op: alert` frames carrying `ack`, is re-read on reconnect and when the displayed key set changes, and is dropped locally on `applied: 1` because the fold clears it there ([acknowledge.md](acknowledge.md) §6) |
 | Backpressure | if the socket's `bufferedAmount` exceeds a threshold, drop render cadence rather than the socket |
 | Visibility | close the socket when the tab is hidden > 5 min, reconnect on focus with backfill |
@@ -120,7 +120,7 @@ Both tables lead with identity and status, then time, then volume, then the huma
 
 `Key` is deliberately **last** in the alert table. It is a stable identifier you read once when you need it, not something scanned down the column on every glance — putting it first pushed the signal (severity, recency, count) off to the right. Ack sits immediately before it because both are "about this specific row" rather than about the condition.
 
-With ten columns the drawer is horizontally tight, so:
+With ten columns the live table is horizontally tight, so:
 
 - **no cell ever wraps.** A wrapped value corrupts the value — `CIF-\n7730` is
   unreadable, and a timestamp split across two lines is worse than a scrollbar.
@@ -201,7 +201,7 @@ appended after them with natural widths.
 
 #### Making the two tables the same width
 
-Both tables must line up: the alert table sits directly above the drawer, and a few
+Every table must line up, and a few
 pixels of offset is immediately visible as misaligned columns.
 
 Note that resizable columns (§4.3) change this on purpose: once an operator drags
@@ -212,16 +212,15 @@ the misalignment comes only from content and never from a layout bug.
 Three things are needed for the containers to match, and the first two were each
 wrong at some point:
 
-1. **No `max-width` cap.** `main` and `.drawer` were both limited to 1200px, which
-   wasted most of a wide monitor and forced the ten-column live table to wrap.
-   Both now fill the viewport.
+1. **No `max-width` cap.** `main` used to be limited to 1200px, which wasted most
+   of a wide monitor and forced the ten-column live table to wrap. It now fills
+   the viewport.
 2. **`width: 100%` on `main`.** In a flex column, removing `max-width` is not
-   enough: the item shrink-to-fits its content and ended up *narrower* than the
-   drawer. `#root` states `align-items: stretch` explicitly for the same reason.
-3. **`scrollbar-gutter: stable` on both scroll containers.** `main` scrolls
-   vertically and `.drawer-body` may not, so `main`'s content box is narrower by
-   exactly one scrollbar (12px). Reserving the gutter on both keeps the columns
-   aligned whether or not a scrollbar is currently shown.
+   enough: the item shrink-to-fits its content and ended up narrower than its
+   container. `#root` states `align-items: stretch` explicitly for the same reason.
+3. **`scrollbar-gutter: stable` on the pane bodies.** Each tab's `.panelbody` owns
+   the scroll, and reserving the gutter keeps the columns from shifting by the
+   scrollbar width when a table crosses the threshold that needs one.
 
 Measured after the fix (table widths, px):
 
@@ -246,16 +245,15 @@ not sent to the gateway and they do not affect `applied` handling.
 |---|---|---|---|
 | Theme | `auto`, `light`, `dark` | `auto` | `localStorage['fw:theme']` |
 | Colour rows | on, off | off | `localStorage['fw:rowColor']` |
-| Live events open | on, off | **off** | `localStorage['fw:drawerOpen']` |
+| Selected tab | `alerts`, `events`, `closed` | `alerts` | `localStorage['fw:tab']` |
 
 Column widths are persisted separately per table (`fw:colw:alerts`,
-`fw:colw:events` — §4).
+`fw:colw:events`, `fw:colw:closed` — §4).
 
-The drawer is persisted because it is a **workspace preference, not transient UI
-state**: an operator who expanded it to watch a storm should still have it open
-after a reload. The default stays closed, so a first visit still gives the alert
-table the whole screen. It is stored as `'1'`/`'0'` rather than JSON so that a
-stale non-JSON value cannot throw during the initial render.
+The selected tab is persisted because it is a **workspace preference, not
+transient UI state**: an operator working the Closed tab should not be reset to
+Alerts on every reload. An unknown stored value falls back to `alerts` rather than
+throwing or rendering an empty page.
 
 Both toggles are **icon buttons**, not checkboxes:
 
@@ -403,7 +401,30 @@ loop. The panel waits for the next state change or a reload.
 This was verified by forcing a render throw in the alert table and confirming the
 header, the other pane and the socket all stayed functional.
 
-### 5.5 Live events drawer
+### 5.5 Three tabs: Open alerts, Live events, Closed
+
+The drawer is gone. It was a primary view with an accessory bolted underneath: it
+could only be expanded or invisible, it competed with the alert table for vertical
+space, and at `max-height:38vh` it either hid during an incident or ate a third of
+the screen.
+
+Three peers replace it, because "what is firing", "what did we receive", and "what
+already finished" are parallel questions rather than a hierarchy:
+
+| Tab | Answers | Source |
+|---|---|---|
+| **Open alerts** | what is firing right now | `op: snapshot` on connect + `op: alert` live |
+| **Live events** | what did we actually receive, and when | `op: event` frames, arrival order |
+| **Closed** | what ended in the last 7 days | `op: closed`, a windowed query |
+
+The tab bar is a real `role=tablist` with `aria-selected` and Arrow key
+navigation. The active tab is marked by **both** a colour change and an underline,
+because colour alone fails for anyone who cannot separate the two hues and an
+underline alone is easy to miss. The selected tab is persisted
+(`localStorage['fw:tab']`) so a reload lands where the operator left off, and an
+unknown stored value falls back to `alerts` rather than rendering an empty page.
+
+### 5.6 Live events tab
 
 **What it is for.** It is the raw ARRIVAL feed — one row per delivery, in arrival
 order — and it is a diagnostic view, not the working surface. The alert table
@@ -418,53 +439,51 @@ when", which is what you need when the two disagree. Concretely:
 - see events that never reached the alert fold at all (`applied: 0`)
 - inspect the full record, including fields the tables do not show
 
-**Its Count column is the producer's own `Count` payload field**, not an occurrence
-rollup, and it is labelled **Msg count** for that reason. A repeat is a distinct
-arrival with no occurrence number of its own, so showing `1` beside an alert Count
-of `2` is correct: the alert owns the rollup, the tail owns the arrivals.
+### 5.7 Closed tab
 
-**De-duplication is per ARRIVAL.** Both the gateway and the client key on
-`id + brokerTs`, not `id`. An absorbed repeat keeps the original record's id — the
-copy is never stored — so keying on id alone dropped every arrival after the first,
-and two runs of the same probe produced one tail row. A genuine redelivery repeats
-its `brokerTs` and is still suppressed.
+Shows what retired in the last **7 days**, newest closure first. It is a
+**query**, not a stream: `{"op":"closed"}` is fetched on demand — when the tab is
+first opened, or on `refresh` — because the window changes slowly and a client
+that never opens the tab should not pay for a 7-day read
+([websocket-server.md](websocket-server.md) §3.5).
 
-The live tail is a bottom drawer, `max-height:45vh`, closed **on a first visit**
-and remembered afterwards (`localStorage['fw:drawerOpen']` — §5). Reasons:
-
-- at 1 000 events/min the tail is the noisiest thing on screen, and it is a diagnostic view rather than the thing an operator acts on
-- keeping it closed on a first visit means the alert table owns the full page height
-- the collapsed handle still shows `(n of last 500)`, so a closed drawer is not a dead one
-- once an operator expands it, that choice survives a reload: reopening a diagnostic
-tail on every page load is friction, and the state is a preference rather than a
-transient interaction
-
-**A real bottom bar, never an overlay.** `position: sticky; bottom: 0` was tried and removed: sticky does not reserve space, it *lifts* the element out of its natural position to keep it visible, so as soon as `<main>` was taller than the viewport the drawer floated up over the alert table and clipped the row beneath it. `padding-bottom` on `<main>` cannot compensate, because the drawer was never in that space.
-
-The page is therefore a fixed-height shell:
-
-| Element | Role |
+| Column | Note |
 |---|---|
-| `html, body, #root` | `height: 100%` |
-| `#root` | `display:flex; flex-direction:column; overflow:hidden` — the viewport-locked shell |
-| `main` | `flex:1 1 auto; min-height:0; overflow-y:auto` — takes the remaining height and scrolls internally |
-| `.drawer` | `flex:0 0 auto; position:static` — a normal flex item, so it *consumes* layout height |
+| Severity | the severity that RETIRED the alert (`CLEAR` / `INFORMATION`), not the one it was firing at. The original lives in the event record, reachable through Information |
+| **Closed at** | the timestamp the window is measured from, and the sort key |
+| First / Last occurrence, Count | kept, so a closed row still explains how bad it got |
+| Summary, Key | as elsewhere |
 
-Because the drawer occupies real space, it cannot cover `<main>` at any scroll position or window size. Verified by measurement: `main.bottom === drawer.top` exactly, with `overlap: false`.
+**No Ack column.** The ack belonged to the episode and the fold deletes it when
+the episode ends, so a column of `—` would imply a state that does not exist.
 
-`min-height: 0` on `main` is load-bearing — a flex item's default `min-height: auto` refuses to shrink below its content, which would push the drawer off the bottom of the viewport instead of scrolling.
+**Filtering is client-side** (`filterClosedAlerts` in `lib.js`, exported so it is
+tested directly rather than through a rendered table):
 
-A partially visible row at the bottom of `main` is the scroll boundary, not the drawer covering it; that row is fully reachable by scrolling. An `inset` box-shadow on `main` marks the edge so the difference is visible rather than ambiguous — it is painted against the scroll container, so it does not scroll away with the content.
+- free text, case-insensitive and trimmed, matched across every visible column
+  plus the summary and the enriched fields
+- an exact severity select whose options come from the **data** — a fixed list
+  would offer dead ends
+- both the internal severity and the producer's value are searchable, so searching
+  `CLEAR` finds a row whose stored severity is `CLOSE`
+- sorting is newest-first *after* filtering, so a filter cannot silently reorder
+  the table
 
-| Concern | Handling |
-|---|---|
-| Overlap | none possible — the drawer is in the flow |
-| Share of viewport | closed: handle bar only (~36px). Open: drawer ≈ 44%, `main` ≈ 56% |
-| Inner scrolling | `.drawer-body` has `overflow:auto` and `max-height:38vh`, so the tail scrolls inside the drawer rather than growing the page |
-| Accessibility | the handle is a real `<button>` with `aria-expanded` and `aria-controls`; the body uses `hidden`, so it leaves the tab order and the accessibility tree when closed |
-| Reflow | not persisted — every page load starts closed |
+`truncated` from the server is surfaced as a notice rather than a silent cut: a
+busy week must not look smaller than it is.
 
-### 5.6 Pause
+Two loading states, deliberately distinct: "Nothing has closed in the last 7 days"
+is a real answer (the list was fetched), whereas "Open this tab to load" means it
+has not been fetched yet. Conflating them would make an unfetched tab look like a
+quiet week.
+
+**The auto-load effect depends on the connection status, not just the tab.** On a
+reload with this tab already selected the effect runs *before* the socket opens;
+without the `status === 'open'` guard the request was dropped and nothing changed,
+so the effect never ran again and the list stayed empty until `refresh` was
+pressed.
+
+### 5.8 Pause
 
 The `❚❚ Pause` button freezes the **render**, not the socket. The socket keeps draining into the buffer, so resuming shows everything that arrived while paused instead of silently skipping a window.
 
@@ -472,7 +491,7 @@ The `❚❚ Pause` button freezes the **render**, not the socket. The socket kee
 - the button is `aria-pressed` and changes to `▶ Resume` plus a `paused` marker, so a paused view is never mistaken for a quiet stream
 - the count in the handle shows the frozen length while paused; on resume it jumps to the true length, which is itself evidence that nothing was dropped
 
-### 5.7 Record inspector
+### 5.9 Record inspector
 
 Right-clicking a row in either table opens a **two-level menu**:
 
@@ -509,7 +528,7 @@ so a long value is necessarily clipped at a narrow width. The record is therefor
 read here, in a panel that can be as tall as it needs, rather than by reflowing the
 row and pushing every other column out of alignment.
 
-### 5.8 Acknowledge is a menu action, not a button
+### 5.10 Acknowledge is a menu action, not a button
 
 The `Ack` column shows *state*; the *action* lives in the right-click menu. Rationale:
 

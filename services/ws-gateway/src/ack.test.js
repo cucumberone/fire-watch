@@ -10,6 +10,9 @@ import assert from 'node:assert/strict';
 import {
   ANONYMOUS,
   MAX_ALERT_QUERY_KEYS,
+  MAX_CLOSED_LIMIT,
+  DEFAULT_CLOSED_MS,
+  validateClosedQuery,
   MAX_KEY_LEN,
   MAX_ID_LEN,
   ackAlertKey,
@@ -200,4 +203,37 @@ test('deletedFrame is a distinct op carrying the id', () => {
   const f = JSON.parse(deletedFrame('evt-1'));
   assert.equal(f.op, 'deleted');
   assert.equal(f.id, 'evt-1');
+});
+
+// ------------------------------------------- op: closed (the Closed tab)
+test('an empty closed frame means the default 7-day window', () => {
+  const now = 1_800_000_000_000;
+  const v = validateClosedQuery({ op: 'closed' }, { now });
+  assert.equal(v.ok, true);
+  assert.equal(v.limit, MAX_CLOSED_LIMIT);
+  assert.equal(v.sinceMs, now - DEFAULT_CLOSED_MS);
+});
+
+test('closed clamps an over-large limit instead of refusing it', () => {
+  // A client asking for more than allowed wants as much as exists; an error
+  // would leave it with an empty table for no reason.
+  const v = validateClosedQuery({ op: 'closed', limit: 99999 });
+  assert.equal(v.ok, true);
+  assert.equal(v.limit, MAX_CLOSED_LIMIT);
+});
+
+test('closed clamps a future sinceMs to now', () => {
+  const now = 1000;
+  const v = validateClosedQuery({ op: 'closed', sinceMs: 9999 }, { now });
+  assert.equal(v.sinceMs, now);
+});
+
+test('closed rejects non-numeric bounds', () => {
+  assert.equal(validateClosedQuery({ op: 'closed', limit: 'lots' }).ok, false);
+  assert.equal(validateClosedQuery({ op: 'closed', sinceMs: 'yesterday' }).ok, false);
+});
+
+test('the wrong op is refused', () => {
+  assert.equal(validateClosedQuery({ op: 'alerts' }).ok, false);
+  assert.equal(validateClosedQuery(null).ok, false);
 });

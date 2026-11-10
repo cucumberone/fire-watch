@@ -30,6 +30,7 @@ import {
   validateAlertQuery,
   validateClose,
   validateDelete,
+  validateClosedQuery,
   ackAlertKey,
   normaliseAck,
   ackFrame,
@@ -161,6 +162,11 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'resync') {
       await handleResync(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'closed') {
+      await handleClosedQuery(conn, frame, send);
       return;
     }
 
@@ -518,6 +524,44 @@ async function handleResync(conn, frame, send) {
   if (rows >= 0 && frame.ack === true) {
     send(JSON.stringify({ op: 'resynced', alerts: rows }));
   }
+}
+
+/**
+ * `{"op":"closed"}` — the recently retired alerts, newest closure first.
+ *
+ * Backs the Closed tab, which is why an `op` exists rather than a snapshot field:
+ * the window is a query, not part of "what is firing now", and a client that
+ * never opens that tab should not pay for it.
+ *
+ * Read-only and bounded server-side. The response is one `op: closed` frame with
+ * the rows; `truncated` tells the client the limit was hit, so the UI can say so
+ * instead of silently presenting a partial window as complete.
+ */
+async function handleClosedQuery(conn, frame, send) {
+  const verdict = validateClosedQuery(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  let rows;
+  try {
+    rows = await reader.readClosedAlerts({ sinceMs: verdict.sinceMs, limit: verdict.limit });
+  } catch (err) {
+    log.warn('closed alert read failed', { err: String(err) });
+    send(JSON.stringify({ op: 'error', code: 'closed_failed', message: 'could not read closed alerts' }));
+    return;
+  }
+
+  send(JSON.stringify({
+    op: 'closed',
+    alerts: rows,
+    // A full page means "there may be more", which is the honest signal. The
+    // alternative — silently returning the newest N — would make a busy week look
+    // smaller than it is.
+    truncated: rows.length >= verdict.limit,
+    sinceMs: verdict.sinceMs,
+  }));
 }
 
 async function handleAlertQuery(conn, frame, send) {

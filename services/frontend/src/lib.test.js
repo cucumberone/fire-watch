@@ -23,6 +23,8 @@ import {
   WIRE_FIELD,
   SEVERITY_RANK,
   isUnsupportedOpError,
+  filterClosedAlerts,
+  closedSeverities,
 } from './lib.js';
 
 const gunzip = async (bytes) => gunzipSync(Buffer.from(bytes));
@@ -715,4 +717,66 @@ test('retirement styling still keys off the internal severity', () => {
     payload: { msg: 'cleared', EVT_Severity: 'CLEAR' },
   });
   assert.equal(isRetirement(v.severity), true, 'row still dims as a retirement');
+});
+
+// ------------------------------------------- Closed-tab filtering (pure logic)
+// ------------------------------------------- Closed-tab filtering (pure logic)
+test('filterClosedAlerts matches text across every visible column', () => {
+  const rows = [
+    { key: 'a:psu', severity: 'CLOSE', closedAt: 3, event: { agent: 'Zabbix', summary: 'power supply' } },
+    { key: 'b:link', severity: 'HARMLESS', closedAt: 5, event: { agent: 'Prometheus', summary: 'uplink' } },
+  ];
+  assert.equal(filterClosedAlerts(rows, 'psu', '').length, 1);
+  assert.equal(filterClosedAlerts(rows, 'zabbix', '').length, 1);
+  assert.equal(filterClosedAlerts(rows, 'uplink', '').length, 1);
+  assert.equal(filterClosedAlerts(rows, 'nothing', '').length, 0);
+});
+
+test('filterClosedAlerts is case-insensitive and ignores surrounding space', () => {
+  const rows = [{ key: 'a:psu', severity: 'CLOSE', closedAt: 1, event: {} }];
+  assert.equal(filterClosedAlerts(rows, '  PSU  ', '').length, 1);
+});
+
+test('filterClosedAlerts finds the PRODUCER severity as well as the internal one', () => {
+  // The badge shows CLEAR while the stored severity is CLOSE; searching either
+  // must find the row, or the filter would miss what the operator can see.
+  const rows = [{
+    key: 'a:b', severity: 'CLOSE', closedAt: 1,
+    event: { displaySeverity: 'CLEAR' },
+  }];
+  assert.equal(filterClosedAlerts(rows, 'clear', '').length, 1);
+  assert.equal(filterClosedAlerts(rows, 'close', '').length, 1);
+});
+
+test('the severity filter is exact and combines with text', () => {
+  const rows = [
+    { key: 'a:1', severity: 'CLOSE', closedAt: 1, event: {} },
+    { key: 'a:2', severity: 'HARMLESS', closedAt: 2, event: {} },
+  ];
+  assert.equal(filterClosedAlerts(rows, '', 'CLOSE').length, 1);
+  assert.equal(filterClosedAlerts(rows, 'a:2', 'CLOSE').length, 0);
+});
+
+test('filterClosedAlerts sorts newest closure first', () => {
+  const rows = [
+    { key: 'old', severity: 'CLOSE', closedAt: 100 },
+    { key: 'new', severity: 'CLOSE', closedAt: 900 },
+    { key: 'mid', severity: 'CLOSE', closedAt: 500 },
+  ];
+  assert.deepEqual(filterClosedAlerts(rows, '', '').map((r) => r.key), ['new', 'mid', 'old']);
+});
+
+test('filterClosedAlerts tolerates missing timestamps and empty input', () => {
+  assert.deepEqual(filterClosedAlerts(null, 'x', ''), []);
+  assert.deepEqual(filterClosedAlerts([], 'x', ''), []);
+  const rows = [{ key: 'k', severity: 'CLOSE' }];
+  assert.equal(filterClosedAlerts(rows, '', '').length, 1);
+});
+
+test('closedSeverities lists what the data actually contains, sorted', () => {
+  const rows = [
+    { severity: 'HARMLESS' }, { severity: 'CLOSE' }, { severity: 'CLOSE' }, {},
+  ];
+  assert.deepEqual(closedSeverities(rows), ['CLOSE', 'HARMLESS']);
+  assert.deepEqual(closedSeverities(null), []);
 });

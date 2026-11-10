@@ -242,9 +242,9 @@ test('an absorb records the OWNER id in the fold, not the discarded copy', async
   await persistEvent({ ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000 });
 
   // `eval` is called as (script, numKeys, ...keys, ...argv), so `args` is
-  // [3 keys, brokerTs, id, severity, window, bareKey] — the id is index 4.
+  // [4 keys, brokerTs, id, severity, window, bareKey] — the id is index 5.
   const last = dfl.calls.eval[dfl.calls.eval.length - 1];
-  const idGiven = last.args[4];
+  const idGiven = last.args[5];
   assert.equal(idGiven, silent.id, 'the owner id, which has a stored record');
   assert.notEqual(idGiven, 'evt-2', 'not the id of the copy that was discarded');
 
@@ -266,7 +266,21 @@ test('the fold id on the fingerprint-absent path also names a real record', asyn
   await persistEvent({ ...args, evt: { ...silent, id: 'evt-3' }, brokerTs: 3000 });
 
   const last = dfl.calls.eval[dfl.calls.eval.length - 1];
-  const idGiven = last.args[4];
+  const idGiven = last.args[5];
   const ids = eventSets(dfl).map((s) => JSON.parse(dfl.store.get(s.key)).id);
   assert.ok(ids.includes(idGiven), `fold id ${idGiven} must exist in the store`);
+});
+
+// ------------------------------- the fold is told about the closed index too
+test('the fold receives the closed index as its fourth key', async () => {
+  // Without it the Closed tab has nothing to enumerate: retiring an alert removes
+  // it from the open index, so the only alternative is an unbounded SCAN.
+  const dfl = makeDfl();
+  await persistEvent({
+    dfl, evt: silent, storedPayload: {}, brokerTs: 1000, cfg, fold, log,
+  });
+  const last = dfl.calls.eval[dfl.calls.eval.length - 1];
+  assert.equal(last.numKeys, 4, 'numKeys must match the 4 keys passed');
+  assert.equal(last.args[0], 'fw:alert:' + `${silent.source}:${silent.type}`);
+  assert.equal(last.args[3], 'fw:idx:alert:closed', 'fourth key is the closed index');
 });

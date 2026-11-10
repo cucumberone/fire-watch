@@ -71,6 +71,7 @@ Four ops a client may send after `subscribe`:
 | `close` | `{"op":"close","key":"source:type"}` | retire the alert as an operator ([acknowledge.md](acknowledge.md) §8.1) |
 | `alerts` | `{"op":"alerts","keys":[...]}` | re-read ack state for the displayed rows |
 | `resync` | `{"op":"resync"}` | re-send the open-alert snapshot (§3.3) |
+| `closed` | `{"op":"closed"}` | the last 7 days of retired alerts (§3.5) |
 
 `close` is confirmed with `{"op":"alert","key":…,"applied":3}` — the same frame a
 source-sent CLOSE produces — so no client needs a second code path to retire a
@@ -282,6 +283,45 @@ showed **111 s** of cumulative `throttled_usec`, climbing ~600 ms every 3 s, whi
 Dragonfly was throttled in only 2 % of periods. The snapshot is a burst of CPU work
 (Node string handling for 199 rows), so it lands right at the quota. If handshake
 latency matters, raise that limit before optimising the reads further.
+
+### 3.5 `op: closed` — the retired alerts
+
+The Closed tab needs what is no longer firing, and neither existing op can supply
+it: a snapshot is the OPEN set, and backfill replays events without knowing which
+alert each one left behind.
+
+```json
+{"op":"closed"}
+{"op":"closed","limit":200,"sinceMs":1762000000000}
+```
+
+Neither field is required; an empty frame means the default 7-day window and
+`limit` 500. Both are **clamped, not rejected** — a client asking for more than
+exists wants as much as there is, and refusing would leave it with an empty table
+for no reason. A non-numeric value IS rejected, because that is a bug rather than
+an over-ask.
+
+The answer is one frame:
+
+```json
+{"op":"closed","alerts":[ … ],"truncated":false,"sinceMs":…}
+```
+
+Each row is a snapshot row (`key`, `severity`, `firstSeen`, `lastSeen`, `count`,
+`event`) plus the closure metadata the tab sorts and filters on: `closedAt`,
+`closedBy` (the id of the retiring event) and `state`.
+
+Read path: `ZREVRANGEBYSCORE fw:idx:alert:closed` for the keys, one Lua script for
+every hash, one pipeline for the closure fields, one MGET for the event records.
+Four round trips regardless of row count, because a 7-day window is not small and
+per-row reads would make the tab take seconds to open.
+
+`sinceMs` filters **server-side**, so a shorter window costs strictly less work
+rather than the server building the full set and the client discarding most of it.
+
+`truncated` is honest rather than silent: a full page means "there may be more",
+which the UI shows as a notice. Returning the newest N and saying nothing would
+make a busy week look smaller than it is.
 
 ## 4. Resource guardrails per connection
 

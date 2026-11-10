@@ -112,10 +112,11 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
       const applied = await dfl.write((c) =>
         c.eval(
           fold.get(),
-          3,
+          4,
           keys.alert(key),
           keys.alertOpen(key),
           keys.alertOpenIndex,
+          keys.alertClosedIndex,
           String(brokerTs),
           ownerId,
           evt.severity,
@@ -160,10 +161,11 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
     const applied = await dfl.write((c) =>
       c.eval(
         fold.get(),
-        3,
+        4,
         keys.alert(key),
         keys.alertOpen(key),
         keys.alertOpenIndex,
+        keys.alertClosedIndex,
         String(brokerTs),
         // The existing record IS the owner here, so its id is what represents
         // this condition. `evt.id` names a record that was never stored.
@@ -200,10 +202,11 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   const applied = await dfl.write((c) =>
     c.eval(
       fold.get(),
-      3,
+      4,
       keys.alert(key),
       keys.alertOpen(key),
       keys.alertOpenIndex,
+      keys.alertClosedIndex,
       String(brokerTs),
       evt.id,
       evt.severity,
@@ -242,6 +245,18 @@ export async function maybePruneIndex(dfl, source, cfg, log, force = false) {
       c.zremrangebyscore(keys.index(source), '-inf', `(${cutoff}`),
     );
     if (removed > 0) log.debug('pruned index members', { source, removed });
+
+    // The closed index needs the same treatment and the same cutoff. It is a
+    // single global zset (not per source), so it is pruned here rather than per
+    // event: ZADD members never expire on their own, and a 7-day window of
+    // closures across every device would otherwise grow without bound.
+    //
+    // Same cutoff as the alert hash's PEXPIRE, so the Closed tab cannot list a
+    // key whose hash has already expired — an entry that renders as a blank row.
+    const removedClosed = await dfl.write((c) =>
+      c.zremrangebyscore(keys.alertClosedIndex, '-inf', `(${cutoff}`),
+    );
+    if (removedClosed > 0) log.debug('pruned closed index members', { removed: removedClosed });
     return true;
   } catch (err) {
     // A missed prune is corrected by the next one.

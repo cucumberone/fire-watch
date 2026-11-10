@@ -65,4 +65,7 @@ export function loadConfig() {
 export const keys = {
   index: (source) => `fw:idx:src:${source}`,
   event: (id) => `fw:evt:${id}`,
+  // Maintained by the worker's alert fold, scored by `closed_at`. Read-only here:
+  // the gateway performs exactly one write in the whole system (an ack).
+  alertClosedIndex: 'fw:idx:alert:closed',
 };

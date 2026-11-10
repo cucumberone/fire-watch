@@ -379,6 +379,30 @@ header, the other pane and the socket all stayed functional.
 
 ### 5.5 Live events drawer
 
+**What it is for.** It is the raw ARRIVAL feed — one row per delivery, in arrival
+order — and it is a diagnostic view, not the working surface. The alert table
+answers "what is firing"; the tail answers "what did we actually receive, and
+when", which is what you need when the two disagree. Concretely:
+
+- prove the pipeline is alive when no alert changed (producers send `CLEAR` or
+  `HARMLESS` continuously, which retire rather than open)
+- see an event that was **absorbed** as a duplicate — it moved the alert's Count
+  and Last occurrence but created no alert row of its own, so the tail is the only
+  place its arrival is visible
+- see events that never reached the alert fold at all (`applied: 0`)
+- inspect the full record, including fields the tables do not show
+
+**Its Count column is the producer's own `Count` payload field**, not an occurrence
+rollup, and it is labelled **Msg count** for that reason. A repeat is a distinct
+arrival with no occurrence number of its own, so showing `1` beside an alert Count
+of `2` is correct: the alert owns the rollup, the tail owns the arrivals.
+
+**De-duplication is per ARRIVAL.** Both the gateway and the client key on
+`id + brokerTs`, not `id`. An absorbed repeat keeps the original record's id — the
+copy is never stored — so keying on id alone dropped every arrival after the first,
+and two runs of the same probe produced one tail row. A genuine redelivery repeats
+its `brokerTs` and is still suppressed.
+
 The live tail is a bottom drawer, `max-height:45vh`, closed **on a first visit**
 and remembered afterwards (`localStorage['fw:drawerOpen']` — §5). Reasons:
 

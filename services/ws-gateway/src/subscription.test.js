@@ -207,3 +207,19 @@ test('alertFrame attaches the row when given one', () => {
   assert.equal(f.row.severity, 'WARNING');
   assert.equal(f.row.event.id, 'e1');
 });
+
+// ---------- RecentIds is now keyed on the FRAME, not the event id alone
+test('a repeat with a new brokerTs is not suppressed as a duplicate', () => {
+  // The gateway used to key this on `event.id`. An absorbed repeat keeps the
+  // original id, so every arrival after the first was dropped and the live tail
+  // showed one row for two runs of the same probe. The key now includes brokerTs.
+  const r = new RecentIds(10);
+  assert.equal(r.add('p1|1000|0'), true, 'first arrival is new');
+  assert.equal(r.add('p1|2000|0'), true, 'later arrival with a new brokerTs is new');
+});
+
+test('an identical frame is still suppressed', () => {
+  const r = new RecentIds(10);
+  assert.equal(r.add('p1|1000|0'), true);
+  assert.equal(r.add('p1|1000|0'), false, 'a true redelivery is dropped');
+});

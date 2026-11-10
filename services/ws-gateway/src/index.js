@@ -556,8 +556,24 @@ function handleEventMessage(raw) {
   const { event, applied } = parsed;
   if (!event || !event.id) return;
 
-  // De-dup on id: a duplicate frame would double-render in the UI.
-  if (!recent.add(event.id)) return;
+  // De-dup on id, but ONLY for identical frames.
+  //
+  // Two different situations both carry the same event id and they must not be
+  // conflated:
+  //
+  //   1. A redelivery — Kafka/Rabbit redelivered the same message, so the worker
+  //      published the same frame twice. Re-sending it would double-render.
+  //   2. A REPEAT — the same event content sent again later. The worker absorbed
+  //      it (no new record) and republished it with a FRESH `brokerTs` so the
+  //      live tail shows the arrival. Suppressing that by id hid every repeat
+  //      after the first, which is why a tail of `send-same-event.mjs` runs
+  //      showed one row.
+  //
+  // The key includes brokerTs and `applied`, so a redelivery (identical frame) is
+  // still dropped while a distinct arrival is shown. The client de-duplicates on
+  // id alone for the ROW list, so the row list is unaffected either way.
+  const frameKey = `${event.id}|${event.brokerTs ?? ''}|${applied ?? ''}`;
+  if (!recent.add(frameKey)) return;
 
   const frame = eventFrame(event, applied);
   for (const ws of wss.clients) {

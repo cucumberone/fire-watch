@@ -49,7 +49,13 @@ const FRAME_BUDGET_PER_SEC = 8;
 const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
 // The enriched columns are fixed-width labels, so only the leading five are
 // user-resizable; ENRICHED_FIELDS is appended after them.
-const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary'];
+// The live tail shows ARRIVALS, one row per delivery. Its Count column is the
+// producer's own `Count` field carried in the payload — a per-MESSAGE field, not
+// an occurrence rollup. It is labelled "Msg count" so it cannot be misread as the
+// alert's Count: an absorbed repeat is a distinct arrival with its own row, but
+// it has no occurrence number of its own, so showing 1 next to the alert's 2 is
+// correct rather than a bug. The alert table owns the occurrence count.
+const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Msg count', 'Summary'];
 
 /**
  * Default widths, in px, for every real column.

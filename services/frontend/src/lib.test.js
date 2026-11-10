@@ -181,9 +181,12 @@ test('insertEvent keeps the list sorted by broker timestamp', () => {
   assert.deepEqual(list.map((e) => e.id), ['a', 'b', 'c']);
 });
 
-test('insertEvent ignores a duplicate id', () => {
+test('insertEvent ignores a true duplicate (same id AND brokerTs)', () => {
+  // It previously ignored any repeated id, which was wrong: an absorbed repeat
+  // keeps the original id and only differs by brokerTs, and the tail must show
+  // each arrival. Only an identical frame is a duplicate.
   let list = insertEvent([], { id: 'a', brokerTs: 1 }, 10);
-  list = insertEvent(list, { id: 'a', brokerTs: 2 }, 10);
+  list = insertEvent(list, { id: 'a', brokerTs: 1 }, 10);
   assert.equal(list.length, 1);
 });
 
@@ -652,4 +655,30 @@ test('without a row the client still increments a known row', () => {
   });
   map = applyAlert(map, { key: KEY, applied: 1 });
   assert.equal(map.get(KEY).count, 2);
+});
+
+// ---------------------- the live tail shows ARRIVALS, not unique records
+test('an absorbed repeat with a new brokerTs is a distinct arrival', () => {
+  // A repeat keeps the original's id (the copy was never stored), so deduping on
+  // id alone hid every repeat after the first: two runs of the same probe showed
+  // one row in the tail.
+  let list = [];
+  list = insertEvent(list, { id: 'p1', brokerTs: 1000 }, 500);
+  list = insertEvent(list, { id: 'p1', brokerTs: 2000 }, 500);
+  assert.equal(list.length, 2, 'both arrivals are shown');
+  assert.deepEqual(list.map((e) => e.brokerTs), [1000, 2000]);
+});
+
+test('a redelivered frame (same id and brokerTs) is still dropped', () => {
+  let list = [];
+  list = insertEvent(list, { id: 'p1', brokerTs: 1000 }, 500);
+  list = insertEvent(list, { id: 'p1', brokerTs: 1000 }, 500);
+  assert.equal(list.length, 1);
+});
+
+test('the limit still bounds a stream of repeats', () => {
+  let list = [];
+  for (let i = 0; i < 10; i += 1) list = insertEvent(list, { id: 'p1', brokerTs: i + 1 }, 3);
+  assert.equal(list.length, 3);
+  assert.deepEqual(list.map((e) => e.brokerTs), [8, 9, 10]);
 });

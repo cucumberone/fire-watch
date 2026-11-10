@@ -399,10 +399,18 @@ export function applyAlert(map, { key, applied, event, row }) {
  *
  * Sorting is by broker timestamp, not arrival order: cross-worker delivery can
  * invert (docs/frontend.md §4).
+ *
+ * De-duplication is on `id` **plus `brokerTs`**, not `id` alone. An absorbed
+ * repeat keeps the original's id — the copy was never stored, so there is no
+ * second record — but it is a distinct ARRIVAL and the tail exists to show
+ * arrivals. Deduping on id alone hid every repeat after the first, so two runs of
+ * the same probe produced one row. A genuine redelivery carries the same
+ * `brokerTs`, so it is still dropped.
  */
 export function insertEvent(list, evt, limit) {
   if (!evt?.id) return list;
-  if (list.some((e) => e.id === evt.id)) return list;
+  const dup = list.some((e) => e.id === evt.id && (e.brokerTs ?? null) === (evt.brokerTs ?? null));
+  if (dup) return list;
   const next = [...list, evt];
   next.sort((a, b) => (a.brokerTs ?? 0) - (b.brokerTs ?? 0));
   return next.length > limit ? next.slice(next.length - limit) : next;

@@ -806,9 +806,17 @@ The two selections are **independent**. Selecting alerts and selecting events ar
 different intents, and a single set spanning two id spaces would make every consumer
 filter a mixed collection.
 
+**The Live events tab has neither.** No selection, no right-click, no row actions. It
+is a diagnostic tail — rows scroll past at stream rate, so a menu opened on one would
+usually describe a record that is no longer under the pointer. Every action a live row
+could offer is an action on the ALERT or on the stored RECORD, and both are one click
+away in Open alerts and All events, where the row is the thing being acted on. Three
+action surfaces for one row was three places to keep in step for no gain; the row now
+carries no `aria-selected` and no handler at all.
+
 ### 5.9 Record inspector
 
-Right-clicking a row in either table opens a **two-level menu**:
+Right-clicking a row in **Open alerts** or **All events** opens a **two-level menu**:
 
 ```text
 level 1                          level 2

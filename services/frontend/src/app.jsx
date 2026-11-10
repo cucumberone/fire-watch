@@ -1195,24 +1195,6 @@ function useSocket(config) {
   }, [config]);
 
   /**
-   * Acknowledge an alert.
-   *
-   * Optimistic: the server confirms with an `alert` frame carrying the ack, but
-   * waiting for a round trip would make the button feel broken on a slow link.
-   * The frame therefore overwrites whatever we rendered in the meantime, so a
-   * rejection (bad_key, no_such_alert, ack_failed) is corrected rather than
-   * silently believed — the error is shown in the notice line too.
-   */
-  const acknowledge = useCallback((key) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setNotice('not connected — acknowledgement not sent');
-      return;
-    }
-    ws.send(JSON.stringify({ op: 'ack', key }));
-  }, []);
-
-  /**
    * Bulk ack/close.
    *
    * Frames are PACED, not fired in a loop. The gateway rate-limits inbound
@@ -1369,7 +1351,7 @@ function useSocket(config) {
   }, []);
 
   return {
-    status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
+    status, events, alerts, acks, notice, bulk, deleteEvent,
     loadClosed, closed: closedState,
     loadAllEvents, allEvents,
     journals, loadJournal, addJournalEntry,
@@ -1847,8 +1829,7 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   );
 }
 
-function EventRow({ evt, selected, onSelect, onContextMenu }) {
-  // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
+function EventRow({ evt, selected, onSelect, onContextMenu }) {  // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
   // and the worker-enriched fields are already mapped by toViewEvent().
   //
   // NO DISCLOSURE FOLD IN THE SUMMARY COLUMN. It went through three stages and the
@@ -1876,7 +1857,11 @@ function EventRow({ evt, selected, onSelect, onContextMenu }) {
       // Selection is pointer state, so the row is not focusable and carries no
       // button semantics: making a data row behave like a button breaks
       // screen-reader table navigation. The same actions are on the context menu.
-      aria-selected={selected || undefined}
+      //
+      // `aria-selected` is only claimed when the row CAN be selected. The live tail
+      // passes neither handler, and a row advertising a selection state it does not
+      // support is a lie to a screen reader.
+      aria-selected={onSelect ? Boolean(selected) : undefined}
     >
       <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
       <td className="mono">{formatClock(evt.firstOccurrence)}</td>
@@ -1896,7 +1881,7 @@ function EventRow({ evt, selected, onSelect, onContextMenu }) {
 function App() {
   const { config, error } = useConfig();
   const {
-    status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
+    status, events, alerts, acks, notice, bulk, deleteEvent,
     loadClosed, closed, loadAllEvents, allEvents, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
@@ -2364,60 +2349,24 @@ function App() {
                     <th />
                   </>
                 )}
-                rows={[...shownEvents].reverse().map((e) => {
-                  // An event row can also start an ack: the alert it belongs to
-                  // is `source:type`, and the operator is looking right at it.
-                  // Acking from here and from the alert table are the same
-                  // action on the same key.
-                  const ackKey = `${e.source}:${e.type}`;
-                  const ack = acks.get(ackKey);
-                  return (
-                    <EventRow
-                      // NOT `e.id`: since the tail shows every ARRIVAL, two rows
-                      // can legitimately share an id (an absorbed repeat keeps the
-                      // original record's id). Duplicate React keys made the
-                      // reconciler reuse the wrong row, which showed MORE rows than
-                      // the buffer held and in the wrong order. The arrival is
-                      // identified by id plus its broker timestamp.
-                      key={`${e.id}@${e.brokerTs ?? ''}`}
-                      evt={e}
-                      onContextMenu={(ev) => openInspector(
-                        ev,
-                        e.wire ?? e,
-                        `${e.source} · ${e.type}`,
-                        [
-                          {
-                            label: ack ? `Acked by ${ack.by}` : 'Acknowledge alert',
-                            disabled: Boolean(ack),
-                            title: ack
-                              ? `Acknowledged by ${ack.by} at ${formatClock(ack.at)}`
-                              : `Acknowledge ${ackKey}`,
-                            run: () => acknowledge(ackKey),
-                          },
-                          {
-                            label: 'Close alert',
-                            disabled: false,
-                            title: `Retire ${ackKey}`,
-                            run: () => bulk('close', [ackKey]),
-                          },
-                          {
-                            // On an EVENT row, delete targets this event id, not
-                            // the alert: the operator is removing one record.
-                            label: 'Delete event',
-                            disabled: false,
-                            title: `Permanently delete event ${e.id}`,
-                            run: () => deleteEvent(e.id),
-                            danger: true,
-                          },
-                        ],
-                        // The journal is keyed on the ALERT, so an event row opens
-                        // the notes for the incident this event belongs to — which is
-                        // what an operator means by "add a note about this".
-                        e.source && e.type ? `${e.source}:${e.type}` : null,
-                      )}
-                    />
-                  );
-                })}
+                rows={[...shownEvents].reverse().map((e) => (
+                  <EventRow
+                    // NOT `e.id`: since the tail shows every ARRIVAL, two rows can
+                    // legitimately share an id (an absorbed repeat keeps the original
+                    // record's id). Duplicate React keys made the reconciler reuse the
+                    // wrong row, which showed MORE rows than the buffer held and in
+                    // the wrong order. The arrival is identified by id plus its
+                    // broker timestamp.
+                    key={`${e.id}@${e.brokerTs ?? ''}`}
+                    evt={e}
+                    // No onContextMenu: the live tail is a DIAGNOSTIC view, not a
+                    // working surface. Every action on it — ack, close, delete,
+                    // journal — belongs to the alert or the stored record, and the
+                    // operator reaches those from Open alerts and All events, where
+                    // the row is the thing being acted on. Three action surfaces for
+                    // one row was three places to keep in step for no gain.
+                  />
+                ))}
               />
               </PaneBoundary>
             )}

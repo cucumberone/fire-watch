@@ -36,6 +36,22 @@ shrink-wraps:
 - `MuiTabs` (with `variant="scrollable"`) shrink-wraps its labels, so it needs
   `width: 100%` too, and the Toolbar above it inherits the same shrink without it
 
+**`<Stack alignItems>` is silently ignored in MUI v9.** The prop is accepted without
+a warning and the computed style stays `align-items: normal`, so every control row
+renders top-stretched instead of centred — a 38px `TextField` next to a 29px
+`IconButton` leaves the icon 8px above the input's mid-line. Nine call sites had this
+and all nine were no-ops. Put alignment in `sx`:
+
+```jsx
+<Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>  // correct
+<Stack direction="row" spacing={1} alignItems="center">             // silently nothing
+```
+
+`direction` and `spacing` still work as props. This is the third bug in this class —
+after `MuiToolbar` needing an explicit `width` and `.healthlink` needing an explicit
+`align-self` — so the pattern to remember is: **if MUI output looks untouched, read
+the computed style rather than the JSX.**
+
 The CSP already allowed `style-src 'unsafe-inline'`, which is what emotion's
 runtime style injection requires, so no CSP change was needed.
 
@@ -563,11 +579,27 @@ The chip reports the SOCKET, not the cluster: it can read `connected` while Drag
 is down and the board is stale.
 
 The tab bar is a real `role=tablist` with `aria-selected` and Arrow key
-navigation. The active tab is marked by **both** a colour change and an underline,
-because colour alone fails for anyone who cannot separate the two hues and an
-underline alone is easy to miss. The selected tab is persisted
-(`localStorage['fw:tab']`) so a reload lands where the operator left off, and an
-unknown stored value falls back to `alerts` rather than rendering an empty page.
+navigation. The active tab is marked by **both** a colour change and a filled
+background, because colour alone fails for anyone who cannot separate the two hues.
+MUI's `TabIndicator` is **disabled** (`display: none`) rather than kept alongside it:
+a 2px underline drawn directly under a rounded fill reads as a rendering seam, and it
+is two signals for one state.
+
+The fill's alpha is deliberately low (`.12` light, `.18` dark). A solid primary block
+would compete with the severity colours in the table below, which are the actual
+signal being scanned; the selected tab only has to be unmistakable, not loud. Hover
+gets its own faint tint, and `&.Mui-selected:hover` is set explicitly — otherwise
+hovering the current tab washes it toward the unselected hover colour and it looks
+like it is being deselected.
+
+MUI marks the selected tab with `.Mui-selected` on the Tab root and applies the label
+colour through `.MuiTab-root.Mui-selected`, so the fill lives on `MuiTab.root` rather
+than on the `label` node. Styling the label instead centred the background on the
+text, not on the clickable area.
+
+The selected tab is persisted (`localStorage['fw:tab']`) so a reload lands where the
+operator left off, and an unknown stored value falls back to `alerts` rather than
+rendering an empty page.
 
 ### 5.6 Live events tab
 

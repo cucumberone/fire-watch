@@ -202,8 +202,36 @@ function buildTheme(mode) {
       },
       MuiTab: {
         styleOverrides: {
-          root: { minHeight: 40, textTransform: 'none', fontWeight: 600,
-                  fontSize: '.85rem', paddingInline: 14 },
+          root: {
+            minHeight: 40, textTransform: 'none', fontWeight: 600,
+            fontSize: '.85rem', paddingInline: 14,
+            // A rounded FILL for the selected tab instead of relying on the 2px
+            // underline alone. The underline is a 2px mark at the very bottom edge
+            // of a 40px bar, which is easy to lose at a glance across a dark
+            // screen — the whole point of this strip is knowing which pane you
+            // are looking at during an incident.
+            //
+            // The alpha is deliberately low: a solid primary block would compete
+            // with the severity colours in the table below, which are the actual
+            // signal an operator is scanning for. The fill only has to be
+            // distinguishable, not loud.
+            borderRadius: 6,
+            marginInline: 2,
+            transition: 'background-color 120ms ease, color 120ms ease',
+            '&:hover': {
+              backgroundColor: dark ? 'rgba(240,246,252,.06)' : 'rgba(0,0,0,.04)',
+            },
+            '&.Mui-selected': {
+              color: dark ? '#60a5fa' : '#2563eb',
+              backgroundColor: dark ? 'rgba(96,165,250,.18)' : 'rgba(37,99,235,.12)',
+            },
+            // Hovering an already-selected tab must not lighten it toward the
+            // unselected hover colour, which would make the current pane look like
+            // it is being deselected.
+            '&.Mui-selected:hover': {
+              backgroundColor: dark ? 'rgba(96,165,250,.24)' : 'rgba(37,99,235,.18)',
+            },
+          },
         },
       },
       MuiTabs: {
@@ -213,7 +241,11 @@ function buildTheme(mode) {
           // of the tab labels and sit centred in the AppBar.
           root: { minHeight: 40, width: '100%', borderBottom: '1px solid',
                   borderColor: 'divider' },
-          indicator: { height: 2 },
+          // The indicator is HIDDEN because the selected tab now carries a filled
+          // background. Keeping both would draw a 2px underline directly beneath a
+          // rounded fill, which reads as a rendering seam rather than as emphasis —
+          // two signals for the same state, one of them ugly.
+          indicator: { display: 'none' },
         },
       },
       MuiButton: { defaultProps: { size: 'small', disableElevation: true } },
@@ -1729,7 +1761,11 @@ function App() {
               where an operator needs to concentrate. Motion is off entirely under
               `prefers-reduced-motion`.
             */}
-            <Stack direction="row" alignItems="center" spacing={0} sx={{ mr: 1 }}>
+            {/* alignItems goes in `sx`, not as a prop: MUI v9's Stack silently
+                IGNORES the alignItems prop (computed style stays `normal`), which
+                left the health link and every control row vertically stretched.
+                spacing and direction still work. */}
+            <Stack direction="row" spacing={0} sx={{ alignItems: 'center', mr: 1 }}>
               <Chip
                 label={status}
                 size="small"
@@ -1811,7 +1847,7 @@ function App() {
                   id={`tab-${t.id}`}
                   aria-controls={`panel-${t.id}`}
                   label={(
-                    <Stack direction="row" spacing={0.75} alignItems="center">
+                    <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
                       <span>{t.label}</span>
                       {t.id === 'closed' && closed.loading
                         ? <CircularProgress size={11} />
@@ -1828,7 +1864,7 @@ function App() {
       <Box role="tabpanel" id="panel-alerts" aria-labelledby="tab-alerts"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
-        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
           <Typography variant="h2">Open alerts</Typography>
           <Chip label={sortedAlerts.length} size="small" variant="outlined" />
           <Box sx={{ flex: 1 }} />
@@ -1950,7 +1986,7 @@ function App() {
       <Box role="tabpanel" id="panel-events" aria-labelledby="tab-events"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
-        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
           <Typography variant="h2">Live events</Typography>
           <Chip label={`${shownEvents.length} of last ${EVENT_LIMIT}`} size="small" variant="outlined" />
           {paused ? <Chip label="paused" size="small" color="warning" /> : null}
@@ -2061,8 +2097,8 @@ function App() {
       <Box role="tabpanel" id="panel-all" aria-labelledby="tab-all"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
-        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}
-               flexWrap="wrap" useFlexGap>
+        <Stack direction="row" spacing={1}
+               sx={{ alignItems: 'center', mb: 1, flexWrap: 'wrap', useFlexGap: true }}>
           {/* No heading: the tab strip directly above already names the pane, and
               the tab badge carries its count. A heading repeating the selected
               tab is the one control on screen that tells the operator nothing. */}
@@ -2079,9 +2115,25 @@ function App() {
               ))}
             </Select>
           </FormControl>
-          <Box sx={{ flex: 1 }} />
+          {/* The filter sits on the SAME row as the window picker: both narrow what
+              the table shows, and stacking them put two sparse control rows above
+              the data on a screen whose whole job is showing rows. The `flex: 1`
+              with a `maxWidth` lets it absorb the free space up to a readable
+              width, pushing the refresh button to the right edge. */}
+          <TextField
+            type="search"
+            value={eventFilter}
+            onChange={(e) => setEventFilter(e.target.value)}
+            placeholder="Filter by key, device, severity, summary, agent…"
+            inputProps={{ 'aria-label': 'Filter all events' }}
+            sx={{ flex: '1 1 320px', minWidth: 200, maxWidth: 520 }}
+          />
           <Tooltip title={allEvents.loading ? 'Loading…' : 'Re-read this window'}>
-            <span>
+            {/* marginLeft:auto, not a flex spacer: a spacer Box and the search
+                field both carrying flex:1 SPLIT the free width between them, so
+                the field stayed 228px wide next to a 240px void. `auto` on the
+                last item absorbs whatever the capped field leaves over. */}
+            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
               {/* Icon-only and compact: the tab strip already says what the pane is,
                   so a labelled filled button was the loudest control on the screen
                   for a read-only refresh. `span` wrapper because a disabled
@@ -2102,19 +2154,10 @@ function App() {
           </Tooltip>
         </Stack>
 
-        <TextField
-          type="search"
-          value={eventFilter}
-          onChange={(e) => setEventFilter(e.target.value)}
-          placeholder="Filter by key, device, severity, summary, agent…"
-          inputProps={{ 'aria-label': 'Filter all events' }}
-          sx={{ mb: 1.5, flex: '0 0 auto', maxWidth: 520 }}
-        />
-
         {allEvents.error ? (
           <MuiAlert severity="error">Events failed: {allEvents.error}</MuiAlert>
         ) : allEvents.loading && allEvents.events.length === 0 ? (
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ p: 2 }}>
+          <Stack direction="row" spacing={1} sx={{ alignItems: 'center', p: 2 }}>
             <CircularProgress size={16} />
             <Typography variant="body2" color="text.secondary">Loading…</Typography>
           </Stack>
@@ -2195,7 +2238,7 @@ function App() {
       <Box role="tabpanel" id="panel-closed" aria-labelledby="tab-closed"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                  p: 2, pt: 1.5 }}>
-        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
           <Typography variant="h2">Closed</Typography>
           <Chip label={`last 7 days`} size="small" variant="outlined" />
           <Chip label={closed.count} size="small" variant="outlined" />
@@ -2225,7 +2268,7 @@ function App() {
             is bounded (7 days) and a server round trip per keystroke would make
             typing feel broken. It matches every column the operator can see plus
             the summary, so "which switch was flapping last Tuesday" is one box. */}
-        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1.5 }}>
           <TextField
             type="search"
             value={filter}
@@ -2265,7 +2308,7 @@ function App() {
         {closed.error ? (
           <MuiAlert severity="error">Closed list failed: {closed.error}</MuiAlert>
         ) : closed.loading && closed.alerts.length === 0 ? (
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ p: 2 }}>
+          <Stack direction="row" spacing={1} sx={{ alignItems: 'center', p: 2 }}>
             <CircularProgress size={16} />
             <Typography variant="body2" color="text.secondary">Loading…</Typography>
           </Stack>

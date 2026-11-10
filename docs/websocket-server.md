@@ -149,6 +149,30 @@ The client sends `resync`:
 Cost is the same as a connect snapshot: three round trips regardless of alert
 count (§3.2), so a one-minute interval per client is negligible.
 
+#### Deploy skew: a newer page against an older gateway
+
+The frontend bundle and the ws-gateway image are **separate artifacts**, so a page
+can be newer than the gateway serving it. When that happens the gateway answers
+
+```json
+{"op":"error","code":"bad_op","message":"unknown op resync"}
+```
+
+and the client must stop asking, because no retry can succeed and the fix is a
+redeploy. Unhandled, this error reappears on every interval and every reconnect —
+`bad_op: unknown op resync` every 60 seconds reads as a frontend bug and hides the
+real cause.
+
+So the client watches for that specific rejection, stops sending `resync` for the
+lifetime of the page, and replaces the raw protocol error with a notice saying the
+gateway needs updating. The match is deliberately narrow — `code === 'bad_op'`
+**and** the message being exactly `unknown op resync` — so that a genuine
+malformed-frame bug elsewhere still surfaces instead of silently disarming the
+auto-refresh — see `isUnsupportedOpError` in `services/frontend/src/lib.js`.
+
+Recovery is a page reload once the gateway has been updated; nothing is persisted,
+so the next load tries `resync` again.
+
 Two consequences worth stating:
 
 - The snapshot is **unconditional** — it ignores `since`. "What is open right now"

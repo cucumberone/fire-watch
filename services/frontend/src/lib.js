@@ -380,3 +380,28 @@ export function backoffDelay(attempt, { base = 500, cap = 30000 } = {}) {
   const exp = Math.min(cap, base * 2 ** Math.max(0, attempt));
   return Math.round(exp * (0.5 + Math.random() * 0.5));
 }
+
+/**
+ * Does this `bad_op` error mean the SERVER is too old to know an op we send?
+ *
+ * Only resolvable by redeploying the gateway, so the client has to stop asking
+ * rather than retrying forever. This is a deploy-skew case: the frontend bundle
+ * and the ws-gateway image are separate artifacts, so a newer page can talk to an
+ * older gateway. The symptom without this guard is `bad_op: unknown op resync`
+ * every resync interval, and again on every reconnect, for as long as the two
+ * versions disagree.
+ *
+ * Matching on the message text is not ideal, but `bad_op` is generic — it covers
+ * any unrecognised op — and the gateway does not distinguish "unknown" from
+ * "unsupported". Narrowing to an exact `unknown op <name>` match keeps a genuine
+ * malformed-frame bug visible instead of silently disarming the resync.
+ *
+ * @param {object} frame  an `op: 'error'` frame
+ * @param {string} op     the op we sent
+ */
+export function isUnsupportedOpError(frame, op) {
+  if (!frame || frame.op !== 'error' || frame.code !== 'bad_op') return false;
+  if (typeof frame.message !== 'string') return false;
+  return frame.message.trim() === `unknown op ${op}`;
+}
+

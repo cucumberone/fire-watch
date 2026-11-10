@@ -23,6 +23,7 @@ import {
   formatClock,
   ENRICHED_FIELDS,
   SEVERITY_RANK,
+  isUnsupportedOpError,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -279,6 +280,10 @@ function useSocket(config) {
   const timerRef = useRef(null);
   const lastTsRef = useRef(null);
   const closedByUsRef = useRef(false);
+  // Set when the gateway rejects `resync` as an unknown op — i.e. the deployed
+  // ws-gateway predates this bundle. Stops the client from asking every interval
+  // for an op that can only work after a redeploy.
+  const noResyncRef = useRef(false);
   // Alert keys we currently display, so a reconnect can re-read their ack state.
   const knownKeysRef = useRef([]);
 
@@ -406,6 +411,20 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'error') {
+      // A gateway older than this bundle does not know `resync`. That is a deploy
+      // skew, not something the operator can act on, and retrying cannot fix it:
+      // stop sending it and say so once. Showing the raw frame (
+      // `bad_op: unknown op resync`) every 60 seconds reads as a frontend bug.
+      if (isUnsupportedOpError(frame, 'resync')) {
+        if (!noResyncRef.current) {
+          noResyncRef.current = true;
+          setNotice(
+            'Auto-refresh is off: the ws-gateway is older than this page and does ' +
+            'not support it. Reload the page to retry after the gateway is updated.',
+          );
+        }
+        return;
+      }
       setNotice(`${frame.code}: ${frame.message}`);
       return;
     }
@@ -450,8 +469,9 @@ function useSocket(config) {
       // timer tick. `subscribe` above already sends a snapshot, so this is
       // redundant on the happy path — but it costs one small frame and covers
       // the case where the subscribe was accepted while the snapshot read was
-      // still in flight and returned nothing.
-      ws.send(JSON.stringify({ op: 'resync' }));
+      // still in flight and returned nothing. Skipped entirely once the gateway
+      // has shown it does not know the op.
+      if (!noResyncRef.current) ws.send(JSON.stringify({ op: 'resync' }));
     };
 
     ws.onmessage = (msg) => {
@@ -535,6 +555,7 @@ function useSocket(config) {
     const ms = (config.resyncSeconds ?? 300) * 1000;
     if (!(ms > 0)) return undefined;   // 0 disables it
     const tick = () => {
+      if (noResyncRef.current) return;   // gateway rejected it; see the error handler
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ op: 'resync' }));

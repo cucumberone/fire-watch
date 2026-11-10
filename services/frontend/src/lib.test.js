@@ -22,6 +22,7 @@ import {
   ENRICHED_FIELDS,
   WIRE_FIELD,
   SEVERITY_RANK,
+  isUnsupportedOpError,
 } from './lib.js';
 
 const gunzip = async (bytes) => gunzipSync(Buffer.from(bytes));
@@ -488,4 +489,33 @@ test('formatClock is 24-hour, so 1pm is 13 not 01', () => {
 test('formatClock zero-pads every component', () => {
   const d = new Date(2026, 0, 2, 3, 4, 5);
   assert.equal(formatClock(d.getTime()), '2026-01-02 03:04:05');
+});
+
+// ---------------------------------------------- deploy skew: unsupported ops
+test('an unknown-op rejection is recognised for the op we sent', () => {
+  // The exact frame a gateway older than this bundle returns for `resync`.
+  assert.equal(
+    isUnsupportedOpError({ op: 'error', code: 'bad_op', message: 'unknown op resync' }, 'resync'),
+    true,
+  );
+});
+
+test('a bad_op for a DIFFERENT op is not mistaken for resync', () => {
+  // Otherwise an ack bug would silently disable the auto-refresh.
+  assert.equal(
+    isUnsupportedOpError({ op: 'error', code: 'bad_op', message: 'unknown op ack' }, 'resync'),
+    false,
+  );
+});
+
+test('other error frames are never treated as an unsupported op', () => {
+  assert.equal(isUnsupportedOpError({ op: 'error', code: 'rate_limited', message: 'too many frames' }, 'resync'), false);
+  assert.equal(isUnsupportedOpError({ op: 'error', code: 'bad_op' }, 'resync'), false);
+  assert.equal(isUnsupportedOpError({ op: 'alert', key: 'a:b' }, 'resync'), false);
+  assert.equal(isUnsupportedOpError(null, 'resync'), false);
+  assert.equal(isUnsupportedOpError(undefined, 'resync'), false);
+});
+
+test('a malformed bad_op message does not arm the disable', () => {
+  assert.equal(isUnsupportedOpError({ op: 'error', code: 'bad_op', message: 'unknown operation' }, 'resync'), false);
 });

@@ -1006,7 +1006,18 @@ function RecordInspector({ state, onClose }) {
 
   if (!state) return null;
   const entries = recordEntries(state.record);
-  const actions = state.actions || [];
+  // Drop any caller-supplied `Information`.
+  //
+  // This component ALWAYS renders its own Information row at the bottom, because
+  // that submenu is intrinsic to the inspector rather than something a row should
+  // have to remember to add. A caller that adds one anyway gets two identical
+  // entries — and because the injected one is not wired to `setView('info')`, it
+  // does nothing when clicked. That exact bug shipped: the Closed tab's menu
+  // showed two Information rows and only the second worked.
+  //
+  // Filtering here rather than trusting callers means the mistake cannot recur:
+  // the panel owns its own affordance.
+  const actions = (state.actions || []).filter((a) => a.label !== 'Information');
 
   return (
     <div
@@ -1032,8 +1043,7 @@ function RecordInspector({ state, onClose }) {
 
       {view === 'menu' ? (
         <div className="inspector-actions">
-          {actions.map((a) => (
-            <button
+          {actions.map((a) => (            <button
               key={a.label}
               // Destructive actions get their own class: an irreversible item must
               // not look identical to Acknowledge sitting above it.
@@ -1889,23 +1899,21 @@ function App() {
                   <ClosedRow
                     key={row.key}
                     row={row}
+                    // No actions. A closed alert offers nothing an operator can
+                    // do to it: it cannot be re-opened (an alert is open because
+                    // a source reported it, and inventing one from the UI would
+                    // be a severity the operator made up), and the ack was
+                    // cleared when the episode ended.
+                    //
+                    // Passing an `Information` action here was a bug: the
+                    // inspector ALWAYS appends its own Information row, so the
+                    // menu showed two — the injected one with an empty `run`
+                    // (dead on click) and the real one below it.
                     onContextMenu={(ev) => openInspector(
                       ev,
                       row.event?.wire ?? row.event ?? row,
                       row.key,
-                      [
-                        {
-                          // Re-opening is not offered: an alert is open because a
-                          // source reported it, and inventing one from the UI
-                          // would be a severity the operator made up. Acknowledge
-                          // is likewise absent — the ack was cleared when the
-                          // episode ended.
-                          label: 'Information',
-                          disabled: false,
-                          title: 'Every field of the record that closed this alert',
-                          run: () => {},
-                        },
-                      ],
+                      [],
                     )}
                   />
                 ))}

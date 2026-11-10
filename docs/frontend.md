@@ -564,6 +564,7 @@ keys the table does not show.
 | Size | `620px` wide, `max-height:min(560px, 100vh-1rem)`, from the stylesheet only. The action list is short, so the panel only reaches full height on the Information view — which is the view that needs it: 16 typical fields fit with no scrolling, where the previous `460x320` cap forced a scrollbar through the very values the panel exists to reveal |
 | No horizontal scroll | `table-layout:fixed` with a 34% key column and `overflow-wrap:anywhere` on values. Without it the table sized to its longest cell and the panel grew a sideways scrollbar |
 | Positioning | clamped to the viewport **using the element's measured size** (`offsetWidth/offsetHeight` after layout), re-run when the view toggles because the Information table is a different height from the action list. The size is deliberately not duplicated in JS — the two copies disagreed when the panel grew, and the stale clamp pushed it off the bottom of the screen |
+| Information is intrinsic | the panel always renders its own **Information** row, and caller-supplied actions are filtered for that label. A row that added one anyway produced TWO identical entries, and because the injected one was not wired to `setView('info')` it did nothing when clicked — that exact bug shipped on the Closed tab |
 | Dismissal | Escape, click outside, or the ✕ button. The ✕ is present in both levels; the back link returns to the action list |
 
 **Why Information exists instead of wrapping cells.** Cells never wrap (see §4.3),

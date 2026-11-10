@@ -239,6 +239,7 @@ What it does **not** touch, and why:
 | Not touched | Reason |
 |---|---|
 | `fw:alert:{key}` and its `count` | The fold owns that number. A second writer decrementing it would race the fold and produce a count that disagrees with the stored state. The row's count therefore still includes the deleted event until the next fold write — an honest visible artefact rather than a silent corruption. |
+| `fw:journal:{key}` | Keyed by the ALERT, not the event, so an event deletion shares no key with it. Notes are about the incident, which still exists and may still be firing — deleting one record must not erase what operators wrote about it ([journal.md](journal.md) §2.1). |
 | The RabbitMQ audit copy (`q.audit.events`) | It is a plain-text log written before the ack. There is no operator path to delete from it, so the event is **not** fully erased — only the queryable record is gone. Anyone relying on delete for compliance (GDPR-style erasure) must know this. |
 | Dragonfly snapshots | No AOF, and snapshots are retained for two hours. A deleted record can survive in a `.dfs` snapshot that is later restored. |
 

@@ -60,6 +60,36 @@ Trimming happens **on the write**, not on a timer: a timer cannot know which
 incidents are active and would walk every key forever — the same argument as
 `maybePruneIndex` in the worker.
 
+### 2.1 Deleting an event does NOT delete its journal
+
+Three key spaces, and they are scoped differently on purpose:
+
+| Key | Scoped to | Removed by |
+|---|---|---|
+| `fw:evt:{id}` | one **event record** | Delete event (3 keys, all keyed by id) |
+| `fw:alert:{source:type}` | one **incident** | Close, or the 7-day TTL |
+| `fw:journal:{source:type}` | one **incident** | the 7-day TTL only |
+
+`deleteEvent` removes `fw:evt:{id}`, its per-source index member and its global index
+member — nothing else. A journal is keyed by the ALERT, so an event deletion shares no
+key with it and cannot touch it.
+
+**That is the intended behaviour, and it is the reason the journal is alert-keyed.**
+If notes were attached to an event id, a note would disappear whenever that record was
+deleted or pruned — the opposite of what a journal is for. Deleting one record also
+never implies "forget what operators wrote about this incident": the incident is still
+there and may still be firing.
+
+The consequence is stated plainly: **there is no way to delete a journal entry.** Not
+one note, not the whole thread. Notes outlive every event in their incident and expire
+only with the alert's own 7-day TTL. That was chosen deliberately over two
+alternatives:
+
+- **cascade from event delete** — rejected: cleaning up one record would wipe the
+  notes for the whole incident
+- **a journal delete verb** — not built; if it ever is, it belongs in the journal panel
+  with its own confirmation, clearly separate from deleting events
+
 ---
 
 ## 3. Durability — and the honest limit

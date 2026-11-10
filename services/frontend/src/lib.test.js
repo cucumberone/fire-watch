@@ -141,6 +141,43 @@ test('applied=2 moves lastSeen and DOES increment count', () => {
   assert.equal(map.get('a:t').severity, 'CRITICAL', 'severity escalation is still shown');
 });
 
+test('lastSeen never moves BACKWARDS, whatever the frame carries', () => {
+  // THE BUG THIS PINS. One arrival produces TWO frames — `op: event` (carrying
+  // brokerTs) and `op: alert` (usually carrying neither `event` nor `row`). If the
+  // alert frame lands second with an older timestamp, or with a `row` whose
+  // lastSeen predates what the event frame already wrote, the column went
+  // backwards: measured 21:51:11 -> 21:51:07 while Count climbed 2 -> 3.
+  //
+  // "Last occurrence" is read as a monotonic clock. It must never retreat.
+  let map = new Map();
+  map = applyAlert(map, { key: 'a:t', applied: 1, event: { severity: 'WARNING', brokerTs: 2000 } });
+  assert.equal(map.get('a:t').lastSeen, 2000);
+
+  // An `op: alert` frame with a STALE row must not pull it back.
+  map = applyAlert(map, { key: 'a:t', applied: 1, row: { severity: 'WARNING', lastSeen: 1000, count: 2 } });
+  assert.equal(map.get('a:t').lastSeen, 2000, 'a stale row cannot rewind lastSeen');
+
+  // Nor can an older event brokerTs.
+  map = applyAlert(map, { key: 'a:t', applied: 2, event: { severity: 'WARNING', brokerTs: 1500 } });
+  assert.equal(map.get('a:t').lastSeen, 2000);
+
+  // A newer value always wins.
+  map = applyAlert(map, { key: 'a:t', applied: 1, row: { severity: 'WARNING', lastSeen: 3000, count: 3 } });
+  assert.equal(map.get('a:t').lastSeen, 3000);
+});
+
+test('an applied frame with no event and no row still moves lastSeen forward', () => {
+  // The common case: `op: alert` for a NEW occurrence carries neither. Falling
+  // back to Date.now() is what keeps the column alive, so it must not be
+  // defeated by the "never rewind" clamp when the stored value is older.
+  let map = new Map([['a:t', { key: 'a:t', severity: 'WARNING', count: 1, firstSeen: 1, lastSeen: 1000 }]]);
+  const before = Date.now();
+  map = applyAlert(map, { key: 'a:t', applied: 1 });
+  const got = map.get('a:t').lastSeen;
+  assert.ok(got >= before, `lastSeen must advance to now, got ${got}`);
+  assert.equal(map.get('a:t').count, 2);
+});
+
 // --------------------------------------------------- duplicate handling (drop)
 // A true duplicate never reaches the client: the fold's (timestamp, id)
 // watermark returns 0 for it, so there is no "coalesced" concept and no "+N"

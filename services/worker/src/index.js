@@ -177,6 +177,15 @@ async function handleMessage(msg) {
             kind: 'occurrence',
             key: `${evt.source}:${evt.type}`,
             applied,
+            // The ARRIVAL's broker timestamp, so the client can tell that this
+            // frame and the `op: event` frame beside it describe ONE delivery.
+            //
+            // Without it a client cannot pair them: the gateway may fail to read a
+            // row (so `row.lastSeen` is absent) and then the occurrence frame folds
+            // as a SECOND occurrence of the same arrival. Measured on the deployed
+            // app as Count climbing 1 -> 2 -> 3 -> 2 for one repeat while Last
+            // occurrence went backwards.
+            brokerTs,
           }),
         );
       } catch (err) {

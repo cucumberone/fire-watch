@@ -1054,7 +1054,11 @@ async function handleAlertMessage(raw) {
         key: parsed.key, err: String(err),
       });
     }
-    const frame = alertFrame(parsed.key, parsed.applied, row);
+    // Pass the producer's arrival timestamp through so the client can pair this
+    // frame with the `op: event` frame for the SAME delivery and count it once.
+    // `row.lastSeen` is unavailable whenever the row read fails, so the timestamp
+    // cannot be inferred from the frame body alone.
+    const frame = alertFrame(parsed.key, parsed.applied, row, parsed.brokerTs);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

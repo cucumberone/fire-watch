@@ -141,9 +141,17 @@ export function eventFrame(event, applied) {
  * frame small on the hot path (every applied event already carries its event on a
  * separate `op: event` frame).
  */
-export function alertFrame(key, applied, row) {
-  if (!row) return JSON.stringify({ op: 'alert', key, applied });
-  return JSON.stringify({ op: 'alert', key, applied, row });
+export function alertFrame(key, applied, row, brokerTs) {
+  // `brokerTs` identifies WHICH arrival this frame describes. A content duplicate
+  // is published on both channels, so the client receives an `op: event` frame and
+  // an `op: alert` frame for one delivery; the timestamp is the only field they
+  // share, and without it the client cannot tell a second frame from a second
+  // occurrence. It is carried even when `row` is absent, which is exactly the case
+  // where `row.lastSeen` cannot supply it.
+  const base = { op: 'alert', key, applied };
+  if (Number.isFinite(brokerTs) && brokerTs > 0) base.brokerTs = brokerTs;
+  if (row) base.row = row;
+  return JSON.stringify(base);
 }
 
 /**

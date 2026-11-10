@@ -693,6 +693,16 @@ function useSocket(config) {
   const noResyncRef = useRef(false);
   // Alert keys we currently display, so a reconnect can re-read their ack state.
   const knownKeysRef = useRef([]);
+  // Last ARRIVAL folded into each alert key.
+  //
+  // ONE arrival produces TWO frames: `op: event` on the events channel and, for a
+  // content duplicate, `op: alert` (kind: occurrence) on the alerts channel. Both
+  // reach this client and both used to fold into the alert map, so a single repeat
+  // incremented Count twice — measured 1 -> 2 -> 3 -> 2 across one arrival's frames.
+  //
+  // The pair is identified by the arrival's broker timestamp (an `op: alert` frame
+  // without one cannot be paired, and folds as before). Value is the brokerTs.
+  const lastFoldedRef = useRef(new Map());
 
   const ingest = useCallback(async (frame) => {
     if (frame.op === 'event' && frame.event) {
@@ -750,6 +760,9 @@ function useSocket(config) {
         if (frame.applied === 1 || frame.applied === 2) {
           closedCountedRef.current.delete(alertKey);
         }
+        // Remember this arrival so the paired `op: alert` occurrence frame for the
+        // SAME delivery does not count it a second time.
+        if (evt.brokerTs) lastFoldedRef.current.set(alertKey, evt.brokerTs);
         setAlerts((prev) =>
           applyAlert(prev, {
             key: alertKey,
@@ -797,6 +810,23 @@ function useSocket(config) {
       // repeat after a CLEAR needed a browser refresh to appear.
       const row = frame.row;
       const rowEvent = row?.event ? toViewEvent(row.event) : undefined;
+      // ONE ARRIVAL, ONE COUNT.
+      //
+      // A content duplicate is published on BOTH channels: `op: event` carries the
+      // arrival with its brokerTs, and `op: alert` (kind: occurrence) carries the
+      // rollup. Both reach this client, so folding both incremented Count twice for
+      // a single repeat — measured 1 -> 2 -> 3 -> 2 as the two frames interleaved.
+      //
+      // `brokerTs` is the arrival identity both frames share. It is preferred over
+      // `row.lastSeen` because the gateway may fail to read the row, and then the
+      // row supplies nothing at all.
+      const arrival = Number.isFinite(frame.brokerTs) && frame.brokerTs > 0
+        ? frame.brokerTs
+        : (row?.lastSeen ?? null);
+      if (arrival && lastFoldedRef.current.get(frame.key) === arrival) {
+        return;
+      }
+      if (arrival) lastFoldedRef.current.set(frame.key, arrival);
       // Re-opening forgets the "already counted" marker (see the retirement
       // handling below), so a later retirement of this key counts as a new closure.
       if (frame.applied === 1 || frame.applied === 2) {

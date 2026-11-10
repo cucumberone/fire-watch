@@ -494,9 +494,34 @@ export function applyAlert(map, { key, applied, event, row }) {
       // nothing to read it from.
       severity: event?.severity ?? row?.severity ?? prev?.severity,
       firstSeen: prev?.firstSeen ?? row?.firstSeen ?? event?.brokerTs ?? Date.now(),
-      // A repeat IS an occurrence, so lastSeen moves even without an event: the
-      // fold recorded the arrival at roughly now.
-      lastSeen: event?.brokerTs ?? row?.lastSeen ?? Date.now(),
+    // A repeat IS an occurrence, so lastSeen moves — and it must move FORWARD.
+    //
+    // THE BUG THIS FIXES. One arrival produces TWO frames: `op: event` (carrying
+    // brokerTs) and `op: alert` (usually carrying neither `event` nor `row`). The
+    // alert frame used to compute `event?.brokerTs ?? row?.lastSeen ?? Date.now()`,
+    // so with neither field it took Date.now() — the CLIENT's clock — and could
+    // land BELOW the broker timestamp the event frame had already written. Measured
+    // on the deployed app: Last occurrence went 21:51:11 -> 21:51:07 while Count
+    // climbed 2 -> 3. A clock that runs backwards is worse than a stale one.
+    //
+    // The rule is therefore not "prefer the newest field" — it is:
+    //
+    //   a frame WITH a timestamp  ->  max(prev, event.brokerTs, row.lastSeen)
+    //   a frame WITHOUT one       ->  never move backwards, but do advance
+    //
+    // The second case cannot be `Date.now()` outright (the client clock may trail
+    // the broker's by more than an occurrence interval), and it cannot be `prev`
+    // either (the column would freeze for the most common frame type). Advancing by
+    // a millisecond keeps it strictly increasing and honest: "this happened now,
+    // after the previous one".
+    lastSeen: (() => {
+      const prevSeen = prev?.lastSeen ?? 0;
+      const candidates = [event?.brokerTs, row?.lastSeen].filter((t) => Number.isFinite(t) && t > 0);
+      if (candidates.length > 0) return Math.max(prevSeen, ...candidates);
+      // No timestamp in the frame: advance past whatever we have, using the wall
+      // clock only when it is actually ahead.
+      return Math.max(prevSeen + 1, Date.now());
+    })(),
       count: row?.count ?? ((prev?.count ?? 0) + 1),
       // The latest applied event is the record worth inspecting: right-clicking
       // an alert row must show the enriched fields of the occurrence that put

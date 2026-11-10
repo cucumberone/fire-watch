@@ -295,6 +295,14 @@ main { flex:1 1 auto; width:100%; min-height:0; overflow:hidden;
 tr.row-selected td { background:var(--pre-bg); }
 tr.row-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 main.color-rows tr.row-selected td { background:rgba(127,127,127,.25); }
+/* Rows are a selection surface, not a document.
+   Without this, shift-click also runs the browser's text-selection gesture and
+   paints the cell text with the native highlight — which on a dark board looks
+   exactly like the row text has been selected for copying, and competes with the
+   selection colour so it is unclear what is selected.
+   Text stays copyable from the right-click Information panel, which is where a
+   cell's full value is read anyway. */
+.tbody { user-select:none; -webkit-user-select:none; }
 tbody tr { cursor:default; }
 /* The selection bar. Sits above the table and only exists while something is
    selected, so the normal view has no extra chrome. */

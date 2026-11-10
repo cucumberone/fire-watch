@@ -239,12 +239,23 @@ narrow window.
 
 ## 5. UI preferences
 
-Two presentation toggles live in the header. Both are client-side only — they are not sent to the gateway and they do not affect `applied` handling.
+Three presentation preferences are persisted. All are client-side only — they are
+not sent to the gateway and they do not affect `applied` handling.
 
 | Preference | Values | Default | Storage |
 |---|---|---|---|
 | Theme | `auto`, `light`, `dark` | `auto` | `localStorage['fw:theme']` |
 | Colour rows | on, off | off | `localStorage['fw:rowColor']` |
+| Live events open | on, off | **off** | `localStorage['fw:drawerOpen']` |
+
+Column widths are persisted separately per table (`fw:colw:alerts`,
+`fw:colw:events` — §4).
+
+The drawer is persisted because it is a **workspace preference, not transient UI
+state**: an operator who expanded it to watch a storm should still have it open
+after a reload. The default stays closed, so a first visit still gives the alert
+table the whole screen. It is stored as `'1'`/`'0'` rather than JSON so that a
+stale non-JSON value cannot throw during the initial render.
 
 Both toggles are **icon buttons**, not checkboxes:
 
@@ -298,11 +309,15 @@ Colour is never the only signal: the `sev` badge still carries the severity as t
 
 ### 5.3 Live events drawer
 
-The live tail is a bottom drawer, `max-height:45vh`, closed by default. Reasons:
+The live tail is a bottom drawer, `max-height:45vh`, closed **on a first visit**
+and remembered afterwards (`localStorage['fw:drawerOpen']` — §5). Reasons:
 
 - at 1 000 events/min the tail is the noisiest thing on screen, and it is a diagnostic view rather than the thing an operator acts on
-- keeping it closed by default means the alert table owns the full page height
+- keeping it closed on a first visit means the alert table owns the full page height
 - the collapsed handle still shows `(n of last 500)`, so a closed drawer is not a dead one
+- once an operator expands it, that choice survives a reload: reopening a diagnostic
+tail on every page load is friction, and the state is a preference rather than a
+transient interaction
 
 **A real bottom bar, never an overlay.** `position: sticky; bottom: 0` was tried and removed: sticky does not reserve space, it *lifts* the element out of its natural position to keep it visible, so as soon as `<main>` was taller than the viewport the drawer floated up over the alert table and clipped the row beneath it. `padding-bottom` on `<main>` cannot compensate, because the drawer was never in that space.
 

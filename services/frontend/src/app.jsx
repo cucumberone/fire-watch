@@ -71,6 +71,9 @@ const EVENT_DEFAULT_W = [96, 172, 172, 64, 340];
 // ABSENCE of a key, so a later OS change still takes effect.
 const THEME_KEY = 'fw:theme';
 const ROW_COLOR_KEY = 'fw:rowColor';
+// Whether the Live events drawer is expanded. A workspace preference, not
+// transient UI state: it survives a reload like the theme does.
+const DRAWER_KEY = 'fw:drawerOpen';
 
 function readPref(key, fallback) {
   try {
@@ -960,7 +963,19 @@ function App() {
   // The live tail is a diagnostic view, not the primary signal. Closed by
   // default so the alert table owns the screen; the count stays in the handle
   // so a collapsed drawer still tells you the stream is alive.
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  //
+  // Persisted, because the drawer is a workspace preference: an operator who
+  // opened it to watch a storm should still have it open after a reload, and
+  // reopening it on every page load is pure friction. Stored as '1'/'0' rather
+  // than JSON so a stale non-JSON value cannot throw during render.
+  const [drawerOpen, setDrawerOpen] = useState(() => readPref(DRAWER_KEY, '0') === '1');
+  const toggleDrawer = useCallback(() => {
+    setDrawerOpen((open) => {
+      const next = !open;
+      writePref(DRAWER_KEY, next ? '1' : '0');
+      return next;
+    });
+  }, []);
   // Pause freezes the RENDER, not the socket. The socket keeps draining and the
   // buffer keeps accumulating, so resuming shows everything that arrived while
   // paused instead of silently skipping a window of events.
@@ -1261,7 +1276,7 @@ function App() {
         <div className="drawer-bar">
           <button
             className="drawer-handle"
-            onClick={() => setDrawerOpen((o) => !o)}
+            onClick={toggleDrawer}
             aria-expanded={drawerOpen}
             aria-controls="live-events-panel"
           >

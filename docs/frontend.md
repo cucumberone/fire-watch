@@ -581,6 +581,19 @@ than assigned: it only covers up to `untilMs`, so replacing the list wholesale
 discarded anything that landed during the round trip and the list visibly went
 backwards a moment after the operator saw it move.
 
+**The list and its badge grow before the tab is ever opened.** The append used to be
+gated on `loadedAt`, reasoning that a list of "events since page load" is a partial
+answer and the authoritative query would overwrite it anyway. But `loadedAt` stays
+`null` until the tab is opened, so the badge sat at **0** and the pane said "No events
+in this window" while every other view was visibly busy — measured: Open alerts 4→5
+and Live events 76→79 with All events frozen at 0.
+
+A badge reading zero while the system is producing events is simply wrong. A partial
+count that becomes exact on first open is not, and the query still wins because
+`loadedAt` being null is exactly what triggers it. The same rule as the Closed tab's
+`count`: report what you know, and let the fetch correct it, rather than reporting
+nothing until you have fetched.
+
 **No heading and no count chip in a pane header.** The tab strip sits directly above
 and already names the pane, and its badge already carries the count. A heading
 restating the selected tab is the one control on screen that tells the operator

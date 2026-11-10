@@ -608,10 +608,23 @@ function useSocket(config) {
       // under a different id, so adding it would invent a row this tab's own query
       // can never return — `insertAllEvent`'s id-only dedup cannot catch it,
       // because the abandoned copy carries its own id.
+      //
+      // Appended whether or not the tab has been opened. It used to be gated on
+      // `prev.loadedAt`, reasoning that a list of "events since page load" is a
+      // partial answer and the authoritative query would overwrite it anyway. But
+      // `loadedAt` stays null until the tab is opened, so the tab sat at badge 0
+      // and "No events in this window" while every other view was visibly busy —
+      // measured: Open alerts 4->5 and Live events 76->79 while All events stayed 0.
+      // A badge that reads zero while the system is producing events is simply
+      // wrong; a partial count that becomes exact on open is not.
+      //
+      // The query still wins: `loadedAt` null triggers it on first open, and the
+      // reply is authoritative for its window.
       if (frame.applied !== 0 && frame.applied != null) {
-        setAllEvents((prev) => (prev.loadedAt
-          ? { ...prev, events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT) }
-          : prev));
+        setAllEvents((prev) => ({
+          ...prev,
+          events: insertAllEvent(prev.events, decorated, ALL_EVENTS_LIMIT),
+        }));
       }
       if (frame.applied !== null && frame.applied !== undefined) {
         const alertKey = `${evt.source}:${evt.type}`;
@@ -2509,8 +2522,13 @@ function App() {
           </Stack>
         ) : allEvents.events.length === 0 ? (
           <Typography variant="body2" color="text.secondary">
-            No events in this window.
-            {allEvents.loadedAt ? null : ' Open this tab to load.'}
+            {allEvents.loadedAt
+              // A completed query that returned nothing: the window really is quiet.
+              ? 'No events in this window.'
+              // Nothing has ARRIVED since the page loaded either, so the first
+              // query is still pending. Saying "No events" here would be a claim
+              // we have not verified — this pane has not read storage yet.
+              : 'Waiting for the first events, or open this tab to read the window.'}
           </Typography>
         ) : allEventRows.length === 0 ? (
           <Typography variant="body2" color="text.secondary">

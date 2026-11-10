@@ -119,7 +119,7 @@ header { display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
 .icon { width:1.05rem; height:1.05rem; display:block; }
 table { width:100%; border-collapse:collapse; font-size:.85rem; }
 th { text-align:left; font-weight:600; color:var(--dim); border-bottom:1px solid var(--line);
-     padding:.4rem .5rem; position:sticky; top:0; z-index:2; background:var(--bg); }
+     padding:.4rem .5rem; position:relative; background:var(--bg); }
 
 /* NO CELL EVER WRAPS.
    A wrapped value corrupts the value: "CIF-\n7730" is unreadable, and a time
@@ -172,14 +172,30 @@ main > section:first-of-type { flex:1 1 auto; }
 /* The header row must not scroll horizontally with the body, so the header and
    body are separate scrollers sharing one horizontal offset — see the
    scroll-sync note below. */
+/* The header table does not scroll, so nothing needs to be sticky here. Leaving
+   position:sticky on the th made it a containing block whose height:100% children
+   sized against the table, not the cell. */
 .tablewrap thead { position:static; }
-.tablewrap thead th { position:static; }
+.tablewrap thead th { position:relative; }
 
 /* Column resize handle. A real element, not a pseudo-element, because it needs
    its own hit area and cursor. Sits over the right edge of the header cell so
-   the pointer target is 7px wide however narrow the column is. */
-th { position:sticky; }
-.colresize { position:absolute; top:0; right:-3px; width:7px; height:100%;
+   the pointer target is 7px wide however narrow the column is.
+
+   The th must be position:relative for the absolutely-positioned handle to be
+   bounded by the CELL. It used to be position:sticky, which also establishes a
+   containing block — but with height:100% the handle sized against the table
+   rather than the header cell and measured 722px tall, so it covered the whole
+   body and no longer sat on the column edge. It is static now because the
+   header table does not scroll, so sticky bought nothing anyway.
+
+   The handle is drawn INSIDE the cell edge rather than half outside it. With
+   right:-3px it extended into the neighbouring th, and because a later sibling
+   paints on top, the next header intercepted every pointer event aimed at the
+   handle — the drag was unclickable. Keeping it in-bounds means there is no
+   overlap to lose. */
+.th-wrap { position:relative; }
+.colresize { position:absolute; top:0; bottom:0; right:0; width:7px;
              cursor:col-resize; user-select:none; z-index:3; }
 .colresize::after { content:''; position:absolute; top:20%; bottom:20%; left:3px;
                     width:1px; background:var(--line); }

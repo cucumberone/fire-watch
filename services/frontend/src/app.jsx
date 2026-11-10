@@ -2063,8 +2063,9 @@ function App() {
                  p: 2, pt: 1.5 }}>
         <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}
                flexWrap="wrap" useFlexGap>
-          <Typography variant="h2">All events</Typography>
-          <Chip label={allEventRows.length} size="small" variant="outlined" />
+          {/* No heading: the tab strip directly above already names the pane, and
+              the tab badge carries its count. A heading repeating the selected
+              tab is the one control on screen that tells the operator nothing. */}
           <FormControl sx={{ width: 170, flex: '0 0 auto' }}>
             <InputLabel id="all-range-label">Window</InputLabel>
             <Select
@@ -2081,10 +2082,11 @@ function App() {
           <Box sx={{ flex: 1 }} />
           <Tooltip title={allEvents.loading ? 'Loading…' : 'Re-read this window'}>
             <span>
-              {/* Icon-only and compact: the heading already says what the pane is, so
-                  a labelled filled button was the loudest control on the screen for
-                  a read-only refresh. `span` wrapper because a disabled IconButton
-                  swallows pointer events and the tooltip would stop showing. */}
+              {/* Icon-only and compact: the tab strip already says what the pane is,
+                  so a labelled filled button was the loudest control on the screen
+                  for a read-only refresh. `span` wrapper because a disabled
+                  IconButton swallows pointer events and the tooltip would stop
+                  showing. */}
               <IconButton
                 size="small"
                 onClick={() => loadAllEvents(allEvents.range)}

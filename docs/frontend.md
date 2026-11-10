@@ -491,6 +491,37 @@ survives a reload, reaches the full 7-day retention, and can be asked for a spec
 window. Search is over the fetched page (bounded, so it stays instant); the window
 is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
+**The tab is a query that stays live.** A query alone was a still photograph of a
+live board: it answered once, on first open, and the list and its badge then sat at
+whatever the count was at that instant. An operator watching the tab saw nothing
+move. So a stored event that arrives while the tab is loaded is appended through
+`insertAllEvent`, which de-duplicates on **id alone** — deliberately unlike the live
+tail's `insertEvent`, which also compares `brokerTs`.
+
+The asymmetry is the whole point, and it follows from the two questions:
+
+| List | Question | An absorbed repeat |
+|---|---|---|
+| Live events | what *arrived* | a distinct arrival — include it |
+| All events | what is *stored* | never written — exclude it |
+
+Storage is one record per id in `fw:evt:{id}`, so a second row for the same id would
+be a row the tab's own query could never return. Frames with `applied: 0` are
+therefore skipped outright; their ids are new, so no de-duplication rule could have
+caught them.
+
+The query reply is still authoritative for its window, but it is **merged** rather
+than assigned: it only covers up to `untilMs`, so replacing the list wholesale
+discarded anything that landed during the round trip and the list visibly went
+backwards a moment after the operator saw it move.
+
+**No heading and no count chip in the pane header.** The tab strip sits directly
+above and already names the pane, and its badge already carries the count. A heading
+restating the selected tab is the one control on screen that tells the operator
+nothing, and on a live tab the two counts could disagree for a frame — two numbers
+side by side, one of them stale, is worse than one. The pane header is therefore only
+the controls: the window picker and the refresh button.
+
 **Two chips joined by a line: connection → database.** They are separate because
 they fail separately — the socket can be perfectly healthy while the gateway's reads
 fail, which is a stale board behind a green chip. The line between them shows the

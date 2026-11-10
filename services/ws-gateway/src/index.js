@@ -284,9 +284,34 @@ wss.on('connection', (ws, req) => {
       try {
         const sources = verdict.sub.sources.length > 0 ? verdict.sub.sources : [];
         if (sources.length === 0) {
-          // No source filter: there is no bounded index to read, so live-only.
-          // Scanning every source is exactly the unbounded scan we refuse to do.
-          log.debug('backfill skipped: no source filter');
+          // No source filter — the common case.
+          //
+          // This used to be live-only, on the grounds that without a source there
+          // was no bounded index to read and scanning every source is the unbounded
+          // scan the design forbids. That reasoning predates `fw:idx:evt:all`: the
+          // worker now writes every event to ONE global timeline, so a windowed read
+          // over it is a single bounded ZREVRANGEBYSCORE — exactly what `op:
+          // allEvents` already does.
+          //
+          // Skipping it meant Live events was empty on every refresh, because the
+          // only rows were whatever arrived after connecting. The client already asks
+          // for a `since` (15 minutes by default), so honour it.
+          const ids = await reader.readIndexRange({
+            sinceMs: plan.min,
+            untilMs: plan.max,
+            limit: plan.limit,
+          });
+          if (ids.length >= plan.limit) truncated = true;
+          // `readIndexRange` is ZRANGEBYSCORE, so the ids already arrive OLDEST
+          // first — the order the tail renders. No re-sort: reversing here would
+          // put the newest at the top of a feed that appends.
+          const events = await reader.readEvents(ids);
+          for (const evt of events) {
+            if (!matchesSubscription(verdict.sub, evt)) continue;
+            if (!recent.add(evt.id)) continue;
+            send(eventFrame(evt, null));
+            backfilled += 1;
+          }
         } else {
           for (const source of sources) {
             const ids = await reader.readIndex(source, plan.min, plan.max, plan.limit);

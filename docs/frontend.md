@@ -714,6 +714,20 @@ The dev harness used to fabricate `Count: (i % 5) + 1`, which made the dead fiel
 look meaningful and hid the problem for as long as it existed. It now emits no
 `Count`, so the mock has the same shape production does.
 
+**The tail is NOT seeded from the alert snapshot.** It used to be: on connect the
+gateway sends a `snapshot` of open alerts carrying each one's newest record, and the
+client pushed those into the tail so the pane was not empty. The result was exactly
+one row of unexplained age after every refresh — the alert's `last_id` record, which
+can be hours old, sitting in a feed that otherwise means "arrivals since you
+connected". An operator cannot tell whether that row just arrived or was left over,
+and there was no way to distinguish it because it carried no marker.
+
+So the tail shows **arrivals only**, and history on connect comes from the real
+backfill instead: `subscribe` replays the events in the window since `since`
+(15 minutes by default) from the global index. A refresh therefore shows a genuine
+time range, and the newest row is a real arrival rather than whatever the fold
+happened to leave as `last_id`.
+
 ### 5.7 Closed tab
 
 Shows what retired in the last **7 days**, newest closure first. It is a

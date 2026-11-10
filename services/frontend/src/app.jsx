@@ -930,14 +930,19 @@ function useSocket(config) {
       }
       setAcks(acked);
 
-      // The snapshot carries the newest record per alert; seed the live tail with
-      // them too so the drawer is not empty before the first live event.
-      const seeded = frame.alerts
-        .map((r) => (r?.event ? toViewEvent(r.event) : null))
-        .filter(Boolean);
-      if (seeded.length > 0) {
-        setEvents((prev) => seeded.reduce((acc, e) => insertEvent(acc, e, EVENT_LIMIT), prev));
-      }
+      // NOTE: the live tail is NOT seeded from the snapshot.
+      //
+      // It used to be — the newest record of each open alert was pushed into the
+      // tail so the pane was not empty on load. That produced exactly one row of
+      // unexplained age after every refresh: the alert's `last_id` record, which can
+      // be hours old, presented in a feed that otherwise means "arrivals since you
+      // connected". An operator sees one row and cannot tell whether it just
+      // arrived or was left over.
+      //
+      // The tail now shows ARRIVALS ONLY. Nothing has arrived yet on a fresh
+      // connection, so it is empty, and `op: allEvents` is where history lives —
+      // with a window picker, a filter and a server-reported total. The backfill
+      // below is what fills it with real recent events when a source filter is set.
       return;
     }
     if (frame.op === 'db') {
@@ -2573,15 +2578,23 @@ function App() {
                   const ids = targets
                     .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k)?.id)
                     .filter(Boolean);
-                  // The ALERTS these rows belong to, deduplicated: several events from
-                  // one incident are one alert, so closing must not send the same
-                  // `close` frame twice — and the label must not claim otherwise.
+                  // Events selected -> the distinct alerts they belong to.
+                  //
+                  // An ALERT is `source:type`; several events can share one, which is
+                  // exactly what content dedup records. So a selection of 6 events can
+                  // legitimately touch 4 alerts, and the two menu items then quote
+                  // different numbers. That is correct and it looked like a bug, so the
+                  // Close label now states the collapse explicitly rather than leaving
+                  // the operator to reconcile two counts.
+                  const selectedEvents = targets
+                    .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k))
+                    .filter(Boolean);
                   const alertKeys = [...new Set(
-                    targets
-                      .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k))
-                      .filter((x) => x?.source && x?.type)
+                    selectedEvents
+                      .filter((x) => x.source && x.type)
                       .map((x) => `${x.source}:${x.type}`),
                   )];
+                  const collapsing = targets.length > alertKeys.length;
                   return (
                     <EventRow
                       // Id plus brokerTs: a stored event id is unique, but the same
@@ -2593,7 +2606,14 @@ function App() {
                       onContextMenu={(ev) => openInspector(
                         ev,
                         e.wire ?? e,
-                        targets.length > 1 ? `${targets.length} events` : `${e.source} · ${e.type}`,
+                        // State BOTH counts when they differ. "6 events" alone invites
+                        // the reader to expect 6 of everything; the menu then quotes 4
+                        // for Close and looks broken.
+                        targets.length > 1
+                          ? (collapsing
+                            ? `${targets.length} events · ${alertKeys.length} alerts`
+                            : `${targets.length} events`)
+                          : `${e.source} · ${e.type}`,
                         [
                           {
                             // Close the ALERT this event belongs to. Offered here because
@@ -2607,10 +2627,14 @@ function App() {
                             // operator is not told they are closing five when they are
                             // closing two.
                             label: alertKeys.length > 1
-                              ? `Close ${alertKeys.length} alerts`
+                              ? (collapsing
+                                ? `Close ${alertKeys.length} alerts (${targets.length} events)`
+                                : `Close ${alertKeys.length} alerts`)
                               : 'Close alert',
                             disabled: alertKeys.length === 0,
-                            title: 'Retire the alert these events belong to. Same end state as a CLOSE event from the source',
+                            title: collapsing
+                              ? `These ${targets.length} events belong to ${alertKeys.length} alert(s); one close per alert. Closing is not deleting — the events stay.`
+                              : 'Retire the alert these events belong to. Same end state as a CLOSE event from the source',
                             run: () => bulk('close', alertKeys),
                           },
                           {
@@ -2619,7 +2643,7 @@ function App() {
                               : 'Delete event',
                             disabled: ids.length === 0,
                             title: ids.length > 1
-                              ? 'Permanently delete these event records. Cannot be undone.'
+                              ? `Permanently delete these ${ids.length} event records. One per event, because a record IS an event — unlike Close, which acts on the alert.`
                               : `Permanently delete event ${e.id}`,
                             run: () => { for (const id of ids) deleteEvent(id); },
                             danger: true,

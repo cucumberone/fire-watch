@@ -189,6 +189,27 @@ export class DragonflyReader {
   }
 
   /**
+   * Read event ids in a time window from the GLOBAL index.
+   *
+   * One bounded range over `fw:idx:evt:all`, ascending by broker time — the order
+   * the live tail renders. This is what lets `subscribe` backfill without a source
+   * filter: before the global index existed there was no bounded way to answer
+   * "everything since T" across all devices, so the backfill was skipped and the
+   * tail was empty on every refresh.
+   *
+   * @returns {Promise<string[]>} ids, OLDEST first
+   */
+  async readIndexRange({ sinceMs = 0, untilMs = Date.now(), limit = 500 } = {}) {
+    const c = await this.connect();
+    return c.zrangebyscore(
+      'fw:idx:evt:all',
+      `(${Math.max(0, sinceMs)}`,
+      String(untilMs),
+      'LIMIT', 0, Math.max(1, limit),
+    );
+  }
+
+  /**
    * Read the newest events across ALL sources, with their records attached.
    *
    * Backs the All Events tab. The per-source index cannot answer this: there is no

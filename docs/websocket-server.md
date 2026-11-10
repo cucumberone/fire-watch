@@ -53,7 +53,11 @@ Server → client:
 
 Rules:
 
-- `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **broker timestamp** index (`fw:idx:src:*`), so they stay correct even when producer clocks are skewed.
+- `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **broker timestamp** index, so they stay correct even when producer clocks are skewed.
+
+  **With no source filter it reads `fw:idx:evt:all`.** It used to be skipped entirely in that case, on the grounds that without a source there was no bounded index to read and scanning every source is the unbounded scan this design forbids. That reasoning predates the global index. The worker writes every event to one timeline, so "everything since T" is a single bounded `ZRANGEBYSCORE` — the same read `op: allEvents` already does.
+
+  Skipping it made Live events **empty on every refresh**: the only rows were whatever arrived after connecting, so a reload wiped the tail. It now replays the window since `since` (the client asks for 15 minutes by default) and reports the count in `hello.backfill`.
 - `applied` is the alert fold's return code from the worker ([event-lifecycle.md](event-lifecycle.md) §5.2): `0` dropped (duplicate or stale), `1` applied, `3` closed. `2` is a retired alias for `1`. A duplicate never reaches the client at all — the worker's `SET … NX` gate drops it — so treating `0` as an applied event would double-count, and treating it as a close would flicker the row.
 - `op: alert` frames carry an alert row, not the raw event. `count` counts every applied event; a redelivered event is dropped by the worker's `SET … NX` gate before it can affect the count ([event-lifecycle.md](event-lifecycle.md) §5.4). Alert frames are emitted from `fw:ch:alerts`; a client that missed one recovers via the snapshot on reconnect rather than by replaying events.
 - `payload.msgc` may arrive **gzip-compressed** and base64-encoded. The gateway passes it through untouched — it must not decompress, because that adds per-message CPU to every pod for no benefit ([payload-and-compression.md](payload-and-compression.md) §5.1).

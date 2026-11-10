@@ -526,10 +526,18 @@ wss.on('connection', async (ws) => {
 
     if (frameIn.op !== 'subscribe') return;
 
-    // Backfill: a mix of open alerts and history.
-    const history = Array.from({ length: 14 }, (_, i) => mkEvent(i));
+    // Backfill: honour the client's `since`, like the real gateway now does.
+    //
+    // The gateway used to skip backfill entirely when a subscription had no source
+    // filter, which is the default — so Live events was empty on every refresh and
+    // the only rows were whatever arrived after connecting. It now reads the global
+    // index, so the mock must do the same or it hides the difference.
+    const sinceMs = frameIn.since ? Date.parse(frameIn.since) : Date.now() - 15 * 60e3;
+    const history = [...mockEventLog.values()]
+      .filter((e) => (e.brokerTs ?? 0) >= (Number.isFinite(sinceMs) ? sinceMs : 0))
+      .sort((a, b) => (a.brokerTs ?? 0) - (b.brokerTs ?? 0));
     for (const evt of history) {
-      ws.send(JSON.stringify({ op: 'event', event: evt, applied: null }));
+      ws.send(JSON.stringify({ op: 'event', event: { ...evt }, applied: null }));
       await new Promise((r) => setTimeout(r, 15));
     }
     ws.send(JSON.stringify({ op: 'hello', server: 'ws-gateway-demo', backfill: history.length, truncated: false,

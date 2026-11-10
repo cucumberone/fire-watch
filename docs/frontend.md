@@ -537,6 +537,33 @@ survives a reload, reaches the full 7-day retention, and can be asked for a spec
 window. Search is over the fetched page (bounded, so it stays instant); the window
 is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
+**The State column answers "is this incident open now".** An event record is immutable
+— it carries no state of its own. Open/closed is a property of the **alert**
+(`source:type`), which the fold maintains on `fw:alert:{key}`, and the gateway joins it
+onto each row as `alertState` / `alertClosedAt` using one pipelined `HMGET` over the
+**distinct** alerts in the page (400 events from 4 incidents costs 4 lookups, not 400).
+
+Three states, and `unknown` is deliberately **not** rendered as closed:
+
+| Chip | Meaning |
+|---|---|
+| `open` (filled, error colour) | the alert this event belongs to is still firing |
+| `closed` (outlined, success colour) | retired; the tooltip says when |
+| `unknown` (dimmed) | no alert hash — expired, or the event never opened one |
+
+Colouring `unknown` as `closed` would claim an incident ended when we simply do not
+know, which is the same mistake the connection chip's `unknown` state exists to avoid.
+
+A row can read `CLEAR` for severity and `open` for state, and that is correct: the chip
+reports the alert's **current** state, not its state when the event happened. A CLEAR
+from last Tuesday belongs to an incident that may have re-fired since, and "is it open
+now" is the question an operator scanning a log is actually asking.
+
+The chip stays live. An `op: alert` frame with `applied: 3` flips every All events row
+for that key to `closed` immediately, and `1`/`2` flips them back to `open` — otherwise
+the column would be a snapshot from whenever the tab was queried, and closing an alert
+from Open alerts would leave its All events rows claiming `open`.
+
 **Two filters on one row, severity first.** The severity picker leads because it is
 the coarse cut an operator makes before typing anything — "only the criticals in the
 last 24 hours". Its options are derived from the loaded rows (`eventSeverities`) so a

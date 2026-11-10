@@ -269,6 +269,45 @@ export class DragonflyReader {
         else this.log.warn('unparseable stored event during all-events read', { id: slice[j] });
       });
     }
+
+    // ---- alert state per row.
+    //
+    // An event record carries NO state of its own — it is an immutable fact that
+    // arrived. "Open or closed" is a property of the ALERT (`source:type`), which the
+    // fold maintains on `fw:alert:{key}`. So this is a second read, over the DISTINCT
+    // alerts in the page rather than over every row: 400 events from 4 incidents is 4
+    // lookups, not 400.
+    //
+    // One pipeline, two fields. `state` is 'open' or 'closed'; `closed_at` says when,
+    // and is null while open. An alert hash that has expired yields nulls, which the
+    // client renders as unknown rather than guessing.
+    const alertKeys = [...new Set(
+      events
+        .filter((e) => e?.source && e?.type)
+        .map((e) => `${e.source}:${e.type}`),
+    )];
+    const states = new Map();
+    if (alertKeys.length > 0) {
+      const pipe = c.pipeline();
+      for (const key of alertKeys) pipe.hmget(`fw:alert:${key}`, 'state', 'closed_at');
+      const res = await pipe.exec();
+      res.forEach((tuple, i) => {
+        const [err, value] = tuple || [];
+        if (err || !Array.isArray(value)) return;
+        const [state, closedAt] = value;
+        states.set(alertKeys[i], {
+          state: state || null,
+          closedAt: closedAt ? Number(closedAt) : null,
+        });
+      });
+    }
+    for (const e of events) {
+      const key = e?.source && e?.type ? `${e.source}:${e.type}` : null;
+      const s = key ? states.get(key) : null;
+      e.alertState = s?.state ?? null;
+      e.alertClosedAt = s?.closedAt ?? null;
+    }
+
     return { events, total };
   }
 

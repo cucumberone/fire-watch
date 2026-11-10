@@ -496,9 +496,22 @@ wss.on('connection', async (ws) => {
         .filter((e) => (e.brokerTs ?? 0) > since)
         .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
       const page = rows.slice(0, limit);
+      // Join the alert state the way the real gateway does: the EVENT has no state,
+      // the ALERT (`source:type`) does. A key in openAlerts is open; one in
+      // closedMock is closed; neither means unknown.
+      const withState = page.map((e) => {
+        const key = `${e.source}:${e.type}`;
+        const isOpen = openAlerts.has(key);
+        const closed = closedMock.get(key);
+        return {
+          ...e,
+          alertState: isOpen ? 'open' : (closed ? 'closed' : null),
+          alertClosedAt: isOpen ? null : (closed?.closedAt ?? null),
+        };
+      });
       ws.send(JSON.stringify({
         op: 'allEvents',
-        events: page,
+        events: withState,
         // The WINDOW total, not the page size — the client's badge reads this.
         total: rows.length,
         range,
@@ -596,13 +609,26 @@ wss.on('connection', async (ws) => {
     // Retirement severities (CLOSE, HARMLESS) only ever produce applied:3.
     let n = 100;
     let open = true; // toggles a demo key so a close is visible mid-stream
+    // Rotate through the SAME source/type pairs the seeded alerts use.
+    //
+    // The tail used to emit a single hard-coded `edge-gw-02:link.flap`, which no
+    // alert was ever opened for. With the State column that meant every live row
+    // read `unknown` while the board was clearly firing — the harness contradicting
+    // itself, which hides the thing the column exists to show.
+    const LIVE_PAIRS = [
+      { source: 'core-sw-07', type: 'link.down' },
+      { source: 'edge-gw-01', type: 'power.fault' },
+      { source: 'sensor-rack-a', type: 'telemetry.temperature' },
+      { source: 'edge-gw-02', type: 'power.fault' },
+    ];
     const tick = setInterval(() => {
       if (ws.readyState !== ws.OPEN) { clearInterval(tick); return; }
       const phase = n % 6;
       let severity = 'WARNING';
       let applied = 1;
-      let source = 'edge-gw-02';
-      let type = 'link.flap';
+      const pair = LIVE_PAIRS[n % LIVE_PAIRS.length];
+      const source = pair.source;
+      const type = pair.type;
 
       // Every other tick escalates the severity so a live CRITICAL is visible,
       // and one tick per cycle is a dropped duplicate (applied 0) — exactly what

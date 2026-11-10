@@ -234,8 +234,8 @@ test('an already-closed alert reports who closed it instead of overwriting', asy
 });
 
 // ------------------------------------------------ All Events reader contract
-function allEventsClient({ ids = [], events = {}, total = ids.length } = {}) {
-  const calls = { range: null, mget: [], count: null };
+function allEventsClient({ ids = [], events = {}, total = ids.length, states = {} } = {}) {
+  const calls = { range: null, mget: [], count: null, hmget: [] };
   return {
     calls,
     async zrevrangebyscore(key, max, min, ...rest) {
@@ -249,6 +249,24 @@ function allEventsClient({ ids = [], events = {}, total = ids.length } = {}) {
     async mget(keys) {
       calls.mget.push(keys);
       return keys.map((k) => events[k] ?? null);
+    },
+    pipeline() {
+      const queued = [];
+      const pipe = {
+        hmget(key, ...fields) {
+          calls.hmget.push({ key, fields });
+          queued.push(key);
+          return pipe;
+        },
+        async exec() {
+          return queued.map((key) => {
+            const s = states[key];
+            if (!s) return [null, [null, null]];
+            return [null, [s.state ?? null, s.closedAt != null ? String(s.closedAt) : null]];
+          });
+        },
+      };
+      return pipe;
     },
   };
 }
@@ -270,6 +288,65 @@ test('readAllEvents reads the GLOBAL index, newest first, windowed', async () =>
   // Exclusive lower bound, so two overlapping windows never list the same event.
   assert.equal(client.calls.range.min, '(5000');
   assert.deepEqual(client.calls.range.rest.slice(-2), [0, 100]);
+});
+
+test('readAllEvents joins the ALERT state onto each event', async () => {
+  // An event record is immutable and carries no state. "Open or closed" is a
+  // property of the alert (`source:type`), so the reader joins it on. The State
+  // chip reads `alertState`.
+  const client = allEventsClient({
+    ids: ['e1', 'e2', 'e3'],
+    events: {
+      'fw:evt:e1': JSON.stringify({ id: 'e1', source: 'a', type: 'open.one' }),
+      'fw:evt:e2': JSON.stringify({ id: 'e2', source: 'a', type: 'closed.one' }),
+      'fw:evt:e3': JSON.stringify({ id: 'e3', source: 'a', type: 'gone.one' }),
+    },
+    states: {
+      'fw:alert:a:open.one': { state: 'open', closedAt: null },
+      'fw:alert:a:closed.one': { state: 'closed', closedAt: 1700000000000 },
+    },
+  });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const { events } = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 10 });
+  assert.deepEqual(events.map((e) => [e.id, e.alertState]), [
+    ['e1', 'open'],
+    ['e2', 'closed'],
+    ['e3', null],
+  ]);
+  assert.equal(events[1].alertClosedAt, 1700000000000);
+  assert.equal(events[0].alertClosedAt, null);
+
+  // ONE lookup per DISTINCT alert, not per row: this page has three events but the
+  // read must not scale with row count.
+  assert.equal(client.calls.hmget.length, 3);
+  assert.deepEqual(client.calls.hmget.map((h) => h.key).sort(), [
+    'fw:alert:a:closed.one', 'fw:alert:a:gone.one', 'fw:alert:a:open.one',
+  ]);
+});
+
+test('readAllEvents does one alert lookup per distinct key, not per row', async () => {
+  // 50 events from 2 incidents costs 2 lookups. Scaling with ROWS here would add a
+  // read per row to a query that already pages 1000 of them.
+  const ids = Array.from({ length: 50 }, (_, i) => `e${i}`);
+  const events = Object.fromEntries(ids.map((id, i) => [
+    `fw:evt:${id}`,
+    JSON.stringify({ id, source: 's', type: i % 2 ? 'a' : 'b' }),
+  ]));
+  const client = allEventsClient({
+    ids, events,
+    states: {
+      'fw:alert:s:a': { state: 'open', closedAt: null },
+      'fw:alert:s:b': { state: 'closed', closedAt: 1 },
+    },
+  });
+  const r = new DragonflyReader(cfg, log);
+  r.connect = async () => client;
+
+  const { events: out } = await r.readAllEvents({ sinceMs: 0, untilMs: 999, limit: 100 });
+  assert.equal(out.length, 50);
+  assert.equal(client.calls.hmget.length, 2, 'two distinct alerts -> two lookups');
 });
 
 test('readAllEvents reports the WINDOW total, not the page size', async () => {

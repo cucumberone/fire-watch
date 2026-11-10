@@ -97,7 +97,7 @@ const CLOSED_DEFAULT_W = [96, 172, 172, 172, 64, 340, 240];
 // operator cares about is the alert's occurrence rollup, which lives on the alert
 // hash and is the alert table's Count. A column that always reads 1 is noise that
 // invites the reader to look for meaning in it.
-const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Summary'];
+const EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Summary'];
 
 /**
  * Default widths, in px, for every real column.
@@ -113,7 +113,7 @@ const EVENT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Summary'
  * they are wider. Without the spacer, `width: 100%` redistributes again.
  */
 const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
-const EVENT_DEFAULT_W = [96, 172, 172, 340];
+const EVENT_DEFAULT_W = [96, 84, 172, 172, 340];
 
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
@@ -754,6 +754,34 @@ function useSocket(config) {
       return;
     }
     if (frame.op === 'alert') {
+      // Keep the State chip on existing EVENT rows in step with the alert.
+      //
+      // Without this the chip is a snapshot from whenever the tab was queried: close
+      // an alert from Open alerts and the All events rows for it keep saying `open`
+      // until the next fetch. The chip's whole value is answering "is this incident
+      // open NOW", so it has to move when the fold says it moved.
+      //
+      // `applied === 3` is a retirement, `1`/`2` an occurrence, which means an alert
+      // that was closed has re-fired. Only rows for THIS key are touched.
+      if (typeof frame.key === 'string' && (frame.applied === 1 || frame.applied === 2 || frame.applied === 3)) {
+        const [src, ...rest] = frame.key.split(':');
+        const typ = rest.join(':');
+        const nowState = frame.applied === 3 ? 'closed' : 'open';
+        setAllEvents((prev) => {
+          let changed = false;
+          const events = prev.events.map((e) => {
+            if (e.source !== src || e.type !== typ) return e;
+            if (e.alertState === nowState) return e;
+            changed = true;
+            return {
+              ...e,
+              alertState: nowState,
+              alertClosedAt: nowState === 'closed' ? Date.now() : null,
+            };
+          });
+          return changed ? { ...prev, events } : prev;
+        });
+      }
       // A content-duplicate frame carries `row` (the alert's current state, with
       // its newest event attached) because it has no event of its own. Without it
       // a client that never saw the original had nothing to build a row from, so
@@ -1923,6 +1951,7 @@ function EventRow({ evt, selected, onSelect, onContextMenu }) {  // `evt` is a v
       aria-selected={onSelect ? Boolean(selected) : undefined}
     >
       <td><Badge severity={evt.severity} label={evt.displaySeverity} /></td>
+      <td><AlertStateChip state={evt.alertState} closedAt={evt.alertClosedAt} /></td>
       <td className="mono">{formatClock(evt.firstOccurrence)}</td>
       <td className="mono">{formatClock(evt.lastOccurrence)}</td>
       <td className="summary">
@@ -1934,6 +1963,55 @@ function EventRow({ evt, selected, onSelect, onContextMenu }) {  // `evt` is a v
       {/* Spacer cell, matching the spacer column in the header. */}
       <td />
     </tr>
+  );
+}
+
+/**
+ * Open / closed chip for an EVENT row.
+ *
+ * An event record is immutable — it has no state of its own. "Open or closed" is a
+ * property of the ALERT it belongs to (`source:type`), which the fold maintains on
+ * `fw:alert:{key}`, and the gateway joins it onto each row as `alertState`.
+ *
+ * Three distinct meanings, and they must not look alike:
+ *
+ *   open            the alert this event belongs to is still firing
+ *   closed          it was retired, and `closedAt` says when
+ *   unknown         the alert hash has expired or was never seen
+ *
+ * `unknown` is deliberately not rendered as "closed". A missing hash means we do not
+ * know, and colouring that as a resolution would claim the incident ended — the same
+ * mistake as the connection chip's `unknown` state.
+ *
+ * Note the chip reports the alert's CURRENT state, not the state at the time of the
+ * event. A CLEAR event from a week ago belongs to an alert that may have re-fired
+ * since, so the row can read `open` while its own severity reads `CLEAR`. That is
+ * correct: the chip answers "is this incident open now", which is the question an
+ * operator scanning a log is asking.
+ */
+function AlertStateChip({ state, closedAt }) {
+  if (state !== 'open' && state !== 'closed') {
+    return (
+      <Chip
+        label="unknown"
+        size="small"
+        variant="outlined"
+        title="No alert state for this record — the alert hash has expired, or this event never opened an alert"
+        sx={{ opacity: 0.6 }}
+      />
+    );
+  }
+  const open = state === 'open';
+  return (
+    <Chip
+      label={open ? 'open' : 'closed'}
+      size="small"
+      color={open ? 'error' : 'success'}
+      variant={open ? 'filled' : 'outlined'}
+      title={open
+        ? 'This event belongs to an alert that is still open'
+        : `This event belongs to an alert closed${closedAt ? ` ${formatClock(closedAt)}` : ''}. The event itself is unchanged — closing acts on the alert`}
+    />
   );
 }
 

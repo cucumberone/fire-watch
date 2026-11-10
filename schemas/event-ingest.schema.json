@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/cucumberone/fire-watch/schemas/event-ingest.schema.json",
+  "title": "Fire-Watch ingest event",
+  "description": "The event contract accepted by the HTTP ingress. Producers POST one of these, an array of them, or {\"events\": [...]} to /events.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "EVT_AgentOwner": {
+      "type": "string",
+      "title": "Support team owning the tool sending the event",
+      "description": "Not ownership of the actual monitor — the agent that shipped the event.",
+      "default": "",
+      "examples": ["Group-xxxxxx"]
+    },
+    "EVT_Identifier": {
+      "type": "string",
+      "title": "Optional event ID/identifier",
+      "description": "When blank, the ingress generates one. Two events with the same content are deduplicated on content, not on this field, so re-using it does not create a second alert.",
+      "default": "",
+      "examples": ["own-recipe-of-unique-identifier"]
+    },
+    "EVT_Device": {
+      "type": "string",
+      "title": "Device/server/host that event is about",
+      "description": "Becomes the alert's source, so device + EVT_EventKey identifies the alert.",
+      "default": "",
+      "examples": ["test-device-name"]
+    },
+    "EVT_EventKey": {
+      "type": "string",
+      "title": "EventKey needed to ensure automations, ownership, handling etc.",
+      "description": "Becomes the alert's type. Device + EventKey is the alert identity.",
+      "default": "",
+      "examples": ["EVT_KEY123ABC"]
+    },
+    "EVT_Severity": {
+      "type": "string",
+      "title": "Events' default/original severity",
+      "description": "Mapped onto the internal severity scale by the ingress. CLEAR and HARMLESS retire an alert.",
+      "default": "",
+      "enum": [
+        "CLEAR",
+        "HARMLESS",
+        "INFORMATION",
+        "INDETERMINATE",
+        "WARNING",
+        "MINOR",
+        "MAJOR",
+        "CRITICAL"
+      ],
+      "examples": ["CRITICAL"]
+    },
+    "EVT_Agent": {
+      "type": "string",
+      "title": "What tool/technology is sending the event",
+      "default": "",
+      "examples": ["Prometheus"]
+    },
+    "EVT_Summary": {
+      "type": "string",
+      "title": "Event summary",
+      "description": "The single line shown in the alert table.",
+      "default": "",
+      "examples": ["Something has happened"]
+    },
+    "EVT_Details": {
+      "type": "string",
+      "title": "Details message",
+      "description": "The expandable body. Compressed at the worker when large enough.",
+      "default": "",
+      "examples": ["More details"]
+    },
+    "EVT_URL": {
+      "type": "string",
+      "title": "Optional link/deep link to a page with full event details",
+      "default": "",
+      "examples": ["https://example.invalid/event/123"]
+    },
+    "EVT_Environment": {
+      "type": "string",
+      "title": "Optional environment of the event",
+      "default": "",
+      "examples": ["development", "stage", "production"]
+    }
+  },
+  "required": [
+    "EVT_Device",
+    "EVT_EventKey",
+    "EVT_Severity",
+    "EVT_Summary",
+    "EVT_AgentOwner",
+    "EVT_Agent"
+  ]
+}

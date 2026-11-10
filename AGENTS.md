@@ -32,6 +32,7 @@ This repo sets up an event server.
 ## Documentation
 
 - [Architecture](docs/architecture.md) — components, data flow, message contract, failure matrix
+- [Event Schema](docs/event-schema.md) — the producer contract (`EVT_*`), severity mapping, validation rules
 - [Fault Tolerance Audit](docs/fault-tolerance.md) — per-component H/A and split-brain verification, 9 defects found and fixed
 - [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, redelivery safety
 - [Acknowledgement](docs/acknowledge.md) — operator ack, the one gateway write, cleared on re-fire

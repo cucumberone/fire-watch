@@ -14,6 +14,15 @@ How an event becomes an alert, how a close retires one, and why redelivery must 
 
 Rule quoted from the spec: **a `HARMLESS` or `CLOSE` always closes the others if they exist.**
 
+These are the *internal* severities. A producer does not send them: it sends the
+`EVT_Severity` scale (`CRITICAL`/`MAJOR`/`MINOR`/`WARNING`/`INDETERMINATE`/
+`INFORMATION`/`CLEAR`/`HARMLESS`) which the HTTP ingress maps down onto these five
+before the event ever enters the broker. In particular a producer's `CLEAR` becomes
+`CLOSE`, and `INFORMATION` becomes `HARMLESS` — see
+[event-schema.md](event-schema.md) §3. The producer's original value is preserved as
+`payload.EVT_Severity` but **nothing downstream reads it**; the fold only ever sees
+the mapped internal severity.
+
 Two consequences worth stating explicitly:
 
 - `HARMLESS` and `CLOSE` are *not* severities in the same sense as the others — they are **retirement events**. They never create alert state of their own.

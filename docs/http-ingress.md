@@ -10,6 +10,12 @@ It is a **producer**, not a consumer. It exists because you cannot make an exter
 
 Implemented in [services/http-ingress](../services/http-ingress/).
 
+The request body contract — the `EVT_*` fields, their required-ness, and how each
+severity maps onto the board — is specified separately in
+[event-schema.md](event-schema.md) and defined by
+[`schemas/event-ingest.schema.json`](../schemas/event-ingest.schema.json). This page
+covers what the ingress does with a request once it is valid.
+
 ## 1. Why a separate component and not a plugin
 
 | Alternative | Why not |
@@ -42,11 +48,16 @@ A `202` is only sent after `waitForConfirms()` resolves. Answering 202 before th
 
 ## 3. Accepted body shapes
 
-Three, because external producers vary:
+Four, because external producers vary. The canonical shape is the `EVT_*` contract
+specified in [event-schema.md](event-schema.md) and enforced from
+[`schemas/event-ingest.schema.json`](../schemas/event-ingest.schema.json):
 
 ```json
-{ "id": "abc", "source": "sensor-a", "type": "temp", "severity": "CRITICAL",
-  "ts": "2026-11-09T00:00:00Z", "payload": { "msg": "hot", "msgc": "detail" } }
+{ "EVT_Device": "core-sw-07", "EVT_EventKey": "net.link.down",
+  "EVT_Severity": "CRITICAL", "EVT_Summary": "uplink flapping",
+  "EVT_Details": "Gi0/24 lost carrier", "EVT_Agent": "Prometheus",
+  "EVT_AgentOwner": "AM-000042", "EVT_Identifier": "abc",
+  "EVT_Environment": "production", "EVT_URL": "https://…" }
 ```
 
 ```json
@@ -57,11 +68,29 @@ Three, because external producers vary:
 { "events": [ { ... }, { ... } ] }
 ```
 
+The legacy internal envelope is still accepted for the internal probe scripts:
+
+```json
+{ "id": "abc", "source": "sensor-a", "type": "temp", "severity": "CRITICAL",
+  "ts": "2026-11-09T00:00:00Z", "payload": { "msg": "hot", "msgc": "detail" } }
+```
+
 Batches are capped at `FW_MAX_BATCH` (default 500) and are **all-or-nothing**: one invalid event rejects the whole request with the failing index named, so a producer can fix it rather than guessing which of 500 failed.
 
-### 3.1 What gets filled in
+### 3.1 Which path a body takes
 
-A dumb shipper that only forwards text still works:
+Detection is by **any** key beginning with `EVT_`. That is deliberately not keyed on
+`EVT_EventKey`: keying it on one field meant a request missing exactly that field
+fell through to the lenient legacy path, which defaults everything and answers
+`202` for something that should have been refused `400`.
+
+| Body | Path | Validation |
+|---|---|---|
+| any `EVT_*` key present | upstream mapping | strict, schema-driven |
+| otherwise | legacy envelope | lenient defaults |
+
+The legacy path is lenient because a dumb shipper that only forwards text must
+still work:
 
 | Field | Missing behaviour | Why |
 |---|---|---|
@@ -72,7 +101,15 @@ A dumb shipper that only forwards text still works:
 | `ts` | now (ISO) | display only — ordering uses the broker timestamp ([event-lifecycle.md](event-lifecycle.md) §2) |
 | `payload` | `{}`, or built from bare `msg`/`msgc` | matches the two-field contract |
 
-Validation is **strict** on what it does receive: severity must be one of the five exact uppercase values, `payload` must be an object, and `id`/`source`/`type` have length limits. Rejecting is better than normalising a typo — a lowercase `critical` would otherwise create a second, invisible alert key.
+The `EVT_*` path has **no defaults for required fields** — `EVT_Device`,
+`EVT_EventKey`, `EVT_Severity`, `EVT_Summary`, `EVT_Agent` and `EVT_AgentOwner` are
+refused with `400` when absent or blank, because a mapping that invents a device
+name would put events on the board under the wrong alert key.
+
+Validation is **strict** on what it does receive: severity must be one of the exact
+uppercase values, `payload` must be an object, and string fields have length limits.
+Rejecting is better than normalising a typo — a lowercase `critical` would otherwise
+create a second, invisible alert key.
 
 ## 4. Exposure: NodePort, not a Route
 
@@ -154,7 +191,8 @@ location /events {
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -X POST "http://<node-ip>:30900/events" \
   -H "X-Ingest-Token: $TOKEN" -H 'content-type: application/json' \
-  -d '{"id":"t1","source":"probe","type":"test","severity":"CRITICAL","payload":{"msg":"hello"}}'
+  -d '{"EVT_Device":"probe","EVT_EventKey":"test","EVT_Severity":"CRITICAL",
+       "EVT_Summary":"hello","EVT_Agent":"curl","EVT_AgentOwner":"AM-1"}'
 # expect: 202
 
 # the event really is on the quorum queue
@@ -164,10 +202,17 @@ kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqctl list_queues name messages
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST "http://<node-ip>:30900/events" \
   -H 'content-type: application/json' -d '{}'          # expect: 401
 
-# an invalid severity is refused with the allowed list
+# a required field missing is refused, and named
 curl -sS -X POST "http://<node-ip>:30900/events" -H "X-Ingest-Token: $TOKEN" \
-  -d '{"severity":"critical"}' | jq .
-# expect: 400 + "severity must be one of FATAL, CRITICAL, WARNING, HARMLESS, CLOSE"
+  -H 'content-type: application/json' -d '{"EVT_Device":"probe"}' | jq -r .error
+# expect: 400 + "EVT_EventKey is required"
+
+# an unknown severity is refused with the allowed list from the schema
+curl -sS -X POST "http://<node-ip>:30900/events" -H "X-Ingest-Token: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"EVT_Device":"p","EVT_EventKey":"t","EVT_Severity":"critical",
+       "EVT_Summary":"s","EVT_Agent":"a","EVT_AgentOwner":"AM-1"}' | jq -r .error
+# expect: 400 + "EVT_Severity must be one of CLEAR, HARMLESS, …"
 
 # with the broker stopped, the ingress must answer 503, never 202
 kubectl -n fire-watch scale statefulset/rabbitmq --replicas=0

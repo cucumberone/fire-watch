@@ -7,33 +7,60 @@
  *
  * Accepted shapes:
  *
- *   1. one event in the upstream schema   { "EVT_Severity": ..., "EVT_EventKey": ... }
- *   2. an array of those                  [ {...}, {...} ]
- *   3. a wrapped batch                    { "events": [ {...}, {...} ] }
+ *   1. one event in the ingest schema   { "EVT_Severity": ..., "EVT_EventKey": ... }
+ *   2. an array of those                [ {...}, {...} ]
+ *   3. a wrapped batch                  { "events": [ {...}, {...} ] }
  *
- * The upstream field names are mapped here, once, at the boundary. Everything
- * downstream — the worker, the fold, the gateway, the UI — speaks the canonical
- * envelope (`id`/`source`/`type`/`severity`/`payload`), so a schema change is a
- * change to this file alone.
+ * The schema itself lives at schemas/event-ingest.schema.json and is documented in
+ * docs/event-schema.md. Validation and the mapping below are both driven by it, so
+ * the published contract and the implementation cannot drift: adding a required
+ * field to the JSON requires changing the mapping too, because the test suite
+ * asserts that every property in the schema is handled.
+ *
+ * Everything downstream — the worker, the fold, the gateway, the UI — speaks the
+ * canonical envelope (`id`/`source`/`type`/`severity`/`payload`), so a schema
+ * change is a change to this file plus the schema alone.
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+/** Repo-root `schemas/`, resolved from this file so cwd does not matter. */
+const SCHEMA_PATH = join(HERE, '..', '..', '..', 'schemas', 'event-ingest.schema.json');
+
+let cachedSchema = null;
 
 /**
- * Source severities, as the producer reports them.
+ * The ingest schema, read from disk once.
  *
- * These are NOT the severities the alert board uses. They are mapped onto an
- * internal scale by SEVERITY_MAP below, because "MINOR" and "MAJOR" say nothing
- * about whether an operator must act, while "this is resolved" does.
+ * Read rather than duplicated as a literal: a second copy in code is exactly how
+ * a published contract ends up describing something the code no longer does.
  */
-const SOURCE_SEVERITIES = new Set([
-  'CLEAR',
-  'HARMLESS',
-  'INFORMATION',
-  'INDETERMINATE',
-  'WARNING',
-  'MINOR',
-  'MAJOR',
-  'CRITICAL',
-]);
+export function ingestSchema() {
+  if (!cachedSchema) {
+    cachedSchema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
+  }
+  return cachedSchema;
+}
+
+/** Required ingest fields, straight from the schema. */
+export function requiredFields() {
+  return ingestSchema().required;
+}
+
+/** Every property name the schema defines. */
+export function schemaFields() {
+  return Object.keys(ingestSchema().properties);
+}
+
+/**
+ * Source severities, as the producer reports them — taken from the schema's
+ * `enum` so an added value cannot be accepted by one and rejected by the other.
+ */
+function sourceSeverities() {
+  return new Set(ingestSchema().properties.EVT_Severity.enum);
+}
 
 /**
  * Source severity -> internal severity.
@@ -43,9 +70,9 @@ const SOURCE_SEVERITIES = new Set([
  * operator triages differently at 3am.
  *
  * CLEAR and HARMLESS both RETIRE the alert, matching the fold's existing rule.
- * That is the important mapping here: the upstream schema has no "CLOSE", so
- * `CLEAR` is the resolution signal and must not be treated as just another
- * severity — otherwise a resolved alarm would stay on the board forever.
+ * That is the important mapping here: the ingest schema has no "CLOSE", so `CLEAR`
+ * is the resolution signal and must not be treated as just another severity —
+ * otherwise a resolved alarm would stay on the board forever.
  */
 const SEVERITY_MAP = {
   CRITICAL: 'CRITICAL',
@@ -64,6 +91,11 @@ const SEVERITIES = new Set(['FATAL', 'CRITICAL', 'WARNING', 'HARMLESS', 'CLOSE']
 const MAX_SOURCE_LEN = 256;
 const MAX_TYPE_LEN = 256;
 const MAX_ID_LEN = 128;
+// The details field is the expandable body, not a label. Without its own bound it
+// would inherit the 256 default, which rejects any producer that actually explains
+// what happened. The worker's gzip threshold is 512 bytes, so shorter values are
+// stored uncompressed but still worth accepting.
+const MAX_DETAILS_LEN = 8192;
 
 export class BadRequest extends Error {
   constructor(message, status = 400) {
@@ -113,30 +145,37 @@ function text(value, field, { required = false, max = 256 } = {}) {
  * upstream schema implies by calling it a key.
  */
 export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {}) {
-  const device = text(raw.EVT_Device, 'EVT_Device', { required: true, max: MAX_SOURCE_LEN });
-  const eventKey = text(raw.EVT_EventKey, 'EVT_EventKey', { required: true, max: MAX_TYPE_LEN });
-  const agent = text(raw.EVT_Agent, 'EVT_Agent', { required: true, max: MAX_SOURCE_LEN });
-  const agentOwner = text(raw.EVT_AgentOwner, 'EVT_AgentOwner', { required: true, max: MAX_SOURCE_LEN });
-  const summary = text(raw.EVT_Summary, 'EVT_Summary', { required: true });
+  // Required fields come from the schema, not from this function. Adding one
+  // there is enough to start rejecting requests that omit it — and the test suite
+  // fails if it is not also mapped below, so the two cannot drift apart.
+  const required = new Set(requiredFields());
+  const req = (name, max) => text(raw[name], name, { required: required.has(name), max });
+  const opt = (name, max) => text(raw[name], name, { required: false, max });
 
-  const rawSeverity = text(raw.EVT_Severity, 'EVT_Severity', { required: true });
+  const device = req('EVT_Device', MAX_SOURCE_LEN);
+  const eventKey = req('EVT_EventKey', MAX_TYPE_LEN);
+  const agent = req('EVT_Agent', MAX_SOURCE_LEN);
+  const agentOwner = req('EVT_AgentOwner', MAX_SOURCE_LEN);
+  const summary = req('EVT_Summary');
+
+  const rawSeverity = req('EVT_Severity');
   const severity = SEVERITY_MAP[rawSeverity];
   if (!severity) {
     throw new BadRequest(
-      `EVT_Severity must be one of ${[...SOURCE_SEVERITIES].join(', ')} (got ${JSON.stringify(rawSeverity)})`,
+      `EVT_Severity must be one of ${[...sourceSeverities()].join(', ')} (got ${JSON.stringify(rawSeverity)})`,
     );
   }
 
   // `EVT_Identifier` is optional. When present it is the message identity; when
   // blank a random one is generated, because the duplicate gate needs an id.
-  const givenId = text(raw.EVT_Identifier, 'EVT_Identifier', { max: MAX_ID_LEN });
+  const givenId = opt('EVT_Identifier', MAX_ID_LEN);
   const id = givenId || randomId(now);
 
   // The summary is the row's display text; the details are the expandable body.
   // Keeping them as msg/msgc means the existing compression and UI work unchanged.
   const payload = {
     msg: summary,
-    msgc: text(raw.EVT_Details, 'EVT_Details'),
+    msgc: opt('EVT_Details', MAX_DETAILS_LEN),
     // Everything else is carried through untouched, so the inspector can show it
     // without this file needing to know what each field means.
     EVT_Agent: agent,
@@ -144,9 +183,9 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
     EVT_EventKey: eventKey,
     EVT_Device: device,
   };
-  const environment = text(raw.EVT_Environment, 'EVT_Environment');
+  const environment = opt('EVT_Environment');
   if (environment) payload.EVT_Environment = environment;
-  const url = text(raw.EVT_URL, 'EVT_URL');
+  const url = opt('EVT_URL');
   if (url) payload.EVT_URL = url;
   // The producer's original severity is kept for display: the operator may want
   // to know it was MINOR rather than the WARNING it maps to.
@@ -154,7 +193,7 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
 
   return {
     id,
-    // The alert key is device + event key: the two things the upstream schema
+    // The alert key is device + event key: the two things the ingest schema
     // guarantees identify an alarm. Using the agent would split one device's
     // alarm across every tool that reports it.
     source: device,

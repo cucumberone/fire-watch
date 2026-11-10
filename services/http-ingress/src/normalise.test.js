@@ -10,6 +10,9 @@ import {
   normaliseBatch,
   messageProperties,
   BadRequest,
+  ingestSchema,
+  requiredFields,
+  schemaFields,
 } from './normalise.js';
 
 const opts = { maxBatch: 10, now: 1762699200000, randomId: () => 'gen-id' };
@@ -242,4 +245,67 @@ test('a batch of upstream events is normalised together', () => {
   const batch = normaliseBatch([upstream(), upstream({ EVT_EventKey: 'other' })], opts);
   assert.equal(batch.length, 2);
   assert.equal(batch[1].type, 'other');
+});
+
+// -------------------------------------------- schema file is the source of truth
+// These tests exist so the PUBLISHED contract and the implementation cannot drift.
+// The schema is read from disk, so editing schemas/event-ingest.schema.json
+// without updating the mapping breaks the build rather than production.
+test('the schema file is loadable and well-formed', () => {
+  const s = ingestSchema();
+  assert.equal(s.type, 'object');
+  assert.ok(Array.isArray(s.required), 'required is an array');
+  assert.ok(s.properties && typeof s.properties === 'object');
+});
+
+test('every property in the schema is handled by the mapping', () => {
+  // A field added to the schema but not consumed here would be silently dropped,
+  // which is the exact failure this test is meant to prevent.
+  const handled = new Set([
+    'EVT_Device',
+    'EVT_EventKey',
+    'EVT_Identifier',
+    'EVT_Severity',
+    'EVT_Summary',
+    'EVT_Details',
+    'EVT_Agent',
+    'EVT_AgentOwner',
+    'EVT_Environment',
+    'EVT_URL',
+  ]);
+  const declared = schemaFields();
+  const missing = declared.filter((f) => !handled.has(f));
+  assert.deepEqual(missing, [], `schema fields with no mapping: ${missing.join(', ')}`);
+  const extra = [...handled].filter((f) => !declared.includes(f));
+  assert.deepEqual(extra, [], `mapping handles fields the schema does not declare: ${extra.join(', ')}`);
+});
+
+test('every required field in the schema is rejected when missing', () => {
+  for (const field of requiredFields()) {
+    const raw = upstream();
+    delete raw[field];
+    assert.throws(() => normaliseEvent(raw, opts), BadRequest, `${field} must be required`);
+  }
+});
+
+test('every schema-declared severity is accepted and mapped', () => {
+  const declared = ingestSchema().properties.EVT_Severity.enum;
+  assert.ok(declared.length > 0, 'the schema declares severities');
+  for (const sev of declared) {
+    const e = normaliseEvent(upstream({ EVT_Severity: sev }), opts);
+    assert.ok(e.severity, `${sev} maps to an internal severity`);
+  }
+});
+
+test('EVT_Details accepts a realistic detail body, not just a label', () => {
+  const long = 'x'.repeat(4000);
+  const e = normaliseEvent(upstream({ EVT_Details: long }), opts);
+  assert.equal(e.payload.msgc.length, 4000);
+});
+
+test('EVT_Details above its bound is refused rather than truncated', () => {
+  assert.throws(
+    () => normaliseEvent(upstream({ EVT_Details: 'x'.repeat(9000) }), opts),
+    BadRequest,
+  );
 });

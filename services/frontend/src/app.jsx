@@ -32,6 +32,17 @@ const MSG_MAX_BYTES = 1048576;
 // little later" instead of erroring (docs/acknowledge.md §5).
 const MAX_ACK_KEYS = 200;
 
+/**
+ * How many frames a bulk action may send per second.
+ *
+ * The gateway rejects a connection sending more than `FW_MAX_FRAMES_PER_SEC`
+ * (default 10) inbound frames in a rolling second, and the limiter counts
+ * EVERY frame on the socket — including the ack-state refresh and heartbeat.
+ * Staying at 8 leaves headroom so a bulk action cannot starve them and trigger
+ * `rate_limited: too many frames`.
+ */
+const FRAME_BUDGET_PER_SEC = 8;
+
 // Column labels, defined once so the header, the colgroup and the resize state
 // cannot drift out of order. Order is documented in docs/frontend.md §4.3.
 const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
@@ -494,13 +505,21 @@ function useSocket(config) {
   /**
    * Bulk ack/close.
    *
-   * One frame per key rather than a batched op, deliberately: a batch op would
-   * need its own partial-failure semantics ("3 of 5 closed, 1 already gone, 1
-   * expired") and the gateway's per-key writes are already cheap. The client
-   * gets individual `op: alert` confirmations and the map settles per key.
+   * Frames are PACED, not fired in a loop. The gateway rate-limits inbound
+   * frames per connection (`FW_MAX_FRAMES_PER_SEC`, default 10), and one frame
+   * per key in a tight loop blows straight through it: selecting 200 alerts and
+   * closing them emitted 201 frames in a single tick and the client got back
    *
-   * Guarded so a mixed selection does not stall on one already-acked alert:
-   * only keys that still need the action are sent.
+   *   rate_limited: too many frames
+   *
+   * Pacing to just under the limit keeps every frame inside the budget. It also
+   * matches how the writes already behave — each one is an independent Lua
+   * script, so there is nothing to gain from queueing 200 of them at once, and
+   * a steady drip lets the confirmations update rows as they land instead of all
+   * at the end.
+   *
+   * `FRAME_BUDGET_PER_SEC` is deliberately below the server's 10: the ack-state
+   * refresh and heartbeat also send frames, and the limiter counts all of them.
    */
   const bulk = useCallback((op, keys) => {
     const ws = wsRef.current;
@@ -508,7 +527,24 @@ function useSocket(config) {
       setNotice(`not connected — ${op} not sent`);
       return 0;
     }
-    for (const key of keys) ws.send(JSON.stringify({ op, key }));
+    if (keys.length <= FRAME_BUDGET_PER_SEC) {
+      for (const key of keys) ws.send(JSON.stringify({ op, key }));
+      return keys.length;
+    }
+
+    // More than one second's budget: drip them out.
+    let i = 0;
+    const pump = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        clearInterval(pump);
+        setNotice(`connection lost — ${keys.length - i} ${op} frame(s) not sent`);
+        return;
+      }
+      const slice = keys.slice(i, i + FRAME_BUDGET_PER_SEC);
+      for (const key of slice) ws.send(JSON.stringify({ op, key }));
+      i += slice.length;
+      if (i >= keys.length) clearInterval(pump);
+    }, 1000);
     return keys.length;
   }, []);
 

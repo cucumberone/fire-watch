@@ -41,7 +41,13 @@ export function loadConfig() {
 
     // per-connection guardrails (websocket-server.md §4)
     maxSubscriptions: int('FW_MAX_SUBSCRIPTIONS', 20),
-    maxFramesPerSec: int('FW_MAX_FRAMES_PER_SEC', 10),
+    // Inbound frames per rolling second. This is a guard against a runaway
+    // client, not against an operator: a bulk ack/close of 200 selected alerts
+    // is a legitimate burst, and at the original default of 10 it was rejected
+    // with `rate_limited: too many frames`. The client also paces its bulk
+    // frames (FRAME_BUDGET_PER_SEC), so this is the backstop rather than the
+    // mechanism.
+    maxFramesPerSec: int('FW_MAX_FRAMES_PER_SEC', 50),
     maxOutboundQueue: int('FW_MAX_OUTBOUND_QUEUE', 1000),
     idleTimeoutMs: int('FW_IDLE_TIMEOUT_MS', 300000),
     heartbeatMs: int('FW_HEARTBEAT_MS', 20000),

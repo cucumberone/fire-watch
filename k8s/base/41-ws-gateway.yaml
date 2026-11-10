@@ -63,6 +63,10 @@ spec:
             - { name: FW_ALERT_SNAPSHOT_MAX, value: "2000" }
             - { name: FW_MAX_CONNS,       value: "5000" }
             - { name: FW_MSG_MAX_BYTES,   value: "1048576" }
+            # Backstop against a runaway client, not a throttle on operators:
+            # bulk ack/close is paced client-side to 8/s, and 50 here leaves room
+            # for the ack-state refresh and heartbeat alongside it.
+            - { name: FW_MAX_FRAMES_PER_SEC, value: "50" }
           resources:
             requests: { cpu: 200m, memory: 256Mi }
             limits:   { cpu: "1",  memory: 768Mi }

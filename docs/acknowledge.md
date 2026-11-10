@@ -257,23 +257,36 @@ not a styled dialog, because a destructive action must not be dismissible by an
 accidental outside click and must not look like the menu item above it. The menu
 item itself is styled red (`inspector-danger`) for the same reason.
 
-`op: delete` appears on **alert rows** and on **event rows**, and they mean different
-things — which is why both menus carry both verbs:
+`op: delete` appears **only on event rows** (All events). Not on Open alerts.
 
 | Row | Close | Delete |
 |---|---|---|
-| Open alerts (an alert) | retire the alert | remove the event RECORD the row is showing |
+| Open alerts (an alert) | retire the alert | **not offered** |
 | All events (a stored event) | retire the alert this event belongs to | remove this event record |
 
-An alert row shows `a.event.id` — the newest record behind it — so deleting from there
-removes that one record and leaves the alert. "Remove the alert" is Close, and the two
-are different verbs rather than one ambiguous one.
+**Why an alert row has no Delete.** It was offered there for a while, scoped to
+`a.event.id` — the newest record behind the row. It worked, and it was still wrong:
 
-Both items resolve their targets **before** deciding whether they are enabled, and the
-label reports the resolved count (`Delete 3 events`, `Close 2 alerts`). The earlier
-version was gated on `a.event?.id && targets.length === 1`, so with a multi-row
-selection it stayed ENABLED while every id failed to resolve — a clickable item that
-silently did nothing. That is the "right-click Delete does not work" report.
+```
+before: All events 219
+Delete event  ->  deleted live-106
+after:  All events 218
+on screen: the alert row, its Count, its Summary — all unchanged
+```
+
+An alert with Count 113 has 113 records behind it. Removing one changes a list the
+operator is not looking at, leaves the row and its count intact, and the fold owns the
+count so it cannot even decrement. An action whose effect is invisible and whose scope
+is surprising is worse than an action that is not offered.
+
+The verbs are therefore split by what the row *is*: an alert is retired (**Close**) and
+a record is removed (**Delete**), and each verb lives on the row type it acts on.
+
+For a multi-row selection of events, Delete's label reports the resolved count
+(`Delete 3 events`). The earlier version was gated on `a.event?.id && targets.length
+=== 1`, so with 2+ rows selected it stayed ENABLED while every id failed to resolve —
+a clickable item that silently did nothing. That is the "right-click Delete does not
+work" report.
 
 Close from an event row is offered because the operator is looking at an arrival and
 may be concluding the incident from it; forcing a tab switch to Open alerts to act on

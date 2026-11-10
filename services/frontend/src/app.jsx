@@ -2435,12 +2435,6 @@ function App() {
                   ? selectedAlertKeys
                   : [a.key];
                 const ackTargets = targets.filter((k) => !acks.has(k));
-                // The event RECORD behind each target, resolved once so the menu can
-                // state how many deletes it is about to do instead of saying "Delete"
-                // and leaving the operator to guess.
-                const eventIds = targets
-                  .map((k) => alerts.get(k)?.event?.id)
-                  .filter(Boolean);
                 return (
                   <AlertRow
                     key={a.key}
@@ -2469,32 +2463,22 @@ function App() {
                           title: 'Retire these alerts. Same end state as a CLOSE event from the source',
                           run: () => bulk('close', targets),
                         },
-                        {
-                          // Delete from an ALERT row removes the event RECORD the row is
-                          // showing (`a.event.id`), not the alert. An alert is an aggregate
-                          // over many events, and "remove the alert" is Close — so the two
-                          // are different verbs and both belong here.
-                          //
-                          // Offered only when the row HAS a record attached. An alert loaded
-                          // from a snapshot may have none (its record expired), and a delete
-                          // that cannot resolve an id would be an item that always errors.
-                          // For a multi-row selection only the rows that resolved contribute,
-                          // and the label says how many that is — the old version was gated on
-                          // `targets.length === 1`, so with 2+ rows selected it stayed ENABLED
-                          // while every id failed to resolve, and clicking did nothing. That
-                          // was the "Delete does not work" report.
-                          label: eventIds.length > 1
-                            ? `Delete ${eventIds.length} events`
-                            : 'Delete event',
-                          disabled: eventIds.length === 0,
-                          title: eventIds.length > 1
-                            ? 'Permanently delete the event record behind each selected alert. Cannot be undone.'
-                            : (eventIds.length === 1
-                              ? `Permanently delete event ${eventIds[0]}. Cannot be undone.`
-                              : 'No event record is attached to the selected alert(s)'),
-                          run: () => { for (const id of eventIds) deleteEvent(id); },
-                          danger: true,
-                        },
+                        // NO Delete on an alert row.
+                        //
+                        // It "worked" — the record went — but nothing visible changed: the
+                        // alert stayed, its Count stayed, and one record disappeared from a
+                        // list the operator was not looking at. An alert with Count 113 has
+                        // 113 records, all identical, and deleting one of them is not an
+                        // action anyone means by "delete".
+                        //
+                        // The verb that removes an incident is Close, and the verb that
+                        // removes a RECORD lives on All events, where a row IS one record.
+                        // Keeping Delete here offered an action whose effect was invisible
+                        // and whose scope was surprising — worse than not offering it.
+                        //
+                        // (History: it was removed once for this reason, briefly restored,
+                        // and is now removed again with the evidence: All events 219 -> 218
+                        // and no other change on screen.)
                       ],
                       // The journal belongs to the INCIDENT, so a multi-row selection
                       // gets no journal: one panel cannot annotate several alerts at

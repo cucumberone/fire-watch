@@ -725,7 +725,17 @@ function useSocket(config) {
       // event would reappear only on the next query. Merging by id keeps the reply
       // authoritative for everything it covers while not throwing away what it
       // could not have known about.
-      const rows = (Array.isArray(frame.events) ? frame.events : []).map((e) => toViewEvent(e));
+      const rows = await Promise.all(
+        (Array.isArray(frame.events) ? frame.events : []).map(async (e) => {
+          // Payloads are decoded here for the same reason the live path decodes
+          // them: `msgc` arrives gzipped base64 whenever a producer sends
+          // `EVT_Details`, and `toViewEvent` is synchronous so it cannot decode.
+          // Skipping this on the QUERY paths is what made the details fold render
+          // "[object Object]" on this tab while the live tab was fine.
+          const payload = await decodePayload(e?.payload, gunzip, MSG_MAX_BYTES);
+          return toViewEvent({ ...e, payload });
+        }),
+      );
       const newest = rows.reduce((m, e) => Math.max(m, e.brokerTs ?? 0), 0);
       setAllEvents((prev) => {
         const inFlight = prev.events.filter((e) => (e.brokerTs ?? 0) > newest);
@@ -749,12 +759,17 @@ function useSocket(config) {
       // merging: it is a windowed query, so a row it omits is outside the window,
       // not missing from this response.
       const rows = Array.isArray(frame.alerts) ? frame.alerts : [];
+      // Decode before mapping, same as the live and allEvents paths: a closed row's
+      // `event` is a stored record, so `msgc` can be compressed there too.
       const next = [];
       for (const row of rows) {
         if (!row || typeof row.key !== 'string') continue;
+        const payload = row.event
+          ? await decodePayload(row.event.payload, gunzip, MSG_MAX_BYTES)
+          : undefined;
         next.push({
           ...row,
-          event: row.event ? toViewEvent(row.event) : undefined,
+          event: row.event ? toViewEvent({ ...row.event, payload }) : undefined,
         });
       }
       setClosedState({
@@ -1747,16 +1762,25 @@ function EventRow({ evt, onContextMenu }) {
   const [open, setOpen] = useState(false);
 
   /**
-   * What the fold reveals.
+   * What the fold reveals: the producer's own long-form text, and nothing else.
    *
-   * `msgc` when the producer sent one, otherwise the whole record — which is
-   * always worth expanding, because the row shows a clipped summary and a few
-   * enriched columns while the inspector shows everything. Previously the fold
-   * was gated on `msgc`, so an event without that optional field had no fold at
-   * all and the row appeared inert.
+   * `msgc` is the "complete string" — `EVT_Details` on the wire, mapped in the
+   * ingress. When a producer sends one there is genuinely more to read than the
+   * clipped summary column shows, and the fold is useful.
+   *
+   * There used to be a fallback here: `|| JSON.stringify(evt.wire, null, 2)`. It
+   * was added because gating on `msgc` alone made rows look inert, which was a
+   * real complaint — but the fallback was the wrong answer to it, for two
+   * reasons. `toViewEvent` ALWAYS sets `wire`, so the fallback was always truthy
+   * and every row in every table grew a "details" link (measured: 211 of 211).
+   * And what it revealed was not detail, it was a raw debug dump of the record —
+   * which the right-click menu's Information submenu already renders as a proper
+   * field table. Two ways to see the same thing, one of them unreadable.
+   *
+   * So the link now means what it says: there is more TEXT than the column shows.
+   * A row with no `EVT_Details` has no more to say, and shows nothing.
    */
-  const detailText = msgCompleteString
-    || (evt.wire ? JSON.stringify(evt.wire, null, 2) : '');
+  const detailText = msgCompleteString;
   const retirement = isRetirement(evt.severity);
   const rowClass = severityRowClass(evt.severity, retirement ? 'retirement' : '');
   return (
@@ -1768,13 +1792,13 @@ function EventRow({ evt, onContextMenu }) {
         <td className="summary">
           {summary || <span className="dim">—</span>}
           {/*
-            The toggle is gated on there being something to reveal, not on the
-            `msgc` field existing.
-
-            `msgc` is optional: it is the "complete string" a producer may send,
-            and the ones we have do not send it at all, so gating on it meant the
-            fold never appeared for real events — while the dev harness, whose
-            mock always includes msgc, looked fine. Gate on content.
+            Gated on there being TEXT to reveal. The comment that used to sit here
+            said "not on the msgc field existing" — because gating on msgc alone
+            once meant the fold never appeared for real events, while the dev
+            harness (whose mock always includes msgc) looked fine. The fix for that
+            was not to invent detail, though; it is that the mock must stop
+            fabricating a field production never sends. A row with no EVT_Details
+            now has no link, which is honest.
           */}
           {detailText ? (
             <button

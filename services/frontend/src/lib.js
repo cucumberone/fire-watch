@@ -142,6 +142,22 @@ function asText(value) {
   return String(value);
 }
 
+/**
+ * Display text for a payload field that may still be in the COMPRESSED wire form.
+ *
+ * The compressed form is an object (`{__gz: "<base64>"}`), and `String({})` is
+ * `"[object Object]"` — which is what the All events sheet used to show after a
+ * producer sent `EVT_Details`. A compressed field has no meaningful text until it
+ * is decoded, so it renders as nothing and the row hides its detail link rather
+ * than offering a fold that reveals garbage. `decodePayload` is what actually
+ * decodes; this is the guard for every path that did not run it.
+ */
+function asPayloadText(value) {
+  if (isCompressedField(value)) return '';
+  if (value !== null && typeof value === 'object') return '';
+  return asText(value);
+}
+
 /** Parse a timestamp into epoch ms, falling back when it is unusable. */
 function asTime(value, fallback) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -177,9 +193,14 @@ export function toViewEvent(evt) {
     // event, or every field would appear twice: once as `payload.CIF` and once
     // as the derived `cif`.
     wire: evt,
-    summary: asText(firstPresent(payload, [WIRE_FIELD.summary])),
-    // Only a non-empty complete string is worth a disclosure toggle.
-    msgCompleteString: asText(firstPresent(payload, [WIRE_FIELD.msgCompleteString])),
+    summary: asPayloadText(firstPresent(payload, [WIRE_FIELD.summary])),
+    // Only a non-empty complete string is worth a disclosure toggle. This is the
+    // field that arrives COMPRESSED (`{__gz:…}`) whenever a producer sends a long
+    // `EVT_Details`, so it must go through the guard too — otherwise the fold
+    // renders the string "[object Object]", which is what the All events sheet
+    // showed. Decoding happens in `decodePayload` on the paths that can await;
+    // where it did not run, this yields '' and the row simply has no fold.
+    msgCompleteString: asPayloadText(firstPresent(payload, [WIRE_FIELD.msgCompleteString])),
     firstOccurrence: asTime(
       firstPresent(payload, ['FirstOccurrence', 'firstOccurrence', 'first_occurrence']),
       fallbackTs,

@@ -154,6 +154,26 @@ The rename is a single pure function, `toViewEvent()` in `src/lib.js`, applied o
 - the original fields are preserved on the view event, so any caller still reading `evt.payload.msg` keeps working
 - a missing payload yields `''`, never `undefined`, so a row can never render the literal text "undefined"
 
+**The details fold reveals `msgc` and nothing else.** Two bugs lived here, and both were
+visible as "there is a details link on every row":
+
+1. The fold fell back to `JSON.stringify(evt.wire, null, 2)`. `toViewEvent` always sets
+   `wire`, so the fallback was always truthy — measured **211 of 211** rows had a link —
+   and what it opened was a raw debug dump of the record. The right-click menu's
+   Information submenu already renders the same fields as a table, so the fallback was
+   a second, unreadable way to see them. The link now appears only when the producer
+   sent long-form text.
+2. `toViewEvent` maps a compressed field with `asText`, and `String({__gz:…})` is
+   `"[object Object]"`. The live path passes payloads through `decodePayload` first;
+   the **query** paths (`allEvents`, `closed`) did not, so `msgc` reached the mapper
+   still compressed and the fold rendered that string. Those paths now decode too, and
+   `asPayloadText` yields `''` for anything that is not already text, so a missed
+   decode hides the fold instead of showing garbage.
+
+The general rule: **any path that maps a stored record must decode it first.** There
+are three of them and they must stay in step — live frames, `op: allEvents`, and
+`op: closed`.
+
 ### 4.2 Occurrence fields and worker enrichment
 
 The UI shows four fields that the workers add to `payload` before the event reaches Dragonfly. All are optional — an unenriched event must still render.

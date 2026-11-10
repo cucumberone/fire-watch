@@ -313,6 +313,25 @@ test('toViewEvent yields empty strings, never undefined', () => {
   }
 });
 
+test('toViewEvent never stringifies a compressed field into "[object Object]"', () => {
+  // A compressed field is `{__gz: "<base64>"}`. `String({})` is "[object Object]",
+  // and that is literally what the All events details fold rendered: the QUERY
+  // paths mapped events with `toViewEvent` and skipped `decodePayload`, so `msgc`
+  // reached this function still compressed. A field with no text yet must yield
+  // '' so the row hides its disclosure rather than offering garbage — and a plain
+  // object where a string was expected must do the same.
+  const gz = { __gz: 'H4sIAAAAAAAAA0tMSgYAAAD//wMA' };
+  const view = toViewEvent({ payload: { msg: 'summary ok', msgc: gz } });
+  assert.equal(view.msgCompleteString, '');
+  assert.equal(view.summary, 'summary ok', 'an uncompressed sibling still renders');
+
+  // A compressed SUMMARY likewise must not render as an object.
+  assert.equal(toViewEvent({ payload: { msg: gz } }).summary, '');
+
+  // Any other stray object, e.g. a producer that sent a nested structure.
+  assert.equal(toViewEvent({ payload: { msgc: { a: 1 } } }).msgCompleteString, '');
+});
+
 test('toViewEvent keeps the untouched wire record for the inspector', () => {
   // Without this the right-click panel would list every field twice: once as
   // `payload.CIF` and once as the derived `cif`.

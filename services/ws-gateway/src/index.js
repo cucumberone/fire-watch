@@ -550,6 +550,17 @@ function handleAlertMessage(raw) {
     return;
   }
 
+  // A CONTENT duplicate: the original record absorbed a repeat, so its count and
+  // last_seen moved but no new event exists. Fan out the rollup only — there is no
+  // event to show in the tail, which is the point (the copy was discarded).
+  if (parsed.kind === 'occurrence') {
+    const frame = alertFrame(parsed.key, parsed.applied);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
   const frame = alertFrame(parsed.key, parsed.applied);
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);

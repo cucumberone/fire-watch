@@ -7,29 +7,22 @@
  *   node scripts/send-same-event.mjs --count 5     # send it 5 times in one batch
  *   node scripts/send-same-event.mjs --reset       # clear its state, then send
  *
- * Why this exists: it is the only way to exercise the duplicate path end to end.
- * The event's `id` is FIXED, so every run after the first is a duplicate from the
- * system's point of view and must be dropped by the worker's `SET … NX` gate
- * (docs/event-lifecycle.md §5.4):
+ * Why this exists: it exercises BOTH kinds of duplicate, which are now handled
+ * differently (docs/event-lifecycle.md §5.5):
  *
- *   run 1  -> applied=1, count goes up, Last occurrence moves
- *   run 2+ -> dropped, count and Last occurrence unchanged, absent from the tail
+ *   1. TRANSPORT duplicate — the same message id delivered twice. Dropped
+ *      entirely: no count, no Last occurrence change.
+ *   2. CONTENT duplicate — the same condition reported again under a fresh id.
+ *      The ORIGINAL record absorbs it: count increments and Last occurrence
+ *      moves, and the new copy is never stored.
  *
- * That is the point of the script, but it also explains the confusing part: after
- * the first run the alert is ALREADY on the board, so re-running changes nothing
- * and nothing new appears. And if the alert was retired (by a source CLOSE or by
- * an operator Close), a duplicate cannot revive it — the re-fire path needs a new
- * event id. `--reset` exists so a run can demonstrate the open path again.
+ * So on this script:
  *
- * Two details matter:
+ *   run 1  -> one record stored, count 1
+ *   run 2+ -> count increments, Last occurrence moves, still ONE record stored
  *
- * - The id is a constant, not derived from the clock. A timestamped id would make
- *   every run a NEW event, so nothing would ever be deduplicated and the script
- *   would prove nothing.
- * - `ts` IS stamped at execution time, so the row shows when you ran the script.
- *   That is safe because dedup keys on the event id; the fold orders on the broker
- *   timestamp, which the ingress sets on arrival anyway, so a changing `ts` cannot
- *   affect dedup — it only makes the stored record reflect the real run time.
+ * That is the requested behaviour. `--new-id` is retained only to demonstrate
+ * that a fresh id changes nothing now: dedup is on content, not identity.
  *
  * Endpoint discovery and the token are the same as the other scripts here: read
  * `.env`, then ask kubectl for a node address, because http-ingress is a NodePort
@@ -170,8 +163,11 @@ const body = COUNT === 1 ? thisRun : Array.from({ length: COUNT }, () => thisRun
  *
  * All four keys matter:
  *
- *   fw:evt:{id}            the duplicate gate — while this exists, every run is
- *                          dropped by SET ... NX and nothing new can be created
+ *   fw:evt:{id}            the stored record (and the transport-dedup gate)
+ *   fw:fp:{fingerprint}    the CONTENT-dedup gate — while this exists, a re-run
+ *                          is absorbed by the original record instead of being
+ *                          stored (this is the key that must be cleared to make
+ *                          a re-run create a fresh record)
  *   fw:alert:{key}         the alert record, including state=closed
  *   fw:alert:open:{key}    the "is it firing" flag
  *   fw:idx:alert:open      the snapshot index — leaving a member here means a
@@ -189,9 +185,23 @@ if (RESET) {
   }
   const ns = env.NAMESPACE || 'fire-watch-lab';
   const key = `${EVENT.source}:${EVENT.type}`;
+  // The fingerprint has to be computed exactly as the worker computes it, or this
+  // deletes a key that does not exist and the re-run is still absorbed. Import the
+  // real function rather than re-deriving the hash here.
+  const { contentFingerprint } = await import('../services/worker/src/event.js');
+  const fp = contentFingerprint({
+    source: EVENT.source,
+    type: EVENT.type,
+    severity: EVENT.severity,
+    payload: EVENT.payload,
+  });
   const script = [
     `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw del`,
     `fw:evt:${EVENT.id}`,
+    // The content-dedup gate. Without this, a re-run is absorbed by the original
+    // record instead of creating a new one, which is correct behaviour but not
+    // what --reset is being asked for.
+    `fw:fp:${fp}`,
     `fw:alert:${key}`,
     `fw:alert:open:${key}`,
     `> /dev/null;`,
@@ -237,6 +247,6 @@ if (NEW_ID) {
   console.log(
     COUNT > 1
       ? `${COUNT} copies of the SAME id: the first is stored, the rest are dropped.`
-      : 'Same id: the first run creates the alert, every later run is dropped as a duplicate.',
+      : 'Same content: the original record absorbs this run — count increments and Last occurrence moves, and no second record is stored.',
   );
 }

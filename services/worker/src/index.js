@@ -111,24 +111,49 @@ async function handleMessage(msg) {
     });
 
     // ---- write + fold. Throws on transient failure -> requeue.
-    const { applied, duplicate } = await persistEvent({
+    const { applied, duplicate, contentDuplicate } = await persistEvent({
       dfl, evt, storedPayload, brokerTs, cfg, fold, log,
     });
     lastWriteOk = true;
 
-    // ---- duplicate: dropped, and deliberately silent.
+    // ---- transport duplicate: the same MESSAGE delivered again.
     //
-    // The event record already existed for this id, so this is the same event
-    // being delivered again (a redelivery, or a producer re-sending an id it
-    // already used). Nothing downstream may see it: no fold, so no count and no
-    // Last occurrence change; no audit copy, because the first delivery already
-    // produced one; no live frame, so the tail does not show the same event
-    // twice.
+    // Nothing downstream may see it: no fold, so no count and no Last occurrence
+    // change; no audit copy, because the first delivery already produced one; no
+    // live frame, so the tail does not show the same event twice.
     //
     // Still ACKED. Requeueing would loop forever on a message that can never
     // succeed.
     if (duplicate) {
       log.debug('duplicate event id, dropped', { id: evt.id });
+      return 'ack';
+    }
+
+    // ---- content duplicate: the same CONDITION, reported again.
+    //
+    // This is NOT silent. The original record absorbed it — the fold already
+    // incremented its count and moved its last_seen — so clients must be told, or
+    // the board would keep showing the old count until someone reloaded.
+    //
+    // The new event itself is discarded: no record, no index member, no audit
+    // copy. The frame below carries the ORIGINAL record's id so the frontend
+    // updates the existing row rather than inserting a second one; `applied`
+    // tells it this is an occurrence, not a stale frame.
+    if (contentDuplicate) {
+      log.debug('content duplicate absorbed, copy discarded', { id: evt.id });
+      try {
+        await dfl.publish(
+          keys.channelAlerts,
+          JSON.stringify({
+            kind: 'occurrence',
+            key: `${evt.source}:${evt.type}`,
+            applied,
+          }),
+        );
+      } catch (err) {
+        // The rollup is already durable; the next snapshot carries it.
+        log.warn('occurrence fan-out failed (rollup already durable)', { id: evt.id, err: String(err) });
+      }
       return 'ack';
     }
 

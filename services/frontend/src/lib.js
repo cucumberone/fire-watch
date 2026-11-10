@@ -338,6 +338,12 @@ export function applyAlert(map, { key, applied, event }) {
     // 2 is accepted as an alias for 1 so a gateway still running the previous
     // build (which emitted 2 for a coalesced repeat) cannot freeze a row during
     // a rolling update. Both now mean the same thing: the event was applied.
+    //
+    // A CONTENT duplicate arrives on this same path with NO event attached: the
+    // copy was discarded by the worker, so only the rollup exists. `lastSeen`
+    // then falls back to `Date.now()`, which is correct — the fold recorded the
+    // arrival at roughly now, and the alternative (keeping the old value) would
+    // make Last occurrence appear frozen, which is the bug this replaced.
     const prev = next.get(key);
     next.set(key, {
       key,

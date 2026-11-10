@@ -9,7 +9,7 @@
  * on the same alert key (docs/event-lifecycle.md §5.2).
  */
 import { readFileSync, statSync } from 'node:fs';
-import { isGzip } from './event.js';
+import { isGzip, contentFingerprint } from './event.js';
 import { keys, alertKey } from './config.js';
 
 /** Read the fold script. Reloaded periodically so a ConfigMap edit lands. */
@@ -52,9 +52,25 @@ export class FoldScript {
 }
 
 /**
- * Write one event. Returns the fold verdict so the caller can publish it.
+ * Write one event.
  *
- * `evt` is the validated envelope; `storedPayload` is the compressed payload.
+ * Two different things are called "duplicate" in this system and they are handled
+ * in opposite ways, so they are worth separating explicitly:
+ *
+ *   1. TRANSPORT duplicate — the same MESSAGE delivered twice (a RabbitMQ
+ *      redelivery). Same event id. This must be idempotent: nothing changes.
+ *
+ *   2. CONTENT duplicate — the same CONDITION reported again, arriving as a new
+ *      message with a new id. Per AGENTS.md this must NOT create a second record.
+ *      The original record absorbs it: `count` is incremented and `last_seen` is
+ *      moved. The new copy is never stored.
+ *
+ * The previous implementation only handled (1), keyed on `SET … NX id`. That made
+ * a re-reporting producer inflate the board with one row per delivery.
+ *
+ * Order below is deliberate. The content claim happens BEFORE the record write, so
+ * a content duplicate is rejected before it can touch the event record, the index
+ * or the fold's counters. The transport check stays on the record write itself.
  */
 export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fold, log }) {
   const key = alertKey(evt);
@@ -66,31 +82,73 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
   // arrived, not just the producer's own `ts`.
   const record = JSON.stringify({ ...evt, payload: storedPayload, brokerTs });
 
-  // -------------------------------------------------- 1. record (duplicate gate)
+  // -------------------------------------------- 1. content claim (dedup gate)
   //
-  // NX makes the SET itself the dedup test. A duplicate is identified by EVENT
-  // ID, not by "it looks like the last one": two events with the same id are the
-  // same event, whether they arrived as a RabbitMQ redelivery or as two POSTs
-  // from an over-eager producer.
+  // `SET fw:fp:{fp} {id} NX` is the atomic test. If it succeeds, this fingerprint
+  // is new and this event owns it. If it fails, another record already represents
+  // this condition — read back the owner's id and let that record absorb this
+  // arrival instead of storing it.
+  const fp = contentFingerprint(evt);
+  const claimed = await dfl.write((c) =>
+    c.set(keys.fingerprint(fp), evt.id, 'EX', ttlSec, 'NX'),
+  );
+
+  if (claimed === null) {
+    const ownerId = await dfl.write((c) => c.get(keys.fingerprint(fp)));
+    if (!ownerId) {
+      // The fingerprint expired between SET and GET (both are TTL'd). Not worth
+      // failing an event over: treat this delivery as the new owner.
+      log.debug('fingerprint vanished between claim and read', { fp, id: evt.id });
+      await dfl.write((c) => c.set(keys.fingerprint(fp), evt.id, 'EX', ttlSec));
+    } else {
+      // The original record absorbs this arrival. `brokerTs` is the new event's
+      // arrival time, which is what "Last occurrence" must show.
+      const applied = await dfl.write((c) =>
+        c.eval(
+          fold.get(),
+          3,
+          keys.alert(key),
+          keys.alertOpen(key),
+          keys.alertOpenIndex,
+          String(brokerTs),
+          evt.id,
+          evt.severity,
+          String(cfg.alertDedupWindow),
+          key,
+        ),
+      );
+      // The stored record is NOT rewritten: it keeps its original id, original
+      // payload and original brokerTs. Only the rollup moves. That is the
+      // requested behaviour — "the original event stays, Last occurrence and
+      // Count move, the new event is deleted".
+      log.debug('content duplicate absorbed by the original record', {
+        id: evt.id, ownerId, fp, applied: Number(applied),
+      });
+      return {
+        applied: Number(applied),
+        alertKey: key,
+        contentDuplicate: true,
+        ownerId,
+      };
+    }
+  }
+
+  // --------------------------------------- 2. record (transport dedup on id)
   //
-  // The previous design relied only on the fold's (timestamp, id) watermark,
-  // which cannot catch this case — every broker delivery carries a fresh
-  // timestamp, so a re-sent id always looked newer and was counted again. That
-  // is why a duplicate storm inflated `count` instead of being dropped.
-  //
-  // Returns null when the key already existed: the caller must NOT fold, count,
-  // publish or re-index it.
+  // NX again, now keyed on the event id: a redelivered MESSAGE must not overwrite
+  // the stored record. A content duplicate never reaches here, so this only fires
+  // for a genuine redelivery.
   const created = await dfl.write((c) => c.set(keys.event(evt.id), record, 'EX', ttlSec, 'NX'));
   if (created === null) {
     return { applied: 0, duplicate: true, alertKey: key };
   }
 
-  // ----------------------------------------------------------------- 2. index
+  // ----------------------------------------------------------------- 3. index
   // Score is the BROKER timestamp, not the producer ts: a redelivered event
   // must keep its original position in the timeline (workers.md §4).
   await dfl.write((c) => c.zadd(keys.index(evt.source), brokerTs, evt.id));
 
-  // ------------------------------------------------------------ 3. alert fold
+  // ------------------------------------------------------------ 4. alert fold
   // The fold also maintains the open-alert index (KEYS[3]) so the index cannot
   // drift from the state it indexes; see the comment block in alert-fold.lua.
   // ARGV[5] is the bare alert key, which is what the index stores.
@@ -109,12 +167,12 @@ export async function persistEvent({ dfl, evt, storedPayload, brokerTs, cfg, fol
     ),
   );
 
-  // ----------------------------------------------------------- 4. index prune
+  // ----------------------------------------------------------- 5. index prune
   // ZADD members never expire on their own, so the index is trimmed on the
   // write path (workers.md §4.1). Cheap and self-correcting.
   await maybePruneIndex(dfl, evt.source, cfg, log);
 
-  return { applied: Number(applied), alertKey: key };
+  return { applied: Number(applied), alertKey: key, fingerprint: fp };
 }
 
 /**

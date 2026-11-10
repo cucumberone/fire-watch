@@ -6,6 +6,7 @@
  * gateway must be able to filter without decompressing anything.
  */
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 
 const SEVERITIES = new Set(['FATAL', 'CRITICAL', 'WARNING', 'HARMLESS', 'CLOSE']);
 const RETIREMENT = new Set(['CLOSE', 'HARMLESS']);
@@ -114,4 +115,49 @@ export function brokerTsMs(msg) {
   const secs = msg.properties?.timestamp;
   if (secs !== undefined) return Number(secs) * 1000;
   return null;
+}
+
+/**
+ * Content fingerprint: what makes two events "the same event".
+ *
+ * Dedup has to key on content, not on the event id. The same logical alarm
+ * routinely arrives with a fresh id each time (an upstream system re-reporting a
+ * condition), so an id-only check counts every copy — which is exactly how a
+ * duplicate storm inflated `count`. The id is still the identity of a MESSAGE; the
+ * fingerprint is the identity of the CONDITION.
+ *
+ * What is included: `source`, `type`, `severity` and the payload. Those are the
+ * facts a producer reports about the world.
+ *
+ * What is deliberately EXCLUDED, and why each one would break dedup:
+ *
+ *   id           differs per delivery — the whole point
+ *   ts           the producer's clock, also differs per delivery
+ *   brokerTs     set on arrival by the ingress; differs every time
+ *
+ * Payload keys are sorted before hashing so key order cannot make two identical
+ * payloads look different. Nested objects are sorted too, recursively — a naive
+ * JSON.stringify is order-sensitive at every level.
+ *
+ * A retirement event (CLOSE/HARMLESS) is included in the same space as the
+ * severities it retires: a CLOSE fingerprint differs from the CRITICAL
+ * fingerprint for the same source and type, so retirements never collapse into
+ * the occurrence they are ending.
+ */
+export function contentFingerprint(evt) {
+  const canonical = stableStringify({
+    source: evt.source,
+    type: evt.type,
+    severity: evt.severity,
+    payload: evt.payload ?? {},
+  });
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
+
+/** JSON.stringify with object keys sorted at every depth. */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
 }

@@ -103,6 +103,7 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 | `fw:alert:{key}` | hash | current state + occurrence rollup + watermark | 7d (rolling) |
 | `fw:alert:open:{key}` | string | `"1"` while an alert is open | 7d |
 | `fw:idx:alert:open` | zset | member = alert key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN fw:alert:open:*` ([websocket-server.md](websocket-server.md) §3.1) | none (entries removed by the fold on retirement) |
+| `fw:fp:{fingerprint}` | string | id of the event record that owns this content fingerprint. The content-dedup gate (§5.4.2): while present, an identical arrival is absorbed by that record instead of being stored | 7d, matching event retention |
 
 `fw:alert:{key}` fields:
 
@@ -243,77 +244,100 @@ Without the tie-break, a CRITICAL and a CLOSE stamped in the same millisecond co
 
 Alternative considered and rejected: random UUIDv4 ids cannot provide a meaningful tie-break *order*, but they do provide a deterministic one, which is all that is required — the requirement is convergence, not semantic priority. If a same-millisecond CRITICAL and CLOSE must resolve in favour of the CRITICAL, add an explicit severity rank as the second sort key instead of the id.
 
-### 5.4 Two different kinds of dedup — both needed
+### 5.4 Two different kinds of duplicate — and they are NOT the same
 
-These are unrelated mechanisms and the design has both. Conflating them is the usual source of "why does this alert have count 4 000".
+Conflating these is the usual source of "why does this alert have count 4 000" and,
+more recently, of "why did the board fill with 200 rows for one condition".
 
-| | **Transport dedup** | **Semantic dedup (occurrence coalescing)** |
+| | **Transport duplicate** | **Content duplicate** |
 |---|---|---|
-| Question | "is this the same *message* again?" | "is this the same *condition* still firing?" |
-| Cause | at-least-once delivery, worker crash before ack, replay | a sensor reporting the same fault every second |
-| Key | event `id` | alert `{key}` |
-| Where | worker: idempotent `SET` + watermark | worker: the fold's `count` rollup |
-| Result | the event is stored exactly once | the alert shows one row with a `last_seen` that keeps moving |
+| Question | "is this the same *message* again?" | "is this the same *condition*, reported again?" |
+| Cause | at-least-once delivery, worker crash before ack, replay | a producer re-reporting the same alarm with a fresh id |
+| Identity | event `id` | content **fingerprint** (§5.4.2) |
+| Detection | `SET fw:evt:{id} NX` | `SET fw:fp:{fingerprint} NX` |
+| Result | **nothing at all happens** | the ORIGINAL record absorbs it: `count` +1, `last_seen` moves, and the new copy is **discarded** |
 
-#### Transport dedup (already implemented)
+#### 5.4.1 Transport duplicate — same message id twice
 
-- `SET fw:evt:{id} ... NX` — **the gate**. The second delivery of an id is
-  rejected by the store itself, so it never reaches the fold, the index or the
-  live stream. This is what makes a duplicate cheap: one command, nothing else
-  runs.
-- `ZADD fw:idx:src:{s}` — a repeated member only updates its score.
-- The watermark — a redelivered event older than the fold's watermark returns
-  `0`. Still needed for ordering (an old `CLOSE` must not retire a newer
-  `CRITICAL`), but it cannot replace the `NX` gate: every broker delivery carries
-  a fresh timestamp, so a re-sent id always looks newer.
-- Gateway LRU — a repeated `PUBLISH` is dropped before it reaches the browser.
+A RabbitMQ redelivery is the same message, keeping its original id and its
+original broker timestamp. It must be a no-op:
 
-#### Semantic dedup: coalescing repeated occurrences
+- `SET fw:evt:{id} ... NX` rejects the second write, so the record is unchanged.
+- `ZADD fw:idx:src:{s}` only moves a score for a repeated member.
+- The fold's `(ts, id)` watermark returns `0` for anything not newer.
+- The gateway's LRU drops a repeated `PUBLISH` before it reaches a browser.
 
-A sensor that stays broken does not send one event; it sends one per interval. Without coalescing, a 7-day retention window turns a single fault into ~600 000 alert rows and blows the working set.
+Nothing is counted and nothing is shown. This is correct: the operator already saw
+the original.
 
-The fold handles this with a time window, `FW_ALERT_DEDUP_WINDOW` (default **300 000 ms = 5 min**):
+#### 5.4.2 Content duplicate — same condition, different id
+
+**This is the case that matters for the board.** An upstream alarm system
+re-reports a standing condition every interval, with a new event id each time.
+Counting those would mean one row per delivery, and 7-day retention turns a single
+fault into hundreds of thousands of records.
+
+Identity is therefore **content**, not id. The fingerprint
+(`contentFingerprint()` in `services/worker/src/event.js`) is
+`sha256(canonical(source, type, severity, payload))`, truncated to 32 hex chars.
+
+What is excluded, and why each would break it:
+
+| Field | Why excluded |
+|---|---|
+| `id` | differs on every delivery — that is the whole problem |
+| `ts` | the producer's clock, also differs per delivery |
+| `brokerTs` | set on arrival by the ingress, differs every time |
+
+Object keys are sorted at every depth before hashing, so payload key order cannot
+make two identical payloads look different.
+
+The flow, and where the copy is dropped:
 
 ```text
-if the alert is not open              -> start a new episode: count = 1, first_seen = ts
-else if ts - last_seen >  window      -> a new occurrence:      count += 1
-else                                  -> same occurrence:       count unchanged
-in every applied case                 -> last_seen = ts, last_id = this event
+SET fw:fp:{fingerprint} {id} NX
+  -> OK    : new condition. Store the record, index it, fold it.
+  -> null  : a record already owns this condition. Read the owner id, then:
+               fold(brokerTs, this id)   -> count +1, last_seen moves
+               and STOP. No record, no index member, no audit copy.
 ```
 
-So the record carries **both** numbers, which is what an operator actually needs:
+The new copy is **never written anywhere**. Its arrival is recorded only as the
+rollup movement on the original record — which is exactly "the original event
+stays, Last occurrence and Count move, the new event is deleted".
 
-| Field | Meaning | Example |
-|---|---|---|
-| `first_seen` | when this episode began | 12:00:00 — "firing since" |
-| `last_seen` | when it was last confirmed | 14:37:12 — "last occurrence", keeps moving |
-| `count` | distinct occurrences, not raw event count | 32 — "flapped 32 times in 2.5h" |
+The fold's `count` therefore means **deliveries of this condition**, and
+`last_seen` is the newest arrival. `first_seen` still marks when the episode began.
 
-#### Why `count` is a windowed bucket, not a raw tally
+#### 5.4.3 Why there is no time window any more
 
-The raw event count is already available and exact: `ZCARD` over the index time range. `count` deliberately counts **occurrences** (distinct bursts separated by more than the window) because:
+An earlier design coalesced only repeats inside `FW_ALERT_DEDUP_WINDOW` (300 s).
+Two things were wrong with it:
 
-- at 1 000 events/min a raw tally reaches 10 080 000 for one permanently broken sensor, which is meaningless to a human;
-- a windowed count distinguishes "fired once and stayed" (count 1, `last_seen` moving) from "flapping every few minutes" (count 40) — a genuinely different operational situation;
-- it is bounded by episode length ÷ window, so it never grows faster than ~12 per hour for a continuously firing alert.
+1. A storm inside the window left `count` frozen at 1 — indistinguishable from a
+   broken counter, and reported as one.
+2. A repeat *outside* the window created a second row for the same condition,
+   which is precisely what the board must not do.
 
-Tuning: raise the window (e.g. 900 000 = 15 min) if the UI is noisy with high-frequency sources; lower it to 60 000 if occurrences are meaningfully distinct at one-per-minute resolution. Store the chosen value in the ConfigMap; changing it does **not** require recomputing historical alerts, because alert state is derived (§8).
+Content identity has neither problem: the same payload is always the same
+condition, no matter how far apart the deliveries are. `FW_ALERT_DEDUP_WINDOW` is
+retained in the environment for wire compatibility but no longer gates anything.
 
-#### Coalescing does not lose information
-
-Every individual event is still stored in `fw:evt:{id}` and indexed in `fw:idx:src:*`, so a drill-down can show every raw report. Coalescing only affects the **summary row** the operator sees first.
-
-#### Interaction with severities
+#### 5.4.4 What this means operationally
 
 | Situation | Behaviour |
 |---|---|
-| CRITICAL at t, CRITICAL at t+10s | same occurrence → `count` stays 1, `last_seen` moves |
-| CRITICAL at t, WARNING at t+10s | same alert key, applied → severity becomes WARNING, `count` stays 1 (severity change is not a new occurrence) |
-| WARNING at t, CRITICAL at t+10s | severity escalates to CRITICAL — visible because `severity` is overwritten by the last applied event |
-| CRITICAL at t, CLOSE at t+1s | alert closed; the next CRITICAL starts a **new episode** with `count` reset to 1 and a new `first_seen` |
-| CRITICAL at t, CLOSE at t+1s, CRITICAL at t+2s | new episode — this is correct, an explicit close ends the previous one |
+| Same payload at t and t+10s | one record; `count` 2, `last_seen` = t+10s |
+| Same payload a week later | still one record, unless the fingerprint TTL expired (it is 7 days, matching retention) |
+| Same payload, severity escalated WARNING → CRITICAL | **different** fingerprint → a second record. Severity is part of the identity because an escalation is a different fact about the world |
+| Payload differs in one field | different fingerprint → a second record |
+| `CLOSE` for a condition | different fingerprint from the severity it retires → never collapses into the occurrence it ends |
 
-Escalation history is intentionally not kept in the alert row: it is recoverable from the event stream via the index, which is the authoritative record.
+**Trade-off, stated plainly:** two genuinely distinct faults that happen to be
+byte-identical within the TTL are indistinguishable and will be counted as one
+condition. That is the cost of content identity, and it is the correct cost here —
+an alarm system that wants them distinguished must vary the payload (an occurrence
+counter, a device serial), which is what a real alarm system does anyway.
 
 ### 5.5 What is *not* guarded
 

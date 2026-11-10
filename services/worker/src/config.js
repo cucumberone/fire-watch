@@ -69,6 +69,19 @@ export const keys = {
   // was explicitly rejected (docs/websocket-server.md §3). Scores are the last
   // activity timestamp, so a bounded read is "newest N open alerts".
   alertOpenIndex: 'fw:idx:alert:open',
+  /**
+   * Content fingerprint -> the id of the event record that owns it.
+   *
+   * This is the content-dedup index (event-lifecycle.md §5.5). An event whose
+   * fingerprint is already present is NOT stored: the original record absorbs it
+   * by having its `count` incremented and its `last_seen` moved, and the new copy
+   * is discarded.
+   *
+   * Keyed by fingerprint and not by id because the same logical alarm can arrive
+   * with a different id each time — that is the whole reason id-only dedup let a
+   * storm inflate the count.
+   */
+  fingerprint: (fp) => `fw:fp:${fp}`,
   channelEvents: 'fw:ch:events',
   channelAlerts: 'fw:ch:alerts',
 };

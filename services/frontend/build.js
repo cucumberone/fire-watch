@@ -454,14 +454,62 @@ tr.acked td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
 .inspector-action:disabled { cursor:default; opacity:.7; color:var(--dim); }
 /* Destructive actions. Red text and a red border, because a permanent delete
    sitting one row under Acknowledge must not look like it belongs to the same
-   class of action. The colour is the only warning the item gets — the modal
-   confirm is what actually stops an accident. */
+   class of action. The colour is the only warning the item gets: the confirmation
+   is the three deliberate steps it takes to reach it (right-click, menu, a red item
+   naming the id), not a dialog — a native modal trains an operator to dismiss it
+   without reading. */
 .inspector-danger { color:#ef4444; border-color:rgba(239,68,68,.5); }
 .inspector-danger:hover:not(:disabled) { background:rgba(239,68,68,.12);
                                          border-color:#ef4444; color:#ef4444; }
 .inspector-hint { position:sticky; bottom:0; background:var(--bg);
                   padding:.25rem .6rem; border-top:1px solid var(--line);
                   font-size:.68rem; color:var(--dim); }
+
+/* ------------------------------------------------------------- operator journal
+   A note is arbitrary human text, so the layout has to survive long words, pasted
+   multi-line logs and 1024 characters without horizontal escape. white-space
+   pre-wrap preserves the operator line breaks; overflow-wrap anywhere breaks a
+   pasted hash with no spaces instead of pushing the panel sideways. */
+.journal { display:flex; flex-direction:column; gap:.5rem; padding:.5rem .6rem;
+           min-height:0; overflow-y:auto; }
+.journal-compose { display:flex; flex-direction:column; gap:.35rem;
+                   padding-bottom:.5rem; border-bottom:1px solid var(--line); }
+/* One-time "who are you" prompt, shown only while no name is stored. */
+.journal-signature { display:flex; align-items:center; gap:.4rem; flex-wrap:wrap;
+                     font-size:.72rem; color:var(--dim);
+                     padding:.35rem .4rem; border-radius:.25rem;
+                     border:1px dashed var(--notice); background:transparent; }
+.journal-name { font:inherit; font-size:.75rem; padding:.2rem .35rem;
+                border-radius:.25rem; border:1px solid var(--line);
+                background:var(--bg); color:var(--fg); width:11rem; }
+.journal-name:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.journal-input { font:inherit; font-size:.78rem; line-height:1.45; resize:vertical;
+                 padding:.4rem .5rem; border-radius:.25rem;
+                 border:1px solid var(--line); background:var(--bg); color:var(--fg);
+                 min-height:3.6rem; max-height:9rem; }
+.journal-input:focus-visible { outline:2px solid var(--accent); outline-offset:1px;
+                               border-color:var(--accent); }
+.journal-compose-actions { display:flex; align-items:center; gap:.5rem; }
+.journal-counter { margin-left:auto; font-size:.68rem; color:var(--dim);
+                   font-variant-numeric:tabular-nums; }
+/* Near the cap, so the limit is noticed before the text is truncated rather than
+   after. Amber, not red: reaching 1000 of 1024 characters is not an error. */
+.journal-counter-warn { color:var(--notice); font-weight:600; }
+.journal-save { flex:0 0 auto; }
+.journal-list { list-style:none; margin:0; padding:0; display:flex;
+                flex-direction:column; gap:.45rem; }
+.journal-entry { padding:.4rem .5rem; border-radius:.25rem;
+                 border:1px solid var(--line); background:var(--pre-bg); }
+/* An entry that has been sent but not yet echoed back. Dimmed rather than hidden:
+   the operator must see their own text immediately, and must be able to tell that
+   it is not confirmed yet. */
+.journal-pending { opacity:.65; border-style:dashed; }
+.journal-meta { display:flex; gap:.5rem; align-items:baseline; font-size:.68rem;
+                color:var(--dim); margin-bottom:.2rem; }
+.journal-meta strong { color:var(--fg); font-size:.72rem; }
+.journal-saving { margin-left:auto; font-style:italic; }
+.journal-text { font-size:.78rem; line-height:1.45; white-space:pre-wrap;
+                overflow-wrap:anywhere; }
 /* A render error inside one pane. Deliberately looks like a fault report rather
    than an empty table: an empty pane would read as "nothing is happening", which
    during an incident is the most dangerous possible message. */

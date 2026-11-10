@@ -62,15 +62,34 @@ spec:
             # Cap on the open-alert snapshot sent on connect (websocket-server.md §3.1).
             - { name: FW_ALERT_SNAPSHOT_MAX, value: "2000" }
 
-            # How often the gateway PINGs Dragonfly and reports its health, and how many
-
-            # consecutive failures before telling clients it is down. Three failures is
-
-            # ~30s: long enough that a demoted master or a blip does not flicker the UI.
-
-            - { name: FW_DB_PROBE_MS, value: "10000" }
-
+            # How often the gateway PINGs Dragonfly and reports its health, and how
+            # many consecutive failures before telling clients it is down. Three
+            # failures is ~30s: long enough that a demoted master or a blip does not
+            # flicker the UI.
+            - { name: FW_DB_PROBE_MS,     value: "10000" }
             - { name: FW_DB_FAIL_THRESHOLD, value: "3" }
+
+            # Operator journal: cap on notes kept per incident, and retention.
+            # Trimmed on every append rather than by a timer, and the TTL matches the
+            # alert hash so a journal cannot outlive the alert it annotates.
+            - { name: FW_JOURNAL_MAX,     value: "200" }
+            - { name: FW_JOURNAL_TTL,     value: "604800" }
+
+            # Journal notes are ALSO published to the audit exchange, because
+            # Dragonfly alone cannot make a note durable (docs/journal.md §3).
+            # Without these the gateway still starts and notes are still saved --
+            # they are just not recoverable, which is why the gap is exported as
+            # fw_journal_audit_enabled rather than only logged once.
+            - { name: AMQP_HOST,           value: rabbitmq }
+            - { name: AMQP_PORT,           value: "5672" }
+            - { name: AMQP_AUDIT_EXCHANGE, value: fx.audit }
+            - { name: AMQP_AUDIT_KEY,      value: event.audit }
+            - name: AMQP_USER
+              valueFrom:
+                configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }
+            - name: AMQP_PASS
+              valueFrom:
+                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
             - { name: FW_MAX_CONNS,       value: "5000" }
             - { name: FW_MSG_MAX_BYTES,   value: "1048576" }
             # Backstop against a runaway client, not a throttle on operators:

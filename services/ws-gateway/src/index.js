@@ -40,6 +40,13 @@ import {
   closeFrame,
   deletedFrame,
 } from './ack.js';
+import {
+  validateJournalAppend,
+  validateJournalQuery,
+  journalEntryFrame,
+  journalListFrame,
+} from './journal.js';
+import { AuditPublisher } from './audit.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
@@ -56,6 +63,10 @@ const POD_NAME = process.env.POD_NAME || 'local';
 
 const reader = new DragonflyReader(cfg, log);
 const recent = new RecentIds(cfg.dedupeLru);
+// Replicates journal entries to the audit exchange, because Dragonfly alone cannot
+// make a note durable. Logged at startup either way, so a deployment without it
+// knows notes are stored-but-not-recoverable rather than assuming they are safe.
+const audit = new AuditPublisher(cfg, log);
 
 let ready = false;
 let connCount = 0;
@@ -100,7 +111,12 @@ const httpServer = http.createServer((req, res) => {
       // read". A pod that is ready while its reads fail serves a stale board, and
       // that used to be invisible to monitoring.
       `# TYPE fw_db_up gauge\nfw_db_up ${dbUp ? 1 : 0}\n` +
-      `# TYPE fw_db_consecutive_failures gauge\nfw_db_consecutive_failures ${dbFails}\n`,
+      `# TYPE fw_db_consecutive_failures gauge\nfw_db_consecutive_failures ${dbFails}\n` +
+      // Whether journal notes are being replicated to the audit exchange. A `0`
+      // here means the feature works but its durability promise does not, and that
+      // must be visible to monitoring rather than living only in a startup log
+      // line nobody reads after a deploy (docs/acknowledge.md §11.3).
+      `# TYPE fw_journal_audit_enabled gauge\nfw_journal_audit_enabled ${audit.isEnabled() ? 1 : 0}\n`,
     );
     return;
   }
@@ -222,6 +238,16 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'allEvents') {
       await handleAllEventsQuery(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'journal') {
+      await handleJournalAppend(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'journals') {
+      await handleJournalQuery(conn, frame, send);
       return;
     }
 
@@ -718,6 +744,122 @@ async function handleAllEventsQuery(conn, frame, send) {
   }));
 }
 
+/**
+ * `{"op":"journal","key":"source:type","text":"…"}` — append one operator note.
+ *
+ * The only append in the system. Everything else the gateway writes (ack, close)
+ * is a single-field overwrite of state that has exactly one correct value; a journal
+ * is a LOG, where the earlier entries are the value. So this uses RPUSH and never a
+ * SET, and two operators annotating the same incident both keep their text.
+ *
+ * The note is stored first and replicated second. If the audit publish fails the
+ * operator still gets their entry — an annotation is not worth failing over a
+ * broker hiccup — but the failure is logged at `warn` rather than swallowed, because
+ * it silently weakens a durability promise the operator may be relying on.
+ */
+async function handleJournalAppend(conn, frame, send) {
+  const verdict = validateJournalAppend(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  const entry = {
+    id: verdict.id,
+    by: verdict.by,
+    at: Date.now(),
+    text: verdict.text,
+  };
+
+  let result;
+  try {
+    result = await reader.appendJournal(
+      verdict.key,
+      entry,
+      cfg.journalTtlMs,
+      cfg.journalMaxEntries,
+    );
+  } catch (err) {
+    log.warn('journal append failed', { key: verdict.key, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'journal_failed',
+      message: 'could not save the note, retry',
+    }));
+    return;
+  }
+
+  // Replication is awaited but never fails the request: see audit.js.
+  await audit.publishJournal({ key: verdict.key, entry });
+
+  // Echo to the writer, then fan out to everyone else. The echo carries the entry
+  // (with the server-assigned id and timestamp) so this client can render it
+  // immediately; `shouldFanOut` is what stops the round trip from delivering it a
+  // second time.
+  send(journalEntryFrame(verdict.key, entry));
+
+  if (result.truncated) {
+    send(JSON.stringify({
+      op: 'error',
+      code: 'journal_truncated',
+      message: `this incident keeps the newest ${cfg.journalMaxEntries} notes; older ones were dropped`,
+    }));
+  }
+
+  try {
+    await reader.publish(cfg.channelAlerts, JSON.stringify({
+      kind: 'journal',
+      key: verdict.key,
+      entry,
+      origin: POD_NAME,
+    }));
+  } catch (err) {
+    // The note is stored. Another pod's clients will pick it up on their next read,
+    // so this is a delay rather than a loss.
+    log.warn('journal broadcast failed after a successful write', {
+      key: verdict.key, id: entry.id, err: String(err),
+    });
+  }
+}
+
+/**
+ * `{"op":"journals","keys":["source:type",…]}` — bulk read of recent notes.
+ *
+ * Bulk rather than one-key-per-frame for the same reason `op: alerts` is bulk: an
+ * operator opening the journal on a table of alerts should not cause one round trip
+ * per row. Bounded by `MAX_JOURNAL_QUERY_KEYS`, so one frame cannot ask a pod to do
+ * unbounded work (websocket-server.md §4).
+ *
+ * Every requested key comes back with an entry, even when empty, so a client can
+ * distinguish "read it, there is nothing" from "no answer".
+ */
+async function handleJournalQuery(conn, frame, send) {
+  const verdict = validateJournalQuery(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+  if (verdict.keys.length === 0) {
+    send(journalListFrame([]));
+    return;
+  }
+
+  let journals;
+  try {
+    journals = await reader.readJournals(verdict.keys, verdict.limit);
+  } catch (err) {
+    log.warn('journal read failed', { err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'journal_read_failed',
+      message: 'could not read the journal',
+    }));
+    return;
+  }
+
+  send(journalListFrame(journals));
+}
+
 async function handleAlertQuery(conn, frame, send) {
   const verdict = validateAlertQuery(frame);
   if (!verdict.ok) {
@@ -836,6 +978,19 @@ async function handleAlertMessage(raw) {
   // from its live tail regardless of which pod handled the delete.
   if (parsed.kind === 'deleted') {
     const frame = deletedFrame(parsed.id);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
+  // A new journal note. Same echo guard as ack and close: the pod that accepted the
+  // append already sent the entry to the client that wrote it, so delivering its own
+  // broadcast again would show the note twice. A duplicated note is worse than a
+  // duplicated ack — an ack is idempotent state, a note is a row in a log.
+  if (parsed.kind === 'journal') {
+    if (!shouldFanOut(parsed, POD_NAME)) return;
+    const frame = journalEntryFrame(parsed.key, parsed.entry);
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

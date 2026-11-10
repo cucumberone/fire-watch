@@ -36,6 +36,7 @@ This repo sets up an event server.
 - [Fault Tolerance Audit](docs/fault-tolerance.md) — per-component H/A and split-brain verification, 9 defects found and fixed
 - [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, redelivery safety
 - [Acknowledgement](docs/acknowledge.md) — operator ack, the one gateway write, cleared on re-fire
+- [Operator Journal](docs/journal.md) — right-click notes per incident, append-only, signed, and the audit copy that makes them durable
 - [Payload & Compression](docs/payload-and-compression.md) — `msg` / `msgc`, gzip at the worker, `DecompressionStream` in the browser
 - [RabbitMQ](docs/rabbitmq.md) — 3-node quorum cluster, peer discovery, anti-affinity, probes
 - [DragonflyDB](docs/dragonfly.md) — master + 2 replicas, write guard, snapshots, sizing

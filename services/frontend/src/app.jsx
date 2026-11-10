@@ -58,6 +58,15 @@ const MSG_MAX_BYTES = 1048576;
 const MAX_ACK_KEYS = 200;
 
 /**
+ * Longest journal note, in characters.
+ *
+ * Mirrors `MAX_JOURNAL_LEN` in the gateway. The server enforces it for real; this
+ * copy exists so the field can stop the keystroke and show a counter instead of
+ * letting an operator type 3000 characters and then lose the tail on save.
+ */
+const JOURNAL_MAX_CHARS = 1024;
+
+/**
  * How many frames a bulk action may send per second.
  *
  * The gateway rejects a connection sending more than `FW_MAX_FRAMES_PER_SEC`
@@ -111,6 +120,8 @@ const EVENT_DEFAULT_W = [96, 172, 172, 340];
 // ABSENCE of a key, so a later OS change still takes effect.
 const THEME_KEY = 'fw:theme';
 const ROW_COLOR_KEY = 'fw:rowColor';
+// Who is at the keyboard, used to sign journal notes. A preference, not a login.
+const OPERATOR_KEY = 'fw:operator';
 // Which tab was last open. A workspace preference like the drawer it replaces:
 // an operator who works from the Closed tab should not be reset to Alerts every
 // reload.
@@ -318,6 +329,14 @@ function usePreferences() {
     return stored === 'dark' || stored === 'light' ? stored : 'auto';
   });
   const [rowColor, setRowColor] = useState(() => readPref(ROW_COLOR_KEY, 'off') === 'on');
+  // Who the operator is, for signing journal notes.
+  //
+  // Asked once and remembered, rather than a field beside every note: a note signed
+  // "anonymous" is close to useless as an audit trail, and retyping a name per note
+  // guarantees people stop bothering. Not authentication — there is none in this
+  // system — so the UI must not imply it proves authorship; it records who claimed
+  // the note, exactly like the ack's `by`.
+  const [operatorName, setOperatorNameState] = useState(() => readPref(OPERATOR_KEY, ''));
 
   const darkMode = resolveTheme(themePreference, systemDark) === 'dark';
 
@@ -337,7 +356,16 @@ function usePreferences() {
     setThemePreference(next === 'dark' || next === 'light' ? next : 'auto');
   }, []);
 
-  return { themePreference, darkMode, rowColor, setTheme, setRowColor };
+  const setOperatorName = useCallback((next) => {
+    const clean = String(next || '').trim().slice(0, 128);
+    setOperatorNameState(clean);
+    writePref(OPERATOR_KEY, clean || null);
+  }, []);
+
+  return {
+    themePreference, darkMode, rowColor, setTheme, setRowColor,
+    operatorName, setOperatorName,
+  };
 }
 
 // --------------------------------------------------------- column resizing
@@ -509,6 +537,17 @@ function useSocket(config) {
   // rows are derived from the fold verdicts, while acks are an operator fact
   // that arrives on its own frames (docs/acknowledge.md §5).
   const [acks, setAcks] = useState(new Map());
+  // Operator journal, keyed by ALERT key (`source:type`), newest entry first.
+  //
+  // Keyed by the alert rather than an event id because the note is about the
+  // incident: an event record is pruned after retention, and a note attached to
+  // one would disappear with it. Held in one map so every tab that can open a
+  // journal reads the same copy — two copies would be two chances to disagree.
+  //
+  // Absent key means "not read yet"; an empty array means "read, and there is
+  // nothing". The distinction matters because the panel shows a spinner for the
+  // first and "no notes yet" for the second.
+  const [journals, setJournals] = useState(new Map());
   const [notice, setNotice] = useState(null);
   // The Closed tab's data. Held here rather than in the tab component so it
   // survives switching tabs — re-fetching 7 days of closures every time the
@@ -794,6 +833,43 @@ function useSocket(config) {
       // The initial database state, so a client joining mid-outage does not have to
       // wait for the next probe tick to find out.
       if (frame.db && typeof frame.db.up === 'boolean') setDbUp(frame.db.up);
+      return;
+    }
+    if (frame.op === 'journal') {
+      // One new entry, either echoed back to the operator who wrote it or fanned out
+      // from another pod. Reconciling against the optimistic copy is by TEXT match on
+      // the pending entry: the server mints the id, so the two cannot share one, and
+      // matching on text is the only identity the client has until the echo lands.
+      const entry = frame?.entry;
+      if (typeof frame?.key === 'string' && entry && typeof entry.text === 'string') {
+        setJournals((prev) => {
+          const next = new Map(prev);
+          const list = next.get(frame.key) || [];
+          // Already have this exact entry id (a re-delivered fan-out): ignore.
+          if (list.some((e) => e.id === entry.id)) return prev;
+          const withoutPending = list.filter(
+            (e) => !(e.pending && e.text === entry.text && e.at <= entry.at),
+          );
+          next.set(frame.key, [entry, ...withoutPending]);
+          return next;
+        });
+      }
+      return;
+    }
+    if (frame.op === 'journals') {
+      // A bulk read. Replaces each key wholsesale: it is a bounded newest-N query,
+      // so an entry it omits is older than the window, not missing.
+      const rows = Array.isArray(frame.journals) ? frame.journals : [];
+      if (rows.length === 0) return;
+      setJournals((prev) => {
+        const next = new Map(prev);
+        for (const row of rows) {
+          if (!row || typeof row.key !== 'string') continue;
+          const entries = Array.isArray(row.entries) ? row.entries : [];
+          next.set(row.key, entries);
+        }
+        return next;
+      });
       return;
     }
     if (frame.op === 'deleted') {
@@ -1098,6 +1174,52 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Read the journal for one alert key.
+   *
+   * A query, not a subscription: notes are written rarely and read on demand when
+   * an operator opens the panel, so a live subscription would spend a round trip
+   * per alert on every board refresh to deliver nothing.
+   */
+  const loadJournal = useCallback((key) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ op: 'journals', keys: [key] }));
+  }, []);
+
+  /**
+   * Append one note to an alert's journal.
+   *
+   * Optimistic in the one direction that is safe: the entry is shown immediately
+   * with the text the operator typed, then reconciled when the server's echo
+   * arrives carrying the authoritative id and timestamp. Without this a note would
+   * appear to vanish for a round trip, and on a slow link an operator would type it
+   * again.
+   */
+  const addJournalEntry = useCallback((key, text, by) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — note not saved');
+      return false;
+    }
+    const trimmed = String(text || '').trim();
+    if (trimmed === '') return false;
+    const pending = {
+      id: `pending-${Date.now()}`,
+      by: by || 'you',
+      at: Date.now(),
+      text: trimmed,
+      pending: true,
+    };
+    setJournals((prev) => {
+      const next = new Map(prev);
+      next.set(key, [pending, ...(prev.get(key) || [])]);
+      return next;
+    });
+    ws.send(JSON.stringify({ op: 'journal', key, text: trimmed, by }));
+    return true;
+  }, []);
+
+  /**
    * Ask for the recently closed alerts.
    *
    * A QUERY, not a stream: the Closed tab is a 7-day window that changes slowly,
@@ -1143,6 +1265,7 @@ function useSocket(config) {
     status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
     loadClosed, closed: closedState,
     loadAllEvents, allEvents,
+    journals, loadJournal, addJournalEntry,
     dbUp,
   };
 }
@@ -1252,7 +1375,7 @@ function IconPalette() {
  * Closed on Escape, on a click outside, and on scroll of the container it sits
  * in — a menu anchored to a row that has scrolled away is worse than no menu.
  */
-function RecordInspector({ state, onClose }) {
+function RecordInspector({ state, onClose, journal }) {
   const ref = useRef(null);
   // Which submenu is expanded. Reset whenever a different row is opened, or the
   // panel would reopen showing the previous row's Information.
@@ -1348,6 +1471,17 @@ function RecordInspector({ state, onClose }) {
               {a.label}
             </button>
           ))}
+          {journal ? (
+            <button
+              className="inspector-action"
+              onClick={() => setView('journal')}
+              title="Notes left by operators about this incident"
+            >
+              {journal?.entries?.length
+                ? `Journal (${journal.entries.length})`
+                : 'Journal'}
+            </button>
+          ) : null}
           <button
             className="inspector-action"
             onClick={() => setView('info')}
@@ -1356,6 +1490,11 @@ function RecordInspector({ state, onClose }) {
             Information
           </button>
         </div>
+      ) : view === 'journal' ? (
+        <JournalView
+          journal={journal}
+          onBack={() => setView('menu')}
+        />
       ) : (
         <table className="inspector-table">
           <tbody>
@@ -1371,8 +1510,115 @@ function RecordInspector({ state, onClose }) {
         </table>
       )}
       <div className="inspector-hint">
-        {view === 'info' ? 'Esc or click outside to close' : 'Right-click action for this row'}
+        {view === 'info' || view === 'journal'
+          ? 'Esc or click outside to close'
+          : 'Right-click action for this row'}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The journal for one incident: newest notes first, plus a composer.
+ *
+ * Deliberately inside the inspector rather than a modal. The operator is reading
+ * the row they are annotating — a modal would cover it, and notes are usually
+ * written *about* something visible on screen.
+ *
+ * The character limit is enforced three times on purpose: `maxLength` stops the
+ * keystroke, the counter tells the operator how much room is left, and the SERVER
+ * enforces it again (`MAX_JOURNAL_LEN`) because a client-side limit is a
+ * convenience, never a control.
+ */
+function JournalView({ journal, onBack }) {
+  const [text, setText] = useState('');
+  const { key, entries = [], loading, error, onAdd, operatorName, setOperatorName } = journal || {};
+
+  return (
+    <div className="journal">
+      {/* Signed notes only. A note attributed to "anonymous" is not an audit
+          trail, and making it a prerequisite once is cheaper than a name field on
+          every note — which people stop filling in. Not authentication: this
+          records who CLAIMED the note, exactly like the ack's `by`. */}
+      {!operatorName ? (
+        <div className="journal-signature">
+          <label htmlFor="journal-operator">Sign notes as</label>
+          <input
+            id="journal-operator"
+            className="journal-name"
+            placeholder="your name"
+            maxLength={64}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && e.currentTarget.value.trim()) {
+                setOperatorName?.(e.currentTarget.value);
+              }
+            }}
+            onBlur={(e) => { if (e.currentTarget.value.trim()) setOperatorName?.(e.currentTarget.value); }}
+          />
+          <span className="dim">press Enter</span>
+        </div>
+      ) : null}
+      <div className="journal-compose">
+        <textarea
+          className="journal-input"
+          value={text}
+          onChange={(e) => setText(e.target.value.slice(0, JOURNAL_MAX_CHARS))}
+          placeholder="Add a note about this incident…"
+          maxLength={JOURNAL_MAX_CHARS}
+          rows={3}
+          aria-label="New journal note"
+          // Ctrl/Cmd+Enter submits, because Enter must stay a newline: notes are
+          // often pasted multi-line text and a form that submits on Enter mangles
+          // them the first time someone tries.
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              if (text.trim() && onAdd?.(text)) setText('');
+            }
+          }}
+        />
+        <div className="journal-compose-actions">
+          <span className={text.length > JOURNAL_MAX_CHARS * 0.9
+            ? 'journal-counter journal-counter-warn' : 'journal-counter'}>
+            {text.length}/{JOURNAL_MAX_CHARS}
+          </span>
+          <button
+            className="inspector-action journal-save"
+            disabled={!text.trim() || !onAdd || !operatorName}
+            onClick={() => { if (onAdd?.(text)) setText(''); }}
+            title={operatorName
+              ? 'Save this note (Ctrl/Cmd+Enter)'
+              : 'Set your name above first — a note nobody is willing to sign is not a journal'}
+          >
+            Add note
+          </button>
+        </div>
+      </div>
+
+      {error ? <p className="error">{error}</p> : null}
+
+      {loading && entries.length === 0 ? (
+        <p className="dim">Loading notes…</p>
+      ) : entries.length === 0 ? (
+        <p className="dim">No notes yet for {key}.</p>
+      ) : (
+        <ul className="journal-list">
+          {entries.map((e) => (
+            <li key={e.id} className={e.pending ? 'journal-entry journal-pending' : 'journal-entry'}>
+              <div className="journal-meta">
+                <strong>{e.by}</strong>
+                <span>{formatClock(e.at)}</span>
+                {e.pending ? <span className="journal-saving">saving…</span> : null}
+              </div>
+              {/* Plain text, never HTML. React escapes it by default and that is
+                  exactly what is wanted: a note is arbitrary operator input, and
+                  rendering it as markup would let one operator inject content into
+                  another operator's panel. */}
+              <div className="journal-text">{e.text}</div>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -1566,8 +1812,9 @@ function App() {
   const {
     status, events, alerts, acks, notice, acknowledge, bulk, deleteEvent,
     loadClosed, closed, loadAllEvents, allEvents, dbUp,
+    journals, loadJournal, addJournalEntry,
   } = useSocket(config);
-  const { themePreference, darkMode, rowColor, setTheme, setRowColor } = usePreferences();
+  const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
   // Which tab is showing. Persisted as a workspace preference, in the same spirit
   // as the theme: reopening the app should land where the operator left off.
   const [tab, setTabState] = useState(() => {
@@ -1678,8 +1925,13 @@ function App() {
   if (!paused) frozenRef.current = events;
   const shownEvents = paused && frozenRef.current ? frozenRef.current : events;
 
-  const openInspector = useCallback((e, record, title, actions = []) => {
+  const openInspector = useCallback((e, record, title, actions = [], journalKey = null) => {
     e.preventDefault();
+    // Opening the journal panel is a READ, so it is issued here rather than on the
+    // submenu click: the note count is rendered on the menu item itself ("Journal
+    // (3)"), and that number has to be there before the operator commits to the
+    // click. One frame per open, not per row — the inspector only ever shows one.
+    if (journalKey) loadJournal(journalKey);
     // Open at the pointer, then let the panel reposition itself once it has been
     // measured (see the clamp effect in RecordInspector). The size lives in the
     // stylesheet ONLY: duplicating 620x560 here meant two places to keep in sync,
@@ -1688,10 +1940,15 @@ function App() {
       record,
       title,
       actions,
+      journal: journalKey
+        ? {
+          key: journalKey,
+        }
+        : null,
       x: e.clientX,
       y: e.clientY,
     });
-  }, []);
+  }, [loadJournal]);
 
   const closeInspector = useCallback(() => setInspector(null), []);
 
@@ -2008,6 +2265,10 @@ function App() {
                         // That is the "Delete does not work" report: a menu item that
                         // was clickable and had no effect.
                       ],
+                      // The journal belongs to the INCIDENT, so a multi-row selection
+                      // gets no journal: one panel cannot annotate several alerts at
+                      // once, and silently picking the first would hide the others.
+                      targets.length === 1 ? a.key : null,
                     )}
                   />
                 );
@@ -2121,6 +2382,10 @@ function App() {
                             danger: true,
                           },
                         ],
+                        // The journal is keyed on the ALERT, so an event row opens
+                        // the notes for the incident this event belongs to — which is
+                        // what an operator means by "add a note about this".
+                        e.source && e.type ? `${e.source}:${e.type}` : null,
                       )}
                     />
                   );
@@ -2283,6 +2548,7 @@ function App() {
                           danger: true,
                         },
                       ],
+                      e.source && e.type ? `${e.source}:${e.type}` : null,
                     )}
                   />
                 ))}
@@ -2448,7 +2714,28 @@ function App() {
       ) : null}
       </Box>
 
-      <RecordInspector state={inspector} onClose={closeInspector} />
+      <RecordInspector
+        state={inspector}
+        // Resolved at RENDER, not captured when the panel opened. The inspector
+        // holds a snapshot of `journal` from the open call, so an entry appended
+        // while it is open would never appear — the same stale-copy bug the Closed
+        // tab had when `loadedAt` was captured instead of derived.
+        journal={inspector?.journal
+          ? {
+            key: inspector.journal.key,
+            entries: journals.get(inspector.journal.key),
+            loading: journals.get(inspector.journal.key) === undefined,
+            operatorName,
+            setOperatorName,
+            // Built at RENDER, not when the panel opened. Capturing it in
+            // `openInspector` meant the closure held whatever `operatorName` was at
+            // open time — so setting your name inside the panel and then writing a
+            // note still stored it as "anonymous".
+            onAdd: (text) => addJournalEntry(inspector.journal.key, text, operatorName),
+          }
+          : null}
+        onClose={closeInspector}
+      />
     </ThemeProvider>
   );
 }

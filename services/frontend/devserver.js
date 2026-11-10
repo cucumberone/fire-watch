@@ -281,6 +281,18 @@ function retireMock(evt, applied) {
   openAlerts.delete(key);
 }
 
+// Journal store: alert key -> [{id,by,at,text}], newest last (the real gateway
+// stores oldest-first in a Redis list and reverses on read). Seeded so the panel
+// has something to show before anyone types anything, and so the "no notes yet"
+// state is reachable by clearing them.
+const journalMock = new Map();
+journalMock.set('core-sw-07:link.down', [
+  { id: 'seed-j1', by: 'alice', at: Date.now() - 12 * 60e3,
+    text: 'Swapped the SFP on Gi0/24. Flaps stopped for 4 minutes, watching.' },
+  { id: 'seed-j2', by: 'bob', at: Date.now() - 5 * 60e3,
+    text: 'Uplink counters clean since the swap.\nLeaving the ticket open until the 1h window closes.' },
+]);
+
 wss.on('connection', async (ws) => {
   ws.on('message', async (raw) => {
     let frameIn;
@@ -329,6 +341,54 @@ wss.on('connection', async (ws) => {
     // for a reply that never comes when developing locally.
     if (frameIn.op === 'resync') {
       ws.send(JSON.stringify({ op: 'snapshot', alerts: mockOpenAlerts() }));
+      return;
+    }
+
+    // ---- op: journal — append one note, mirroring handleJournalAppend.
+    if (frameIn.op === 'journal') {
+      const key = frameIn.key;
+      const text = typeof frameIn.text === 'string' ? frameIn.text.trim() : '';
+      if (typeof key !== 'string' || !key.includes(':')) {
+        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be source:type' }));
+        return;
+      }
+      if (text === '') {
+        ws.send(JSON.stringify({ op: 'error', code: 'empty_note', message: 'a journal entry cannot be empty' }));
+        return;
+      }
+      const entry = {
+        id: `j-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        by: typeof frameIn.by === 'string' && frameIn.by.trim() ? frameIn.by.trim() : 'anonymous',
+        at: Date.now(),
+        text: text.slice(0, 1024),
+      };
+      const list = journalMock.get(key) || [];
+      list.push(entry);
+      // Same cap as the real gateway.
+      journalMock.set(key, list.slice(-200));
+      // Echo to the writer, then broadcast; the mock has no echo guard because it
+      // does not need one — the client de-duplicates by entry id.
+      for (const client of wss.clients) {
+        if (client.readyState === client.OPEN) {
+          client.send(JSON.stringify({ op: 'journal', key, entry }));
+        }
+      }
+      return;
+    }
+
+    // ---- op: journals — bulk read, newest first, like readJournals.
+    if (frameIn.op === 'journals') {
+      const keys = Array.isArray(frameIn.keys) ? frameIn.keys : [];
+      const limit = Math.min(frameIn.limit || 50, 200);
+      const journals = keys
+        .filter((k) => typeof k === 'string' && k.includes(':'))
+        .slice(0, 200)
+        .map((key) => {
+          const all = journalMock.get(key) || [];
+          const newestFirst = [...all].reverse();
+          return { key, entries: newestFirst.slice(0, limit), truncated: all.length > limit };
+        });
+      ws.send(JSON.stringify({ op: 'journals', journals }));
       return;
     }
 

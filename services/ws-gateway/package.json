@@ -13,6 +13,7 @@
     "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
+    "amqplib": "^0.10.9",
     "ioredis": "^5.4.2",
     "ws": "^8.18.0"
   }

@@ -71,6 +71,19 @@ function safeParse(raw) {
   }
 }
 
+/**
+ * Journal list key for an alert.
+ *
+ * A separate LIST, deliberately not fields on `fw:alert:{key}`. The worker's fold
+ * owns that hash and rewrites it atomically; a second writer HSET-ing journal
+ * entries into it would race the fold and leave state that disagrees with itself —
+ * the same reason `count` is off limits to operators. Mirrors the same shape as
+ * `keys.alert()` so the two are obviously related but obviously different.
+ */
+export function journalKey(alertKey) {
+  return `fw:journal:${alertKey}`;
+}
+
 export class DragonflyReader {
   constructor(cfg, log) {
     this.cfg = cfg;
@@ -805,6 +818,93 @@ export class DragonflyReader {
   async publish(channel, payload) {
     const c = await this.connect();
     return c.publish(channel, payload);
+  }
+
+  /**
+   * Append one journal entry and return the stored entry.
+   *
+   * An APPEND, never a SET. Two operators annotating the same incident must both
+   * keep their text; last-write-wins on a single field would erase the first note
+   * with no trace that it ever existed, which is precisely the lost update this
+   * codebase already had to fix for `count` and for the ack.
+   *
+   * The list is trimmed to MAX_JOURNAL_ENTRIES on every append rather than on a
+   * timer: a timer cannot know which incidents are active and would walk every key
+   * forever. The TTL is refreshed on each append so a journal expires with the alert
+   * it belongs to instead of outliving it as an orphan list.
+   *
+   * @returns {Promise<{entry:{id:string,by:string,at:number,text:string}, count:number, truncated:boolean}>}
+   */
+  async appendJournal(key, entry, ttlMs, maxEntries) {
+    const hashKey = journalKey(key);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const c = await this.connect();
+      try {
+        const pipe = c.multi()
+          .rpush(hashKey, JSON.stringify(entry))
+          // Keep only the newest `maxEntries`. LTRIM takes inclusive start/stop, so
+          // -maxEntries..-1 keeps the tail; a negative start larger than the list
+          // is clamped by Redis, which is what makes this safe on a short list.
+          .ltrim(hashKey, -maxEntries, -1)
+          .lrange(hashKey, -maxEntries, -1)
+          .pexpire(hashKey, ttlMs);
+        const res = await pipe.exec();
+        // ioredis returns [err, value] pairs; a per-command error must not be
+        // silently treated as success, which is how the closed-list pipeline bug
+        // produced an opaque failure.
+        for (const [err] of res) {
+          if (err) throw err;
+        }
+        const raw = res[2][1] || [];
+        const stored = [];
+        for (const line of raw) {
+          try { stored.push(JSON.parse(line)); } catch { /* skip a corrupt entry */ }
+        }
+        return {
+          entry,
+          count: stored.length,
+          // `truncated` means entries were dropped to stay in the cap. Only true
+          // when the list is exactly at the cap, since that is the only observable
+          // evidence from here.
+          truncated: stored.length >= maxEntries,
+        };
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');
+        if (!retryable || attempt === 1) throw err;
+        this.log.warn('journal write hit a demoted node, re-resolving master', { err: msg });
+        await this.reset();
+      }
+    }
+    throw new Error('unreachable');
+  }
+
+  /**
+   * Read the newest entries for a set of alert keys.
+   *
+   * One `LRANGE` per key in a single pipeline, bounded by the caller. Returns an
+   * entry per requested key even when the journal is empty, so a client can tell
+   * "read it and there is nothing" from "never answered" — the distinction the
+   * Closed tab needed a `loadedAt` flag for.
+   */
+  async readJournals(keys, limit) {
+    if (keys.length === 0) return [];
+    const c = await this.connect();
+    const pipe = c.pipeline();
+    for (const k of keys) pipe.lrange(journalKey(k), -limit, -1);
+    const results = await pipe.exec();
+    return keys.map((key, i) => {
+      const [err, raw] = results[i] || [];
+      if (err || !Array.isArray(raw)) return { key, entries: [], truncated: false };
+      const entries = [];
+      for (const line of raw) {
+        try { entries.push(JSON.parse(line)); } catch { /* skip a corrupt entry */ }
+      }
+      // Newest first: the wire order the table renders, so the client does not have
+      // to reverse it and two views cannot disagree about the order.
+      entries.reverse();
+      return { key, entries, truncated: entries.length >= limit };
+    });
   }
 
   async quit() {

@@ -45,6 +45,7 @@ import {
   tabBadgeCount,
   linkState,
   insertAllEvent,
+  allEventRowKey,
 } from './lib.js';
 
 const EVENT_LIMIT = 500;
@@ -2250,10 +2251,7 @@ function App() {
   // single set keyed by two different id spaces would collide on nothing while
   // making every consumer filter a mixed set.
   const alertRowKeys = useMemo(() => sortedAlerts.map((a) => a.key), [sortedAlerts]);
-  const eventRowKeys = useMemo(
-    () => allEventRows.map((e) => `${e.id}@${e.brokerTs ?? ''}`),
-    [allEventRows],
-  );
+  const eventRowKeys = useMemo(() => allEventRows.map(allEventRowKey), [allEventRows]);
   const alertsSel = useRowSelection(alertRowKeys);
   const eventsSel = useRowSelection(eventRowKeys);
   const { selected } = alertsSel;
@@ -2579,13 +2577,12 @@ function App() {
                     ?? (alertKey && alerts.has(alertKey) ? 'open' : null);
                   return (
                     <EventRow
-                      // NOT `e.id`: since the tail shows every ARRIVAL, two rows can
-                      // legitimately share an id (an absorbed repeat keeps the original
-                      // record's id). Duplicate React keys made the reconciler reuse the
-                      // wrong row, which showed MORE rows than the buffer held and in
-                      // the wrong order. The arrival is identified by id plus its
-                      // broker timestamp.
-                      key={`${e.id}@${e.brokerTs ?? ''}`}
+                      // The LIVE TAIL keys on the ARRIVAL, so two deliveries of
+                      // one record are told apart by `brokerTs`. `allEventRowKey`
+                      // is the same composition All events uses — one helper
+                      // rather than three copies, which is how `id` here and `key`
+                      // there drifted apart in the first place.
+                      key={allEventRowKey(e)}
                       evt={liveState === e.alertState ? e : { ...e, alertState: liveState }}
                       // No onContextMenu: the live tail is a DIAGNOSTIC view, not a
                       // working surface. Every action on it — ack, close, delete,
@@ -2748,7 +2745,7 @@ function App() {
                 rows={allEventRows.map((e) => {
                   // Same key the selection set uses, so a row and its selection
                   // entry cannot describe different records.
-                  const rowKey = `${e.id}@${e.brokerTs ?? ''}`;
+                  const rowKey = allEventRowKey(e);
                   const isSelected = eventsSel.selected.has(rowKey);
                   // Right-clicking inside a multi-row selection acts on the whole
                   // selection: otherwise the menu would contradict what the board
@@ -2756,8 +2753,23 @@ function App() {
                   const targets = isSelected && eventsSel.liveKeys.length > 1
                     ? eventsSel.liveKeys
                     : [rowKey];
+                  // A record key, NOT a message id.
+                  //
+                  // `op: delete` addresses `event:<key>` — one record per
+                  // CONDITION — so the gateway validates the id as a 32-hex record
+                  // key and rejects anything else with `bad_id`. A live row carries
+                  // BOTH: `id` is the message id the producer sent and `key` is the
+                  // record. Forwarding `id` therefore failed for every row that had
+                  // not been re-read from a query, which is every row in a session
+                  // that started from the live tail.
+                  //
+                  // Falling back to `id` keeps a row from an older worker (no `key`
+                  // field) from becoming undeletable.
                   const ids = targets
-                    .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k)?.id)
+                    .map((k) => {
+                      const row = allEventRows.find((x) => allEventRowKey(x) === k);
+                      return row?.key ?? row?.id;
+                    })
                     .filter(Boolean);
                   // Events selected -> the distinct alerts they belong to.
                   //
@@ -2768,7 +2780,7 @@ function App() {
                   // Close label now states the collapse explicitly rather than leaving
                   // the operator to reconcile two counts.
                   const selectedEvents = targets
-                    .map((k) => allEventRows.find((x) => `${x.id}@${x.brokerTs ?? ''}` === k))
+                    .map((k) => allEventRows.find((x) => allEventRowKey(x) === k))
                     .filter(Boolean);
                   const alertKeys = [...new Set(
                     selectedEvents

@@ -556,24 +556,59 @@ export function insertEvent(list, evt, limit) {
 }
 
 /**
+ * Stable React key for one All-events row.
+ *
+ * Built from the RECORD KEY plus the arrival timestamp, and it MUST be built the
+ * same way everywhere a row is looked up by key — the selection list, the row's
+ * `key` prop, and the lookup in the right-click handler.
+ *
+ * Why not `id`: a live row's `id` is the producer's MESSAGE id while a queried
+ * row's `id` is the record key (the gateway sets `id === key` when it reads the
+ * hash). Using `id` therefore produced two different keys for one record depending
+ * on how the row arrived, so selecting a row and then acting on it could fail to
+ * find the row it had just selected.
+ *
+ * The arrival timestamp stays in the key because two DIFFERENT records can share a
+ * `brokerTs` (two conditions reported in the same millisecond) and React requires
+ * unique keys. Falling back to `id` keeps rows from an older worker selectable.
+ */
+export function allEventRowKey(evt) {
+  if (!evt) return '';
+  return `${evt.key ?? evt.id}@${evt.brokerTs ?? ''}`;
+}
+
+/**
  * Append a live event to the All Events list.
  *
- * De-duplicates on `id` ALONE, unlike `insertEvent`. The two lists answer
+ * De-duplicates on the RECORD KEY, not the message id. The two lists answer
  * different questions:
  *
- *   Live events  — "what arrived", so an absorbed repeat is a distinct row
- *                  (same id, new arrival time) and belongs on screen.
- *   All events   — "what is stored", which is one record per id in
- *                  `event:<key>`. A repeat the worker folded in never
- *                  stored, so adding it would invent a row the tab's own
- *                  query would never return.
+ *   Live events  — "what arrived", so a repeat is a distinct row (same content,
+ *                  new message id and arrival time) and belongs on screen.
+ *   All events   — "what is STORED", which is one record per CONDITION. Two
+ *                  arrivals of the same condition are one row here, because the
+ *                  query behind this tab returns one row for them.
  *
- * Sorting is by brokerTs like the query's ZREVRANGE order, but the list is kept
- * ascending and the table renders it newest-first, so the two agree.
+ * WHY `key` AND NOT `id`. Those two identities are NOT the same object any more:
+ *
+ *   a queried row  (gateway `_row()`)        has  id === key === <32-hex>
+ *   a live row     (worker's `op: event`)    has  id === <message id>   and
+ *                                                 key === <32-hex>
+ *
+ * De-duplicating on `id` therefore failed to collapse the two, so every record
+ * that arrived live AND was later returned by a query appeared TWICE — once with
+ * a message id and once with the record key. The same mismatch made the React row
+ * keys disagree, so the two copies rendered as separate rows rather than being
+ * reconciled.
+ *
+ * Falling back to `id` keeps a frame from an older worker (which publishes no
+ * `key`) from being dropped entirely.
  */
 export function insertAllEvent(list, evt, limit) {
-  if (!evt?.id) return list;
-  if (list.some((e) => e.id === evt.id)) return list;
+  const identity = (e) => e?.key ?? e?.id;
+  const incoming = identity(evt);
+  if (!incoming) return list;
+  if (list.some((e) => identity(e) === incoming)) return list;
   const next = [...list, evt];
   next.sort((a, b) => (a.brokerTs ?? 0) - (b.brokerTs ?? 0));
   return next.length > limit ? next.slice(next.length - limit) : next;

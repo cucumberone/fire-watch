@@ -13,6 +13,7 @@ import {
   applyAlert,
   insertEvent,
   insertAllEvent,
+  allEventRowKey,
   backoffDelay,
   isRetirement,
   resolveTheme,
@@ -244,15 +245,63 @@ test('insertEvent trims to the limit, keeping the newest', () => {
 });
 
 // ------------------------------------------------------------- all-events list
-test('insertAllEvent de-duplicates on id alone', () => {
-  // The All Events tab is "what is stored", and storage is ONE record per id in
-  // event:<key>. A second arrival of the same id is a folded repeat that was
-  // never stored, so it must not appear — even though its brokerTs differs, which
-  // is exactly what makes insertEvent accept it.
-  let list = insertAllEvent([], { id: 'p1', brokerTs: 1000 }, 10);
-  list = insertAllEvent(list, { id: 'p1', brokerTs: 2000 }, 10);
+test('insertAllEvent de-duplicates on the RECORD KEY, not the message id', () => {
+  // The All Events tab is "what is STORED", and storage is ONE record per
+  // CONDITION. Two arrivals of the same condition — different message ids, same
+  // record key — are one row here, because the query behind this tab returns one
+  // row for them. Keeping both would make the list disagree with its own query.
+  const KEY = 'a'.repeat(32);
+  let list = insertAllEvent([], { id: 'msg-1', key: KEY, brokerTs: 1000 }, 10);
+  list = insertAllEvent(list, { id: 'msg-2', key: KEY, brokerTs: 2000 }, 10);
   assert.equal(list.length, 1);
   assert.equal(list[0].brokerTs, 1000);
+});
+
+test('a live row and a queried row for one record collapse to ONE row', () => {
+  // THE BUG THIS PINS. The two sources carry different identities for the same
+  // record:
+  //
+  //   a queried row (gateway _row())     id === key === <32-hex>
+  //   a live row    (worker op: event)   id === <message id>, key === <32-hex>
+  //
+  // De-duplicating on `id` therefore failed to collapse them, so any record that
+  // arrived live and was later returned by an `op: allEvents` query appeared
+  // TWICE — once with a message id, once with the record key.
+  const KEY = 'b'.repeat(32);
+  const queried = { id: KEY, key: KEY, brokerTs: 1000 };
+  const live = { id: 'mwdsycxk-0002-mcgau7', key: KEY, brokerTs: 1000 };
+  const list = insertAllEvent([queried], live, 10);
+  assert.equal(list.length, 1, 'one record, one row, whichever way it arrived');
+});
+
+test('a frame from an older worker with no key still de-duplicates on id', () => {
+  // Rolling update: an older worker publishes no `key`. Falling back to `id` keeps
+  // such a frame from adding a duplicate row on every redelivery.
+  let list = insertAllEvent([], { id: 'old-1', brokerTs: 1000 }, 10);
+  list = insertAllEvent(list, { id: 'old-1', brokerTs: 2000 }, 10);
+  assert.equal(list.length, 1);
+});
+
+test('allEventRowKey uses the record key, so every row lookup agrees', () => {
+  // The selection list, the React key and the right-click lookup all build this
+  // string. When they were three copies (`id` in one place, `key` in another) a
+  // freshly-selected live row could not be found again, so Delete acted on
+  // nothing.
+  const KEY = 'c'.repeat(32);
+  const live = { id: 'msg-1', key: KEY, brokerTs: 1000 };
+  const queried = { id: KEY, key: KEY, brokerTs: 1000 };
+  assert.equal(allEventRowKey(live), allEventRowKey(queried));
+  assert.equal(allEventRowKey(live), `${KEY}@1000`);
+  // An older frame with no `key` still produces a usable, unique key.
+  assert.equal(allEventRowKey({ id: 'old-1', brokerTs: 5 }), 'old-1@5');
+});
+
+test('allEventRowKey keeps same-millisecond records distinct', () => {
+  // Two conditions reported in the same millisecond share brokerTs. React needs
+  // unique keys, so the record key has to stay in the composition.
+  const a = { key: 'a'.repeat(32), brokerTs: 1000 };
+  const b = { key: 'b'.repeat(32), brokerTs: 1000 };
+  assert.notEqual(allEventRowKey(a), allEventRowKey(b));
 });
 
 test('insertAllEvent keeps the list sorted and trims the oldest', () => {

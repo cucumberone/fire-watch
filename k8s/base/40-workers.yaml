@@ -95,6 +95,11 @@ spec:
 
             # ---- behaviour ----------------------------------------------
             - { name: FW_EVENT_TTL,            value: "604800" }
+            # Retention for the per-ARRIVAL audit trail (docs/history.md). Three
+            # days, deliberately shorter than the record TTL: history is one hash
+            # per DELIVERY, so at storm rate three days of it outweighs a week of
+            # records. Its index is pruned on THIS window, not the record's.
+            - { name: FW_HISTORY_TTL,          value: "259200" }
             - { name: FW_INDEX_PRUNE_EVERY,    value: "1000" }
             # Repair idx:event:all against the per-source indexes at startup.
             # Records written before that index existed are in storage and absent

@@ -43,6 +43,14 @@ export function loadConfig() {
     // ---- behaviour
     eventTtl: int('FW_EVENT_TTL', 604800),
     indexPruneEvery: int('FW_INDEX_PRUNE_EVERY', 1000),
+    // Retention for the per-ARRIVAL audit trail (docs/history.md).
+    //
+    // Deliberately much shorter than the 7-day record TTL. The record is one hash
+    // per CONDITION and is the thing operators work from; history is one hash per
+    // DELIVERY and exists to answer "what did we actually receive, and when". A
+    // storm at 500/s would make three days of it larger than a week of records, so
+    // it gets its own, shorter window.
+    historyTtl: int('FW_HISTORY_TTL', 259200),
     // Reconcile idx:event:all against the per-source indexes at startup.
     //
     // Exists because events written before the global index existed were stored but
@@ -115,6 +123,25 @@ export const keys = {
 
   /** Per-device timeline: bare key -> last broker timestamp. */
   sourceIndex: (source) => `idx:source:${source}`,
+
+  /**
+   * One audit record per DELIVERY — the immutable history.
+   *
+   * `hist:<record key>|<arrival id>` is a hash of the facts as they arrived: id,
+   * device, type, severity, summary, payload, broker timestamp and the fold's
+   * verdict. It carries NO state: no count, no ack, no closedBy. That is the point
+   * — a condition's record is updated in place, so the only way to see that it
+   * fired 400 times in an hour is a log written once per delivery.
+   *
+   * The member is compound (`<bareKey>|<id>`) rather than the bare id because the
+   * two zsets answer different questions: the record index is keyed by CONDITION,
+   * this one by ARRIVAL, and two conditions receiving the same message id must not
+   * overwrite each other's audit row.
+   */
+  history: (bareKey, arrivalId) => `hist:${bareKey}|${arrivalId}`,
+
+  /** History index: `<bareKey>|<id>` -> broker timestamp. Backs the History tab. */
+  historyIndex: 'idx:history',
 
   channelEvents: 'fw:ch:events',
   channelAlerts: 'fw:ch:alerts',

@@ -20,6 +20,14 @@ import assert from 'node:assert/strict';
 import { ValkeyReader, journalKey } from './valkey.js';
 
 const log = { info() {}, warn() {}, debug() {}, error() {} };
+
+// HISTORY_FIELDS order: source, type, severity, displaySeverity, msg, payload,
+// brokerTs, applied.
+const HISTORY_VALUES = [
+  'shop', 'check-001', 'CRITICAL', 'MAJOR', 'disk almost full',
+  JSON.stringify({ msg: 'disk almost full' }), '1000', '1',
+];
+const HISTORY_EMPTY = ['', '', '', '', '', '', '', ''];
 const cfg = { valkeyPassword: 'p', alertTtlMs: 1000, sentinels: [] };
 
 /** A reader whose connection is a hand-rolled client. */
@@ -149,6 +157,57 @@ test('readClosedAlerts reads the closed index, newest first', async () => {
   assert.equal(rows[0].alertState, 'closed');
   assert.equal(rows[0].alertClosedAt, 3000);
   assert.equal(rows[0].alertClosedBy, 'alice');
+});
+
+test('readHistory reads idx:history and splits the arrival member', async () => {
+  // The difference from readAllEvents is the whole point: this is one member per
+  // DELIVERY, so a condition that fired twice yields two rows.
+  const member = `${KEY}|evt-1`;
+  const client = {
+    async zrevrangebyscore(key, max, min) {
+      assert.equal(key, 'idx:history');
+      assert.equal(max, '+inf'.replace('+inf', String(max)));
+      assert.ok(min.startsWith('('), 'sinceMs is exclusive');
+      return [member];
+    },
+    async zcount(key) { assert.equal(key, 'idx:history'); return 9; },
+    pipeline() {
+      const q = [];
+      const p = {
+        hmget(k, ...f) { q.push([k, f]); return p; },
+        async exec() {
+          return q.map(([k]) => [null, HISTORY_VALUES]);
+        },
+      };
+      return p;
+    },
+  };
+  const { rows, total } = await readerWith(client).readHistory({ sinceMs: 1000, limit: 10 });
+  assert.equal(total, 9, 'the badge is the WINDOW total, not the page size');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].key, KEY, 'the condition key is recovered from the member');
+  assert.equal(rows[0].arrivalId, 'evt-1', 'and so is the arrival');
+  assert.equal(rows[0].applied, 1);
+  assert.equal(rows[0].summary, 'disk almost full');
+  assert.equal(rows[0].count, undefined, 'an audit row carries no state');
+  assert.equal(rows[0].alertState, undefined, 'nor a joined alert state');
+});
+
+test('readHistory skips a member whose hash already expired', async () => {
+  const client = {
+    async zrevrangebyscore() { return [`${KEY}|gone`]; },
+    async zcount() { return 1; },
+    pipeline() {
+      const p = {
+        hmget() { return p; },
+        async exec() { return [[null, HISTORY_EMPTY]]; },
+      };
+      return p;
+    },
+  };
+  const { rows, total } = await readerWith(client).readHistory({});
+  assert.deepEqual(rows, [], 'an expired hash must not become a blank row');
+  assert.equal(total, 1);
 });
 
 test('readEvent does not require the record to be open', async () => {
@@ -348,7 +407,7 @@ test('every method index.js calls exists on the reader', () => {
   const used = [
     'ackAlert', 'appendJournal', 'closeAlert', 'deleteEvent', 'isSubscribed',
     'ping', 'publish', 'quit', 'readAcks', 'readAlert', 'readAllEvents',
-    'readClosedAlerts', 'readEvent', 'readEvents', 'readIndex',
+    'readClosedAlerts', 'readEvent', 'readEvents', 'readHistory', 'readIndex',
     'readIndexRange', 'readJournals', 'readOpenAlerts', 'subscribe',
   ];
   const r = new ValkeyReader(cfg, log);

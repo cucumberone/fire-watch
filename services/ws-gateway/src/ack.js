@@ -267,6 +267,76 @@ export const ALL_EVENTS_RANGES = {
 export const MAX_ALL_EVENTS_LIMIT = 1000;
 
 /**
+ * Ranges offered by the History tab.
+ *
+ * Capped at THREE DAYS because that is the audit retention (`FW_HISTORY_TTL`).
+ * Offering `7d` here would be offering a window whose older half cannot exist, and
+ * the badge would then report fewer rows than the label promises for a reason the
+ * operator cannot see.
+ */
+export const HISTORY_RANGES = {
+  '15m': 15 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '3d': 3 * 24 * 60 * 60 * 1000,
+};
+
+/** Default page size for History. A page, not the window — `total` says that. */
+export const MAX_HISTORY_LIMIT = 1000;
+
+/**
+ * Validate `{"op":"history"}`.
+ *
+ * Same contract as `validateAllEventsQuery`: an unknown `range` falls back to the
+ * default rather than erroring (the tab only ever sends a known value, and a stray
+ * one must not blank the table), `limit` is clamped because a client asking for
+ * more wants what exists, and a non-numeric value IS rejected because that is a bug
+ * rather than an over-ask.
+ *
+ * `key` optionally narrows to one condition's deliveries — the question "show me
+ * every time this particular incident fired", which is the main reason to open the
+ * audit trail at all.
+ */
+export function validateHistoryQuery(frame, { maxLimit = MAX_HISTORY_LIMIT, now = Date.now() } = {}) {
+  if (!frame || frame.op !== 'history') {
+    return { ok: false, code: 'bad_op', message: 'expected {"op":"history"}' };
+  }
+
+  const range = typeof frame.range === 'string' && HISTORY_RANGES[frame.range]
+    ? frame.range
+    : '24h';
+
+  let limit = maxLimit;
+  if (frame.limit !== undefined) {
+    if (!Number.isFinite(frame.limit)) {
+      return { ok: false, code: 'bad_limit', message: 'limit must be a number' };
+    }
+    limit = Math.max(1, Math.min(maxLimit, Math.floor(frame.limit)));
+  }
+
+  // `key` is a record key (32 hex). Anything else is rejected rather than ignored:
+  // silently returning the unfiltered window would show an operator rows that do
+  // not belong to the incident they asked about.
+  let key = null;
+  if (frame.key !== undefined) {
+    if (typeof frame.key !== 'string' || !/^[0-9a-f]{32}$/.test(frame.key)) {
+      return { ok: false, code: 'bad_key', message: 'key must be 32 lowercase hex characters' };
+    }
+    key = frame.key;
+  }
+
+  return {
+    ok: true,
+    range,
+    limit,
+    key,
+    sinceMs: now - HISTORY_RANGES[range],
+    untilMs: now,
+  };
+}
+
+/**
  * Validate `{"op":"allEvents"}`.
  *
  * `range` is one of the preset keys; anything else falls back to `24h` rather than

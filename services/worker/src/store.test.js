@@ -51,6 +51,18 @@ function makeValkey() {
           const arrivalId = String(argv[1]);
           const sev = String(argv[2]);
 
+          const historyKey = keys[5];
+          const historyIndex = keys[6];
+          // Mirror the script: the index member is the BARE `<key>|<id>`.
+          await this.zadd(historyIndex, ts, `${recordKey.replace(/^event:/, '')}|${arrivalId}`);
+
+          // The audit row is written BEFORE the guard, exactly as the real script
+          // does: a redelivery is an arrival too, and "did the broker deliver this
+          // twice" is a question the trail must be able to answer.
+          const fields = {};
+          for (let i = 7; i + 1 < argv.length; i += 2) fields[argv[i]] = argv[i + 1];
+          hashSet(historyKey, { applied: '0', brokerTs: argv[0], ...fields });
+
           const wmTs = Number(hashGet(recordKey, 'watermark') ?? 0);
           const wmId = String(hashGet(recordKey, 'watermarkId') ?? '');
           if (ts < wmTs || (ts === wmTs && arrivalId <= wmId)) return 0;
@@ -62,8 +74,6 @@ function makeValkey() {
           // real script does: a retirement can arrive for a condition with no
           // stored record yet, and it must still store `msg`, `source` and
           // `payload` or the retired set renders blanks.
-          const fields = {};
-          for (let i = 6; i + 1 < argv.length; i += 2) fields[argv[i]] = argv[i + 1];
           if (Object.keys(fields).length > 0) hashSet(recordKey, fields);
 
           if (sev === 'CLOSE' || sev === 'HARMLESS') {
@@ -78,6 +88,7 @@ function makeValkey() {
             });
             store.get(recordKey).delete('ackedBy');
             store.get(recordKey).delete('ackedAt');
+            hashSet(historyKey, { applied: '3' });
             return 3;
           }
 
@@ -102,6 +113,7 @@ function makeValkey() {
             store.get(recordKey).delete('closedBy');
             store.get(recordKey).delete('closedAt');
           }
+          hashSet(historyKey, { applied: '1' });
           return 1;
         },
         async zadd(key, score, member) {
@@ -142,7 +154,7 @@ function makeValkey() {
 
 const fold = { get: () => '-- fake fold script' };
 const log = { info() {}, warn() {}, debug() {}, error() {} };
-const cfg = { eventTtl: 604800 };
+const cfg = { eventTtl: 604800, historyTtl: 259200 };
 
 const silent = {
   id: 'evt-1',
@@ -211,8 +223,16 @@ test('the first delivery writes one record, both timelines and one fold call', a
   });
 
   assert.equal(res.applied, 1);
-  assert.equal(valkey.calls.eval.length, 1, 'record + indexes + rollup are ONE call');
-  assert.equal(valkey.calls.eval[0].numKeys, 5, 'five keys: record, timeline, open, closed, source');
+  assert.equal(valkey.calls.eval.length, 1, 'record + indexes + rollup + audit are ONE call');
+  assert.equal(valkey.calls.eval[0].numKeys, 7,
+    'seven keys: record, timeline, open, closed, source, audit row, audit index');
+  // The audit row exists and is keyed by ARRIVAL, not by condition.
+  const auditKey = `hist:${bareKeyFor(silent)}|${silent.id}`;
+  const a = valkey.store.get(auditKey);
+  assert.ok(a, 'one audit hash per delivery');
+  assert.equal(a.get('applied'), '1', 'the fold verdict is recorded on the audit row');
+  assert.equal(a.get('msg'), 'disk almost full', 'the audit row carries the arrival payload');
+  assert.equal(a.get('count'), undefined, 'NO state is copied into the audit row');
 
   const bare = bareKeyFor(silent);
   const h = valkey.store.get(`event:${bare}`);
@@ -231,13 +251,42 @@ test('a repeat of the same condition updates the SAME record and creates no seco
   const second = await persistEvent({ ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000 });
 
   assert.equal(second.applied, 1, 'an occurrence, not a duplicate');
-  assert.equal(valkey.store.size, 1, 'exactly one record — the duplicate was folded in');
 
-  const h = valkey.store.get(`event:${bareKeyFor(silent)}`);
+  const bare = bareKeyFor(silent);
+  const recordKeys = [...valkey.store.keys()].filter((k) => k === `event:${bare}`);
+  assert.equal(recordKeys.length, 1, 'exactly one RECORD — the duplicate was folded in');
+  // Two ARRIVALS though, so two audit rows: that is the whole point of the trail.
+  const auditKeys = [...valkey.store.keys()].filter((k) => k.startsWith(`hist:${bare}|`));
+  assert.deepEqual(auditKeys.sort(), [`hist:${bare}|evt-1`, `hist:${bare}|evt-2`],
+    'one immutable audit row per delivery, both kept');
+
+  const h = valkey.store.get(`event:${bare}`);
   assert.equal(h.get('count'), '2', 'the count moved');
   assert.equal(h.get('lastSeen'), '2000', 'last occurrence moved');
   assert.equal(h.get('firstSeen'), '1000', 'first occurrence did NOT move');
   assert.equal(h.get('lastId'), 'evt-2', 'the newest arrival id is recorded');
+});
+
+test('a redelivery is recorded in the audit trail but changes no state', async () => {
+  // "Did the broker deliver this twice" is exactly what an audit trail is for, so a
+  // rejected arrival must still leave a row — while the RECORD refuses the write.
+  const valkey = makeValkey();
+  const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
+  await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000 });
+  const again = await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000 });
+
+  assert.equal(again.applied, 0, 'the record refuses a redelivery');
+
+  const bare = bareKeyFor(silent);
+  const h = valkey.store.get(`event:${bare}`);
+  assert.equal(h.get('count'), '1', 'the count did not move');
+
+  // The second delivery reuses the same (key, id), so the audit row is the same
+  // hash — overwritten, not duplicated. That is correct: it is one ARRIVAL seen
+  // twice, and it now records that the second sighting was rejected.
+  const audit = valkey.store.get(`hist:${bare}|dup`);
+  assert.ok(audit, 'the arrival is on record');
+  assert.equal(audit.get('applied'), '0', 'and the verdict says it changed nothing');
 });
 
 test('a redelivery of the same message is dropped without touching anything', async () => {

@@ -345,7 +345,27 @@ stay, because `idx:event:closed` is the only bounded way to enumerate retirement
 — the alternative is the `SCAN` this design forbids everywhere — and
 `scripts/verify-close.sh` uses the index to assert the fold's close path.
 
-### 3.6 `op: allEvents` — the raw log, windowed
+### 3.6 `op: history` — the per-delivery audit trail
+
+One row per ARRIVAL rather than per condition, read from `idx:history`. It answers
+what no other op can, because `idx:event:all` holds one member per condition and the
+record is updated in place: how many times something fired, whether a delivery was
+rejected as a duplicate, and what the source sent at a specific moment.
+
+```json
+{"op":"history","range":"24h"}
+{"op":"history","range":"1h","key":"<32-hex>","limit":500}
+{"op":"history","events":[ … ],"total":128,"range":"24h","truncated":false,"sinceMs":…}
+```
+
+Ranges stop at `3d` because that is the audit retention. `key` narrows to one
+condition and is REJECTED when malformed rather than ignored — silently returning
+the whole window would show rows that do not belong to the incident asked about.
+`total` is a `ZCOUNT`, so the badge reports the window and not the page.
+
+Full detail: [history.md](history.md).
+
+### 3.7 `op: allEvents` — the raw log, windowed
 
 ```json
 {"op":"allEvents","range":"24h"}

@@ -49,6 +49,23 @@ const SNAPSHOT_FIELDS = [
   'state', 'closedAt', 'closedBy', 'ackedBy', 'ackedAt',
 ];
 
+/**
+ * Fields of an AUDIT row (`hist:<key>|<id>`).
+ *
+ * Deliberately a different, smaller set than SNAPSHOT_FIELDS, and the omissions are
+ * the design: no `count`, no `firstSeen`/`lastSeen`, no `state`, no ack, no
+ * `closedBy`. Those describe the CONDITION at read time; an audit row describes ONE
+ * DELIVERY. Reading them here would either be blank (nothing writes them) or, worse,
+ * a stale copy competing with the record it belongs to.
+ *
+ * `applied` is the fold's verdict (0 rejected, 1 occurrence, 3 retirement), which is
+ * what makes a history row explain WHY it did or did not change anything.
+ */
+const HISTORY_FIELDS = [
+  'source', 'type', 'severity', 'displaySeverity', 'msg', 'payload',
+  'brokerTs', 'applied',
+];
+
 const SNAPSHOT_LUA = `
   local out = {}
   local n = ${SNAPSHOT_FIELDS.length}
@@ -335,6 +352,100 @@ export class ValkeyReader {
     if (keys.length === 0) return { events: [], total };
 
     return { events: await this.readRecords(keys), total };
+  }
+
+  /**
+   * Read AUDIT rows from the history index, newest first.
+   *
+   * Backs the History tab. Distinct from `readAllEvents` on purpose, and the
+   * difference is the whole reason the trail exists:
+   *
+   *   `readAllEvents` reads `idx:event:all`, which is one member per CONDITION —
+   *   the record was updated in place, so it shows the LAST time a condition fired
+   *   and its total count, never the individual deliveries.
+   *
+   *   this reads `idx:history`, one member per DELIVERY, each with its own hash.
+   *   "Did this fire 400 times between 02:00 and 03:00" is answerable here and
+   *   nowhere else.
+   *
+   * Members are `<bareKey>|<arrivalId>`, so the key has to be split to recover the
+   * condition a row belongs to.
+   *
+   * @returns {Promise<{rows: object[], total: number}>}
+   *   `total` is the WINDOW count, not the page size — the badge needs the former.
+   */
+  async readHistory({ sinceMs = 0, untilMs = Date.now(), limit = 500 } = {}) {
+    const c = await this.connect();
+    const lo = Math.max(0, sinceMs);
+
+    const members = await c.zrevrangebyscore(
+      'idx:history',
+      String(untilMs),
+      `(${lo}`,
+      'LIMIT', 0, Math.max(1, limit),
+    );
+
+    const total = await c.zcount('idx:history', `(${lo}`, String(untilMs));
+    if (members.length === 0) return { rows: [], total };
+
+    const out = [];
+    const CHUNK = 256;
+    for (let i = 0; i < members.length; i += CHUNK) {
+      const slice = members.slice(i, i + CHUNK);
+      const pipe = c.pipeline();
+      for (const m of slice) pipe.hmget(`hist:${m}`, ...HISTORY_FIELDS);
+      // eslint-disable-next-line no-await-in-loop
+      const res = await pipe.exec();
+      res.forEach((tuple, j) => {
+        const [err, value] = tuple || [];
+        if (err || !Array.isArray(value)) return;
+        if (value.every((v) => v === null || v === '')) {
+          // The hash expired before its index member did. Skipping is correct:
+          // rendering it would invent a row with no content, and the prune will
+          // drop the member on its next pass.
+          this.log.debug('history index member has no record', { member: slice[j] });
+          return;
+        }
+        out.push(this._historyRow(slice[j], value));
+      });
+    }
+    return { rows: out, total };
+  }
+
+  /**
+   * Normalise a flat HMGET of an audit hash.
+   *
+   * `member` is `<bareKey>|<arrivalId>`. Everything a row displays comes from the
+   * hash itself; the key is only split so the row can point at the condition it
+   * belongs to (for the inspector, and to group repeats of one incident).
+   */
+  _historyRow(member, flat) {
+    const at = (name) => flat[HISTORY_FIELDS.indexOf(name)] || '';
+    const num = (name) => {
+      const v = at(name);
+      return v === '' ? null : Number(v);
+    };
+    const bar = member.indexOf('|');
+    const key = bar === -1 ? member : member.slice(0, bar);
+    const arrivalId = bar === -1 ? '' : member.slice(bar + 1);
+    return {
+      // `id` is the ARRIVAL, not the record: two rows for one condition must be
+      // distinguishable, and the live tail already identifies a row this way.
+      id: arrivalId,
+      arrivalId,
+      key,
+      source: at('source'),
+      type: at('type'),
+      severity: at('severity'),
+      displaySeverity: at('displaySeverity') || at('severity'),
+      summary: at('msg'),
+      payload: safeParse(at('payload')) || {},
+      brokerTs: num('brokerTs'),
+      applied: num('applied'),
+      // The alert STATE is deliberately absent — the audit row has none. The
+      // client joins it from the alert map it already holds, so a history row
+      // shows today's state without the trail storing a second copy of it.
+    };
   }
 
   /**

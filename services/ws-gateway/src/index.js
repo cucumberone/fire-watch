@@ -34,6 +34,7 @@ import {
   validateDelete,
   validateClosedQuery,
   validateAllEventsQuery,
+  validateHistoryQuery,
   normaliseAck,
   ackFrame,
   closeFrame,
@@ -237,6 +238,11 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'allEvents') {
       await handleAllEventsQuery(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'history') {
+      await handleHistoryQuery(conn, frame, send);
       return;
     }
 
@@ -732,6 +738,65 @@ async function handleClosedQuery(conn, frame, send) {
     // smaller than it is.
     truncated: rows.length >= verdict.limit,
     sinceMs: verdict.sinceMs,
+  }));
+}
+
+/**
+ * `{"op":"history","range":"24h"}` — every ARRIVAL in a time window.
+ *
+ * Distinct from `allEvents` in one way that matters: that op reads one member per
+ * CONDITION, because a record is updated in place. This reads one member per
+ * DELIVERY, which is the only way to answer "how many times did this actually
+ * fire", "did we receive it twice", or "what did the source send at 02:14" after
+ * the record has been overwritten.
+ *
+ * Read-only, bounded server-side, and capped at the audit retention — offering a
+ * window longer than the TTL would promise rows that cannot exist.
+ */
+async function handleHistoryQuery(conn, frame, send) {
+  const verdict = validateHistoryQuery(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  let rows;
+  let total;
+  try {
+    const res = await reader.readHistory({
+      sinceMs: verdict.sinceMs,
+      untilMs: verdict.untilMs,
+      limit: verdict.limit,
+    });
+    rows = res.rows;
+    total = res.total;
+  } catch (err) {
+    log.warn('history read failed', { err: String(err) });
+    send(JSON.stringify({ op: 'error', code: 'history_failed', message: 'could not read history' }));
+    return;
+  }
+
+  // `key` narrows the CLIENT-side view. It is applied here rather than pushed into
+  // the read because the index is scored by arrival time and members are
+  // `<key>|<id>`: a server-side prefix filter would be a full range walk per
+  // request. The window is bounded at 1000 rows, so filtering it here is cheap and
+  // keeps the read a plain ZREVRANGEBYSCORE.
+  if (verdict.key) {
+    rows = rows.filter((r) => r.key === verdict.key);
+  }
+
+  send(JSON.stringify({
+    op: 'history',
+    events: rows,
+    range: verdict.range,
+    // How many arrivals the WINDOW holds, which is not how many this reply
+    // carries. The badge needs the former, or it reports "rows I happened to
+    // fetch" — 0 before the tab is opened.
+    total: verdict.key ? rows.length : total,
+    key: verdict.key,
+    truncated: rows.length >= verdict.limit,
+    sinceMs: verdict.sinceMs,
+    untilMs: verdict.untilMs,
   }));
 }
 

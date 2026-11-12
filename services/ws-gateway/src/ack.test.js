@@ -21,6 +21,8 @@ import {
   normaliseAck,
   closeFrame,
   ackFrame,
+  validateHistoryQuery,
+  HISTORY_RANGES,
 } from './ack.js';
 
 const key = (c = 'a') => c.repeat(KEY_LEN);
@@ -120,4 +122,46 @@ test('frames are JSON with the wire key', () => {
   assert.deepEqual(JSON.parse(ackFrame(GOOD, { by: 'a', at: 1 })), {
     op: 'alert', key: GOOD, ack: { by: 'a', at: 1 },
   });
+});
+
+// ------------------------------------------------------------------- history
+test('history defaults to 24h and the max page', () => {
+  const now = 1_800_000_000_000;
+  const v = validateHistoryQuery({ op: 'history' }, { now });
+  assert.equal(v.ok, true);
+  assert.equal(v.range, '24h');
+  assert.equal(v.untilMs - v.sinceMs, 24 * 60 * 60 * 1000);
+  assert.equal(v.key, null);
+});
+
+test('history offers no range beyond the audit retention', () => {
+  // Offering `7d` would promise rows that cannot exist: the audit hashes and their
+  // index members expire at three days. Longest preset must be that.
+  const longest = Math.max(...Object.values(HISTORY_RANGES));
+  assert.equal(longest, 3 * 24 * 60 * 60 * 1000);
+});
+
+test('history falls back to 24h for an unknown range rather than erroring', () => {
+  // The tab only ever sends a known value; a stray one must not blank the table.
+  assert.equal(validateHistoryQuery({ op: 'history', range: '9y' }).range, '24h');
+});
+
+test('history clamps the limit and rejects a non-numeric one', () => {
+  assert.equal(validateHistoryQuery({ op: 'history', limit: 1e9 }).limit, 1000);
+  assert.equal(validateHistoryQuery({ op: 'history', limit: 0 }).limit, 1);
+  assert.equal(validateHistoryQuery({ op: 'history', limit: 'x' }).code, 'bad_limit');
+});
+
+test('history accepts an optional condition key and rejects a bad one', () => {
+  assert.equal(validateHistoryQuery({ op: 'history', key: GOOD }).key, GOOD);
+  // Rejected, not ignored: silently returning the whole window would show rows
+  // that do not belong to the incident the operator asked about.
+  assert.equal(validateHistoryQuery({ op: 'history', key: 'a:b' }).code, 'bad_key');
+  assert.equal(validateHistoryQuery({ op: 'history', key: 'A'.repeat(32) }).code, 'bad_key');
+  assert.equal(validateHistoryQuery({ op: 'history', key: 42 }).code, 'bad_key');
+});
+
+test('history rejects the wrong op', () => {
+  assert.equal(validateHistoryQuery({ op: 'allEvents' }).code, 'bad_op');
+  assert.equal(validateHistoryQuery(null).code, 'bad_op');
 });

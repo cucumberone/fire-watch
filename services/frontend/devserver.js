@@ -536,6 +536,53 @@ wss.on('connection', async (ws) => {
       return;
     }
 
+    // ---- op: history — the per-ARRIVAL audit trail, mirroring handleHistoryQuery.
+    //
+    // Built from the mock's own log so it agrees with the live stream. Each stored
+    // event is ONE arrival here; the real worker writes one `hist:` hash per
+    // delivery, and `applied` carries the fold's verdict for it.
+    if (frameIn.op === 'history') {
+      const RANGE_MS = { '15m': 900e3, '1h': 3600e3, '6h': 6 * 3600e3,
+                         '24h': 24 * 3600e3, '3d': 3 * 86400e3 };
+      const range = RANGE_MS[frameIn.range] ? frameIn.range : '24h';
+      const now = Date.now();
+      const since = now - RANGE_MS[range];
+      const limit = Math.min(frameIn.limit || 1000, 1000);
+      const all = [...mockEventLog.values()]
+        .filter((e) => (e.brokerTs ?? 0) > since)
+        .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
+      const rows = (frameIn.key ? all.filter((e) => e.key === frameIn.key) : all)
+        .slice(0, limit)
+        .map((e) => ({
+          id: e.id,
+          arrivalId: e.id,
+          key: e.key,
+          source: e.source,
+          type: e.type,
+          severity: e.severity,
+          displaySeverity: e.displaySeverity ?? e.severity,
+          summary: e.payload?.msg ?? '',
+          payload: e.payload ?? {},
+          brokerTs: e.brokerTs,
+          // The mock has no fold, so derive a plausible verdict: a CLOSE retires,
+          // anything else counts. Deterministically marking some rows rejected is
+          // deliberate — it is the only state that is otherwise unreachable in the
+          // harness, and a chip nobody can see is a chip nobody checks.
+          applied: e.severity === 'CLOSE' ? 3 : ((e.brokerTs ?? 0) % 7 === 0 ? 0 : 1),
+        }));
+      ws.send(JSON.stringify({
+        op: 'history',
+        events: rows,
+        total: frameIn.key ? rows.length : all.length,
+        range,
+        key: frameIn.key ?? null,
+        truncated: rows.length >= limit,
+        sinceMs: since,
+        untilMs: now,
+      }));
+      return;
+    }
+
     if (frameIn.op !== 'subscribe') return;
 
     // Backfill: honour the client's `since`, like the real gateway now does.

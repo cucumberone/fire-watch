@@ -110,27 +110,39 @@ export async function persistEvent({ valkey, evt, storedPayload, brokerTs, cfg, 
   const bareKey = bareKeyFor(evt);
   const eventKey = keys.event(bareKey);
   const ttlMs = cfg.eventTtl * 1000;
+  // The audit row's identity: the condition AND the arrival. Two conditions that
+  // receive the same message id must not share one history hash.
+  //
+  // A missing id falls back to the broker timestamp rather than to the empty
+  // string: an empty id would make every arrival of one condition collide on a
+  // single audit hash, so the trailing rows would overwrite each other. The ingress
+  // always mints an id, so this only covers a message that bypassed it.
+  const arrivalId = String(evt.id ?? '') || `t${brokerTs}`;
+  const historyKey = keys.history(bareKey, arrivalId);
 
   // ARGV layout must match k8s/base/20-event-fold-config.yaml exactly.
   const args = [
     String(brokerTs),       // ARGV[1] broker ts
-    String(evt.id ?? ''),   // ARGV[2] arrival id -> lastId / closedBy
+    arrivalId,              // ARGV[2] arrival id -> lastId / closedBy
     String(evt.severity),   // ARGV[3] severity
     bareKey,                // ARGV[4] index member
     String(evt.source ?? ''), // ARGV[5] device
     String(ttlMs),          // ARGV[6] ttl in ms
+    String(cfg.historyTtl * 1000), // ARGV[7] history ttl in ms
     ...recordFields({ evt, storedPayload, brokerTs }),
   ];
 
   const applied = await valkey.write((c) =>
     c.eval(
       fold.get(),
-      5,
+      7,
       eventKey,
       keys.eventAllIndex,
       keys.eventOpenIndex,
       keys.eventClosedIndex,
       keys.sourceIndex(evt.source),
+      historyKey,
+      keys.historyIndex,
       ...args,
     ),
   );
@@ -184,6 +196,16 @@ export async function maybePruneIndex(valkey, source, cfg, log, force = false) {
       c.zremrangebyscore(keys.eventAllIndex, '-inf', `(${cutoff}`),
     );
     if (removedAll > 0) log.debug('pruned global event index', { removed: removedAll });
+
+    // The history index runs on its OWN, shorter window. Pruning it with the
+    // record cutoff would keep three days of audit members alive for seven, which
+    // is a million-member zset with no hashes behind it — every read would pay for
+    // members that resolve to nothing.
+    const histCutoff = Date.now() - cfg.historyTtl * 1000;
+    const removedHistory = await valkey.write((c) =>
+      c.zremrangebyscore(keys.historyIndex, '-inf', `(${histCutoff}`),
+    );
+    if (removedHistory > 0) log.debug('pruned history index', { removed: removedHistory });
     return true;
   } catch (err) {
     log.warn('index prune failed', { source, err: String(err) });

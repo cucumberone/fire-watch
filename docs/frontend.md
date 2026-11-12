@@ -549,7 +549,7 @@ loop. The panel waits for the next state change or a reload.
 This was verified by forcing a render throw in the alert table and confirming the
 header, the other pane and the socket all stayed functional.
 
-### 5.5 Three tabs: Open alerts, Live events, All events
+### 5.5 Four tabs: Open alerts, Live events, All events, History
 
 The drawer is gone. It was a primary view with an accessory bolted underneath: it
 could only be expanded or invisible, it competed with the alert table for vertical
@@ -564,6 +564,7 @@ happened in this window" are parallel questions rather than a hierarchy:
 | **Open alerts** | what is firing right now | `op: snapshot` on connect + `op: alert` live |
 | **Live events** | what did we actually receive, and when | `op: event` frames, arrival order |
 | **All events** | what happened in the last N, searchable | `op: allEvents`, a windowed query |
+| **History** | every individual delivery, with its fold verdict | `op: history`, a windowed query over `idx:history` ([history.md](history.md)) |
 
 A fourth **Closed** tab existed and has been **removed**. Everything it showed is
 already answerable from All events, which lists every stored record including the

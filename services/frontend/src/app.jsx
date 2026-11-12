@@ -99,6 +99,17 @@ const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 
 const EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Summary'];
 const ALL_EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Count', 'Summary'];
 
+// The History tab: one row per DELIVERY, newest first.
+//
+// No State column, and no Count. An audit row describes an ARRIVAL, not a
+// condition: `state` belongs to the record (which may have moved on since), and a
+// per-arrival count would be a constant 1. What replaces them is `Result` — the
+// fold's verdict for this delivery — which is the fact that makes a trail readable:
+// it distinguishes "this incremented the count" from "this was rejected as a
+// redelivery" from "this retired the alert".
+const HISTORY_COLS = ['Severity', 'Received', 'Result', 'Summary', 'Key'];
+const HISTORY_DEFAULT_W = [96, 172, 96, 380, 240];
+
 /**
  * Default widths, in px, for every real column.
  *
@@ -116,6 +127,7 @@ const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
 const EVENT_DEFAULT_W = [96, 84, 172, 172, 340];
 const ALL_EVENT_DEFAULT_W = [96, 84, 172, 172, 64, 340];
 
+
 // ------------------------------------------------------------ UI preferences
 // Persisted in localStorage so a reload keeps them. `auto` is stored as the
 // ABSENCE of a key, so a later OS change still takes effect.
@@ -130,6 +142,7 @@ const TABS = [
   { id: 'alerts', label: 'Open alerts' },
   { id: 'events', label: 'Live events' },
   { id: 'all', label: 'All events' },
+  { id: 'history', label: 'History' },
 ];
 
 /**
@@ -145,6 +158,22 @@ const ALL_RANGES = [
   { id: '6h', label: 'last 6 hours' },
   { id: '24h', label: 'last 24 hours' },
   { id: '7d', label: 'last 7 days' },
+];
+
+/**
+ * Time ranges offered by History.
+ *
+ * Mirrors `HISTORY_RANGES` in the gateway and STOPS AT THREE DAYS, which is the
+ * audit retention (`FW_HISTORY_TTL`). Offering a longer window would promise rows
+ * that cannot exist, and the badge would then report fewer than the label says for
+ * a reason the operator cannot see.
+ */
+const HISTORY_RANGES = [
+  { id: '15m', label: 'last 15 minutes' },
+  { id: '1h', label: 'last hour' },
+  { id: '6h', label: 'last 6 hours' },
+  { id: '24h', label: 'last 24 hours' },
+  { id: '3d', label: 'last 3 days' },
 ];
 
 /**
@@ -653,6 +682,22 @@ function useSocket(config) {
     windowAdded: 0,
   });
 
+  // The History tab's data: the AUDIT trail, one row per DELIVERY.
+  //
+  // Deliberately its own reducer rather than a second view of `allEvents`. The two
+  // read different indexes and answer different questions: All events enumerates
+  // CONDITIONS (a record is updated in place, so it shows the last time something
+  // fired and its total count), History enumerates ARRIVALS (so it can show that
+  // something fired eleven times in four minutes). Sharing state would force one to
+  // lie about what it holds.
+  const [history, setHistory] = useState({
+    events: [], loading: false, error: null, truncated: false,
+    range: '24h', loadedAt: null,
+    // How many arrivals the WINDOW held when the last query answered. `null` until
+    // one has, because "we have not asked" is not "there are none".
+    total: null,
+  });
+
   const wsRef = useRef(null);
   const attemptRef = useRef(0);
   const timerRef = useRef(null);
@@ -953,6 +998,35 @@ function useSocket(config) {
       });
       return;
     }
+    if (frame.op === 'history') {
+      // The answer to `op: history` — one row per DELIVERY.
+      //
+      // Replaced wholesale, not merged: it is a windowed query, so a row it omits
+      // is outside the window rather than missing from this reply.
+      //
+      // Decode before mapping, like every other read path: `hist:` rows carry the
+      // same (possibly gzipped) payload, so skipping this leaves Summary blank and
+      // the inspector showing `{__gz:…}`.
+      const rows = Array.isArray(frame.events) ? frame.events : [];
+      const next = [];
+      for (const row of rows) {
+        if (!row || typeof row.key !== 'string') continue;
+        const payload = await decodePayload(row.payload, gunzip, MSG_MAX_BYTES);
+        next.push(toViewEvent({ ...row, payload }));
+      }
+      setHistory({
+        events: next,
+        loading: false,
+        error: null,
+        truncated: Boolean(frame.truncated),
+        range: frame.range || '24h',
+        // The server's window total, not the page size. `null` is preserved so the
+        // badge can tell "not asked" from "none".
+        total: Number.isFinite(frame.total) ? frame.total : next.length,
+        loadedAt: Date.now(),
+      });
+      return;
+    }
     if (frame.op === 'snapshot') {
       // The state of the world as of connect, or as of the last resync. Without
       // this the board is empty on load until something new fires, because events
@@ -1139,6 +1213,12 @@ function useSocket(config) {
       if (frame.code === 'all_events_failed') {
         setAllEvents((prev) => ({
           ...prev, loading: false, error: frame.message || 'could not read events',
+        }));
+        return;
+      }
+      if (frame.code === 'history_failed') {
+        setHistory((prev) => ({
+          ...prev, loading: false, error: frame.message || 'could not read history',
         }));
         return;
       }
@@ -1434,9 +1514,37 @@ function useSocket(config) {
     ws.send(JSON.stringify({ op: 'allEvents', range: nextRange }));
   }, []);
 
+  /**
+   * Ask for the AUDIT trail in a time window.
+   *
+   * Same shape as `loadAllEvents` — a bounded, on-demand query rather than a
+   * stream — but a different index: one row per DELIVERY instead of one per
+   * condition.
+   *
+   * `key` optionally narrows to one incident's arrivals. It is sent to the server
+   * rather than filtered here because the badge and the `truncated` notice must
+   * describe the SAME set the table shows; filtering a page client-side would let
+   * the badge say 3 while the table held 3 of 40.
+   */
+  const loadHistory = useCallback((range, key = null) => {
+    const ws = wsRef.current;
+    const nextRange = range || '24h';
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — history not requested');
+      return;
+    }
+    setHistory((prev) => ({
+      ...prev, range: nextRange, loading: true, error: null, total: null,
+    }));
+    const frame = { op: 'history', range: nextRange };
+    if (key) frame.key = key;
+    ws.send(JSON.stringify(frame));
+  }, []);
+
   return {
     status, events, alerts, acks, notice, bulk, deleteEvent,
     loadAllEvents, allEvents,
+    loadHistory, history,
     journals, loadJournal, addJournalEntry,
     dbUp,
   };
@@ -1860,6 +1968,74 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
   );
 }
 
+/**
+ * The fold's verdict for ONE arrival, as a chip.
+ *
+ * This is what makes an audit trail readable rather than a wall of identical
+ * rows. The same condition reported five times produces five rows that look
+ * alike; this column says which of them actually moved the count.
+ *
+ *   1  occurrence — counted, `lastSeen` moved
+ *   3  retirement — closed the condition
+ *   0  rejected   — stale or a redelivery; the record refused it
+ *
+ * `0` is deliberately NOT styled as an error. A redelivery is normal operation
+ * (at-least-once delivery), and colouring it red would send an operator chasing
+ * the broker during a perfectly healthy incident. It is rendered as a quiet
+ * outline, which reads as "seen, no effect".
+ */
+function ResultChip({ applied }) {
+  if (applied === 3) {
+    return (
+      <Chip label="closed" size="small" color="success" variant="outlined"
+            title="This arrival RETIRED the condition" />
+    );
+  }
+  if (applied === 0) {
+    return (
+      <Chip label="rejected" size="small" variant="outlined"
+            title="Stale or a redelivery: the record refused this arrival, nothing changed"
+            sx={{ opacity: 0.7 }} />
+    );
+  }
+  if (applied === 1) {
+    return (
+      <Chip label="counted" size="small" color="primary" variant="outlined"
+            title="Counted as an occurrence: the count moved and so did last occurrence" />
+    );
+  }
+  // A row written by an older worker carries no verdict. Saying so beats guessing.
+  return <Chip label="—" size="small" variant="outlined" sx={{ opacity: 0.5 }} />;
+}
+
+/**
+ * One row in the History tab: a single ARRIVAL.
+ *
+ * Shares nothing with EventRow beyond the badge, because the facts differ. An audit
+ * row has no Count (it is one delivery), no State (that belongs to the record, which
+ * may have moved on since), and its meaningful timestamp is when the broker received
+ * it. What it adds is `Result` — the fold's verdict — and the record key, so an
+ * operator can go from "this arrived" to "this is the condition it belongs to".
+ */
+function HistoryRow({ evt, onContextMenu }) {
+  const label = evt.displaySeverity ?? evt.severity;
+  return (
+    <tr
+      className={severityRowClass(colourSeverity(evt.severity, label))}
+      onContextMenu={onContextMenu}
+    >
+      <td><Badge severity={evt.severity} label={label} /></td>
+      <td className="mono">{formatClock(evt.brokerTs)}</td>
+      <td><ResultChip applied={evt.applied} /></td>
+      <td className="summary">
+        {evt.summary || <span className="dim">—</span>}
+      </td>
+      <td className="mono nowrap">{evt.key}</td>
+      <td />
+    </tr>
+  );
+}
+
 function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   const acked = Boolean(ack);
   // Colour follows what the badge shows, so the row tint and the badge cannot
@@ -2018,7 +2194,7 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadAllEvents, allEvents, dbUp,
+    loadAllEvents, allEvents, loadHistory, history, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2058,6 +2234,13 @@ function App() {
     beginResize: beginAllResize,
   } = useColumnWidths('all', ALL_EVENT_COLS, ALL_EVENT_DEFAULT_W);
 
+  // Its own width state again: History has the same columns as All events but is a
+  // different table, and sizing one must not resize the other.
+  const {
+    widthOf: historyWidthOf,
+    beginResize: beginHistoryResize,
+  } = useColumnWidths('history', HISTORY_COLS, HISTORY_DEFAULT_W);
+
   // All Events filter. The page is bounded, so filtering client-side keeps typing
   // instant.
   const [eventFilter, setEventFilter] = useState('');
@@ -2073,6 +2256,19 @@ function App() {
     [allEvents.events],
   );
 
+  // History filter. Same client-side reasoning as All events: the page is bounded
+  // (1000 rows) so a round trip per keystroke would only make typing feel broken.
+  const [historyFilter, setHistoryFilter] = useState('');
+  const [historySeverity, setHistorySeverity] = useState('');
+  const historyRows = useMemo(
+    () => filterEvents(history.events, historyFilter, historySeverity),
+    [history.events, historyFilter, historySeverity],
+  );
+  const historySeverityOptions = useMemo(
+    () => eventSeverities(history.events),
+    [history.events],
+  );
+
   // Same contract for All Events: re-fetch on an explicit range change or refresh.
   //
   // Also fetched once on CONNECT, regardless of which tab is showing. The badge has
@@ -2085,6 +2281,20 @@ function App() {
     if (allEvents.loadedAt || allEvents.loading) return;
     loadAllEvents(allEvents.range);
   }, [status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
+
+  // History is fetched on first open ONLY, unlike All events.
+  //
+  // The two differ in cost and in how often they are read: All events is the log an
+  // operator scans habitually, so its badge is kept honest from the first frame.
+  // History is the deeper audit trail — a page of up to 1000 rows — and nobody needs
+  // its badge before they open it. Fetching it on every connect would spend a large
+  // read on a tab most sessions never touch.
+  useEffect(() => {
+    if (tab !== 'history') return;
+    if (status !== 'connected') return;
+    if (history.loadedAt || history.loading) return;
+    loadHistory(history.range);
+  }, [tab, status, history.loadedAt, history.loading, history.range, loadHistory]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -2251,6 +2461,12 @@ function App() {
                 allEvents: allEvents.total === null
                   ? allEvents.events.length
                   : allEvents.total + (allEvents.windowAdded ?? 0),
+                // Not asked yet is NOT zero: `total` stays null until the first
+                // query answers, so the badge shows the rows it holds (none) rather
+                // than claiming the trail is empty.
+                history: history.total === null
+                  ? history.events.length
+                  : history.total,
               });
               return (
                 <Tab
@@ -2756,6 +2972,148 @@ function App() {
                     />
                   );
                 })}
+              />
+            </PaneBoundary>
+          </Box>
+        )}
+      </Box>
+      ) : null}
+
+      {tab === 'history' ? (
+      <Box role="tabpanel" id="panel-history" aria-labelledby="tab-history"
+           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                 p: 2, pt: 1.5 }}>
+        {/* The AUDIT trail: one row per DELIVERY, newest first.
+            It answers questions no other tab can, because every other tab lists
+            CONDITIONS (a record is updated in place):
+              "how many times did this actually fire?"
+              "did the broker deliver it twice?"  (a rejected row)
+              "what exactly did the source send at 02:14?"
+            Retention is 3 days, so the range options stop there. */}
+        <Stack direction="row" spacing={1}
+               sx={{ alignItems: 'center', mb: 1, flexWrap: 'wrap', useFlexGap: true }}>
+          <FormControl sx={{ width: 170, flex: '0 0 auto' }}>
+            <InputLabel id="hist-range-label">Window</InputLabel>
+            <Select
+              labelId="hist-range-label"
+              label="Window"
+              value={history.range}
+              onChange={(e) => loadHistory(e.target.value)}
+            >
+              {HISTORY_RANGES.map((r) => (
+                <MenuItem key={r.id} value={r.id}>{r.label}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl sx={{ width: 150, flex: '0 0 auto' }}>
+            <InputLabel id="hist-sev-label">Severity</InputLabel>
+            <Select
+              labelId="hist-sev-label"
+              label="Severity"
+              value={historySeverity}
+              onChange={(e) => setHistorySeverity(e.target.value)}
+            >
+              <MenuItem value="">All severities</MenuItem>
+              {historySeverityOptions.map((sev) => (
+                <MenuItem key={sev} value={sev}>{sev}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <TextField
+            type="search"
+            value={historyFilter}
+            onChange={(e) => setHistoryFilter(e.target.value)}
+            placeholder="Filter by key, device, severity, summary…"
+            inputProps={{ 'aria-label': 'Filter history' }}
+            sx={{ flex: '1 1 240px', minWidth: 0, maxWidth: 420 }}
+          />
+          <Tooltip title={history.loading ? 'Loading…' : 'Re-read this window'}>
+            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+              <IconButton
+                size="small"
+                onClick={() => loadHistory(history.range)}
+                disabled={history.loading}
+                aria-label="Reload history"
+                sx={{ flex: '0 0 auto' }}
+              >
+                {history.loading
+                  ? <CircularProgress size={16} />
+                  : <RefreshIcon fontSize="small" />}
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Stack>
+
+        {history.error ? (
+          <MuiAlert severity="error">History failed: {history.error}</MuiAlert>
+        ) : history.loading && history.events.length === 0 ? (
+          <Stack direction="row" spacing={1} sx={{ alignItems: 'center', p: 2 }}>
+            <CircularProgress size={16} />
+            <Typography variant="body2" color="text.secondary">Loading…</Typography>
+          </Stack>
+        ) : history.events.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            {history.loadedAt
+              ? 'No arrivals in this window.'
+              : 'Waiting for the first arrivals, or open this tab to read the trail.'}
+          </Typography>
+        ) : historyRows.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No arrivals match the filter.
+          </Typography>
+        ) : (
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            {history.truncated ? (
+              <MuiAlert severity="warning" sx={{ mb: 1 }}>
+                Showing the newest {history.events.length} of {history.total ?? 0}
+                {' '}arrivals in this window — narrow the window or the filter to see
+                older ones.
+              </MuiAlert>
+            ) : null}
+            <PaneBoundary name="History">
+              <ScrollTable
+                cols={(
+                  <>
+                    {HISTORY_COLS.map((c, i) => (
+                      <col key={c} style={{ width: `${historyWidthOf(i)}px` }} />
+                    ))}
+                    <col />
+                  </>
+                )}
+                head={(
+                  <>
+                    {HISTORY_COLS.map((label, i) => (
+                      <ResizableTh
+                        key={label}
+                        index={i}
+                        width={historyWidthOf(i)}
+                        onBegin={beginHistoryResize}
+                      >
+                        {label}
+                      </ResizableTh>
+                    ))}
+                    <th />
+                  </>
+                )}
+                rows={historyRows.map((evt, i) => (
+                  <HistoryRow
+                    // Arrival-scoped key: one condition can appear many times, and
+                    // a record key alone would collapse those rows.
+                    key={`${evt.key}|${evt.arrivalId}|${i}`}
+                    evt={evt}
+                    // Read-only: an audit row cannot be acked, closed or deleted —
+                    // those act on the CONDITION, which lives on the other tabs.
+                    // The inspector is offered because reading the whole payload of
+                    // a specific delivery is the one action that belongs here.
+                    onContextMenu={(ev) => openInspector(
+                      ev,
+                      evt.wire ?? evt,
+                      `${evt.source || 'event'} · ${evt.arrivalId || 'arrival'}`,
+                      [],
+                      evt.key || null,
+                    )}
+                  />
+                ))}
               />
             </PaneBoundary>
           </Box>

@@ -47,7 +47,6 @@ The key is
 ```text
 event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>
 ```
-
 computed in [`services/worker/src/keygen.js`](../services/worker/src/keygen.js). Two
 arrivals with the same device and the same summary are **the same row**: the second
 one moves `lastSeen`, increments `count` and does not create a record. That is the
@@ -68,13 +67,34 @@ entire class of bug — the owner-id chasing, the fingerprint that expired befor
 record, the "all events shows one row for three deliveries" complaint — because there
 is nothing left to reconcile.
 
-### 2.2 What is lost, stated plainly
+### 2.2 What is lost — and the one place it is kept
 
-**Per-delivery history is no longer queryable from Valkey.** The record keeps
+**Per-delivery history is not queryable from `event:<key>`.** The record keeps
 `count`, `firstSeen`, `lastSeen` and `lastId` (the newest arrival's id), but not the
-individual arrivals. The per-delivery log is `q.audit.events` in RabbitMQ, which is
-append-only and holds the full window (§4.5). A dedup investigation reads the WAL,
-not the cache.
+individual arrivals: the record is updated in place, so after 400 repeats it looks
+like it did after the first apart from those three fields.
+
+Two things answer per-delivery questions, and they are different tools:
+
+| | `q.audit.events` (RabbitMQ) | `hist:` + `idx:history` (Valkey) |
+|---|---|---|
+| purpose | the durable WAL, replayable | a read model for the UI |
+| retention | the full 7 days | 3 days (`FW_HISTORY_TTL`) |
+| queryable | by draining it | `op: history`, bounded |
+| on a total PVC loss | the source of truth | gone with the data |
+
+The Valkey copy exists only because "how many times did this fire, and when"
+should not require draining a broker queue. Nothing is replayed from it — the WAL
+is still what a rebuild reads ([history.md](history.md) §6,
+[persistence-and-durability.md](persistence-and-durability.md) §4).
+
+```text
+hist:<bareKey>|<arrivalId>   hash  ONE delivery, immutable, no state
+idx:history                  zset  "<bareKey>|<arrivalId>" -> broker timestamp
+```
+
+Both expire on `FW_HISTORY_TTL`, and the index is pruned on that cutoff — not the
+record's — so three days of members cannot outlive the hashes behind them.
 
 ### 2.3 Why the key is opaque
 

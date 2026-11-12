@@ -804,6 +804,9 @@ export function tabBadgeCount(tabId, counts) {
     // Loaded rows, not a live total: this tab is a bounded query, so its badge is
     // "how many I currently hold".
     case 'all': return counts.allEvents;
+    // Same rule for the audit trail: a windowed page, so the badge is the window's
+    // total once a query has answered and the held rows before that.
+    case 'history': return counts.history;
     default:
       throw new Error(`tabBadgeCount: unknown tab "${tabId}" — give it an explicit count`);
   }

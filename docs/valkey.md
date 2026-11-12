@@ -14,7 +14,7 @@ enforced by the engine, not only by routing).
 
 | Requirement (AGENTS.md) | Valkey | Valkey |
 |---|---|---|
-| AOF, refreshed hourly | **not implemented** — snapshots only | `appendonly yes` + `BGREWRITEAOF` |
+| AOF, rotated at 32 MB | **not implemented** — snapshots only | `appendonly yes` + `auto-aof-rewrite-min-size 32mb` |
 | "always find 2 replicas before accepting writes" | no equivalent flag; had to be enforced by emptying a Service endpoint | `min-replicas-to-write 2` |
 | 3 replicas, no operator | yes | yes |
 | RESP compatibility with Sentinel and every client | yes | yes |
@@ -123,8 +123,8 @@ appendonly yes
 appendfsync everysec
 appenddirname appendonlydir
 aof-use-rdb-preamble yes
-auto-aof-rewrite-percentage 100
-auto-aof-rewrite-min-size 256mb
+auto-aof-rewrite-percentage 0
+auto-aof-rewrite-min-size 32mb
 aof-load-truncated yes
 aof-timestamp-enabled yes
 save ""
@@ -139,16 +139,69 @@ command history — that is what makes an AOF-only restart fast.
 `save ""` disables RDB snapshots. With AOF they add nothing, and each background save
 forks a ~29 GiB process: a memory spike for no durability gain.
 
-### 4.2 The hourly rewrite
+### 4.2 Rotation at 32 MB
 
-The requirement is "every hour refresh the file with a new one from what's left in
-memory, to make restart and reread fast". That is exactly `BGREWRITEAOF`: a fresh,
-minimal AOF built from the live keyspace.
+The rule is **"take a 32 MB snapshot and roll the AOF log"**. In Valkey those are one
+operation: `BGREWRITEAOF` builds a fresh AOF whose base is an RDB image of the live
+keyspace, then switches to it atomically.
 
-The `aof-rewriter` sidecar issues it every `FW_AOF_REWRITE_INTERVAL` (3600 s). It is
-scheduled there rather than relying on `auto-aof-rewrite-percentage` because
-size-triggered rewrites depend on write volume, and a quiet week would otherwise leave
-a large file in place to be replayed at boot.
+**The engine cannot express this rule, so the sidecar enforces it.** That conclusion
+came from measurement on Valkey 8.1.11, not from reading the manual:
+
+| Attempt | Result |
+|---|---|
+| `auto-aof-rewrite-percentage 0`, `min-size 1` | **Auto-rewrite is DISABLED.** `aof_rewrites` did not move while `aof_current_size` exceeded `aof_base_size`. `0` does not mean "trigger on size alone" — it means "off" |
+| `auto-aof-rewrite-percentage 1` | Rewrites resume, but the trigger is `current >= base * (1 + pct/100)` — **relative to the base** |
+| `auto-aof-rewrite-min-size 32mb` alone | Never fires in practice, because the base is the whole dataset |
+
+The reason the last row matters: with `aof-use-rdb-preamble yes`, `aof_base_size` is an
+RDB image of the **entire dataset** — ~33 GiB at the production working set
+([sizing.md](sizing.md) §3.5). An integer percentage of that is hundreds of MB at
+minimum, and `percentage 0` does not lower the bar, it turns the feature off.
+
+So the configuration reads:
+
+| Setting | Value | Why |
+|---|---|---|
+| `auto-aof-rewrite-min-size` | `32mb` | states the threshold in one place |
+| `auto-aof-rewrite-percentage` | **`0`** | engine trigger OFF, so it cannot fight the sidecar |
+| `FW_AOF_REWRITE_BYTES` (sidecar) | `33554432` | the enforced threshold: 32 MiB |
+| `FW_AOF_CHECK_INTERVAL` (sidecar) | `60` | how often growth is measured |
+
+### 4.2.1 The sidecar measures GROWTH, not size
+
+```text
+growth = aof_current_size - aof_base_size     -> rewrite when growth >= 32 MB
+```
+
+**Measuring absolute size is the trap.** `aof_current_size` already includes the base,
+so a naive `current > 32mb` check is permanently true the moment the dataset passes
+32 MB. The sidecar would then issue `BGREWRITEAOF` on every pass, each one forking a
+full copy-on-write image of a multi-GiB dataset — an OOMKill waiting to happen, and a
+disk that never settles. Verified against the running pod: with the growth test, a
+below-threshold AOF reports `growth 0` repeatedly; a single write past the threshold
+triggers exactly one rewrite and `growth` returns to 0.
+
+The script is therefore a loop, not a timer:
+
+1. read `aof_current_size`, `aof_base_size`, `aof_rewrite_in_progress`;
+2. if the growth is 32 MB or more and nothing is already running, `BGREWRITEAOF`;
+3. log the growth on every pass either way.
+
+That last point is not noise. "The AOF never rotated" is otherwise discovered as a
+slow restart months later, with nothing in any log to say when it stopped.
+
+Skipping while `aof_rewrite_in_progress` is non-zero also keeps two replicas from
+stacking rewrites on a busy master, and makes the script safe to run alongside an
+operator's manual `BGREWRITEAOF`.
+
+### 4.2.2 Why size rather than time
+
+A clock-triggered rewrite cleans up at the boundary: a busy hour leaves a large AOF
+sitting there until the next tick, and a quiet hour rewrites for nothing. Replay time
+is a function of AOF size, so the size is what should trigger the rewrite. This is the
+one design decision in this file that replaced an earlier, working-but-worse choice (an
+hourly sidecar), and it was made because the requirement names a size.
 
 ### 4.3 RPO
 

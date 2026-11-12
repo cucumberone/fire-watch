@@ -10,9 +10,14 @@
 #   save ""                   already off in the base; restated so a reader does
 #                             not wonder whether a dev box takes RDB snapshots.
 #
-# Everything else — AOF, its hourly rewrite, noeviction — is deliberately identical
+# Everything else — AOF, its 32 MB rotation, noeviction — is deliberately identical
 # to production, because those are the behaviours worth exercising on a lab. A lab
 # that cannot restart from its AOF is not testing the restart path.
+#
+# The rotation threshold is the SAME 32 MB as production on purpose. A larger lab
+# value would mean the lab never rotates (a 512mb dataset rarely produces 32 MB of
+# AOF growth in a session), so the one code path that matters on restart would never
+# run here.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -32,8 +37,15 @@ data:
     appendfsync everysec
     appenddirname appendonlydir
     aof-use-rdb-preamble yes
-    auto-aof-rewrite-percentage 100
-    auto-aof-rewrite-min-size 64mb
+    # Rotation at 32 MB of AOF GROWTH is enforced by the aof-rewriter sidecar, not
+    # by these two settings: `percentage 0` turns the engine's own trigger OFF
+    # (it does not mean "trigger on size"). The full reason, with the measurements,
+    # is in k8s/base/20-valkey-config.yaml and docs/valkey.md §4.2.
+    #
+    # min-size is kept at the same 32 MB so the number is written down in one
+    # place, and so re-enabling the engine trigger later lands on the right value.
+    auto-aof-rewrite-percentage 0
+    auto-aof-rewrite-min-size 32mb
     aof-load-truncated yes
     aof-timestamp-enabled yes
     save ""

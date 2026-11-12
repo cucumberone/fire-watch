@@ -33,7 +33,7 @@ flowchart TB
     R2[(replica)]
     M -->|async| R1
     M -->|async| R2
-    M -->|AOF everysec + hourly rewrite| PV[(PVC)]
+    M -->|AOF everysec, rotates at 32 MB growth| PV[(PVC)]
   end
   subgraph L1["Layer 1 — RabbitMQ (source of truth)"]
     Q[(q.event.ingest<br/>quorum x3)]
@@ -67,7 +67,7 @@ requirement is now satisfied as written:
 | Spec text | Dragonfly | Valkey |
 |---|---|---|
 | "use the AOF feature" | not implemented | `appendonly yes` |
-| "every hour refresh that file with a new one from what's left" | approximated by `snapshot_cron` | `BGREWRITEAOF` hourly, from the live keyspace |
+| "every hour refresh that file with a new one from what's left" | approximated by `snapshot_cron` | `BGREWRITEAOF` at 32 MB of growth, from the live keyspace ([valkey.md](valkey.md) §4.2) |
 | "to make restart and reread fast" | met (fresh snapshot) | met (compact RDB-preamble base + ≤ 1 h tail) |
 | "No data loss" | only via RabbitMQ replay | AOF bounds it to ≤ 1 s, and RabbitMQ replay still covers a total PV loss |
 
@@ -76,7 +76,7 @@ requirement is now satisfied as written:
 | Claim | Holds |
 |---|---|
 | Every write is fsynced within 1 s | yes, `appendfsync everysec` |
-| A restart replays a small file | yes, because the hourly rewrite rebuilds a compact base |
+| A restart replays a small file | yes, because the rewrite rebuilds a compact base and the tail is capped at 32 MB |
 | A torn write at the end of the log is tolerated | yes, `aof-load-truncated yes` |
 | Total PV loss is survivable | **no** — that is what `q.audit.events` is for (§4) |
 | Deleted records stay deleted across a crash | **no** — the AOF still holds the write until the next rewrite ([acknowledge.md](acknowledge.md) §10.1) |
@@ -164,14 +164,14 @@ Constraint to keep in mind: **if the sustained rate grows, this parity breaks.**
 | Mechanism | AOF (`appendonly yes`) |
 | fsync policy | `appendfsync everysec` — ≤ 1 s RPO |
 | Base format | RDB preamble (`aof-use-rdb-preamble yes`) so replay starts from a compact image |
-| Rewrite schedule | `BGREWRITEAOF` hourly, from the `aof-rewriter` sidecar (`FW_AOF_REWRITE_INTERVAL`) |
-| Size-triggered rewrite | `auto-aof-rewrite-percentage 100`, `auto-aof-rewrite-min-size 256mb` as a backstop |
+| Rewrite trigger | **32 MB of AOF growth** (`aof_current_size - aof_base_size`), enforced by the `aof-rewriter` sidecar |
+| Engine auto-rewrite | **off** (`auto-aof-rewrite-percentage 0`). The engine has no "N bytes of growth" setting, and `0` disables rather than relaxes it ([valkey.md](valkey.md) §4.2) |
 | RDB snapshots | **disabled** (`save ""`) — redundant with AOF, and each fork is a memory spike |
 | Restore | automatic on start: Valkey loads `/data/appendonlydir` |
 | Torn tail | tolerated (`aof-load-truncated yes`), which is the correct trade at a 1 s fsync interval |
 
-The hourly rewrite is what makes a restart fast, and it is exactly the mechanism the
-original requirement described. Without it the AOF would be the whole 7-day write
+The 32 MB rotation is what makes a restart fast: a restart replays one snapshot plus
+at most 32 MB of commands. Without it the AOF would be the whole 7-day write
 history and a restart would replay all of it.
 
 ## 6. Restore procedure
@@ -204,7 +204,7 @@ record ([valkey.md](valkey.md) §2).
 - [ ] `q.audit.events` receives a copy before ack (verified by inspecting queue depth growth)
 - [ ] AOF is enabled and healthy: `INFO persistence` shows `aof_enabled:1` and
       `aof_last_write_status:ok` ([valkey.md](valkey.md) §8)
-- [ ] The hourly rewrite runs: `aof_last_bgrewrite_status:ok` and the
-      `aof-rewriter` sidecar's liveness probe stays green
+- [ ] Rotation runs: `aof_last_bgrewrite_status:ok`, the `aof-rewriter` sidecar's
+      liveness probe is green, and its log shows the growth figure every interval
 - [ ] A full Valkey PVC wipe can be recovered from `q.audit.events` ([validation.md](validation.md) §5)
 - [ ] RPO deviation (if option 2 is chosen instead) is recorded and signed off

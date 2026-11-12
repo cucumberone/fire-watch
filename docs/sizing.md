@@ -14,7 +14,7 @@ Capacity model for the baseline: **1 000 events/minute sustained, 7-day retentio
 | Retention TTL | **7 days** = 604 800 s | given |
 | Sources | 500 | assumption |
 | Concurrent browser clients | 1 000 | assumption |
-| AOF base + incremental tail | rewritten hourly | §3.5 |
+| AOF base + incremental tail | tail capped at 32 MB | §3.5 |
 
 Derived:
 
@@ -232,7 +232,7 @@ forks, and the child's copy-on-write pages grow with write volume during the rew
 ```text
 AOF base (RDB preamble) ≈ working set with storm ≈ 33 GiB after a rewrite
 grows between rewrites with every write, ≈ 2 KiB per event
-rewritten hourly        -> the replayed file is a fresh compact image, not a week of history
+rotated at 32 MB growth -> the replayed file is a fresh compact image plus <= 32 MB
 PV                      = 64Gi  (~2x the compact size, so a rewrite can complete
                                 while the previous file still exists)
 rewrite write rate      ≈ 33 GiB / 3 600 s ≈ 9.4 MiB/s sustained while rewriting
@@ -246,8 +246,13 @@ rewrite write rate      ≈ 33 GiB / 3 600 s ≈ 9.4 MiB/s sustained while rewri
 - `aof-use-rdb-preamble yes` is what keeps the replayed file small: without it the
   base would be the full command history since the last rewrite
   ([valkey.md](valkey.md) §4.1).
-- The hourly rewrite is what satisfies "make restart and reread fast": a restart
-  replays at most one hour of incremental commands on top of a compact base.
+- The 32 MB rotation is what satisfies "make restart and reread fast": a restart
+  replays at most 32 MB of incremental commands on top of a compact base.
+- Because the threshold is 32 MB and the dataset is ~33 GiB, rotation is frequent —
+  tens of times per hour at storm rates. That is deliberate and cheap: the rewrite is
+  fork+COW, and the alternative is a replay measured in GiB.
+- The 64 GiB PV is sized for *two* copies during a rewrite (the old file still exists
+  until the switch), which 32 MB of growth does not change.
 
 ### 3.6 RabbitMQ detail
 

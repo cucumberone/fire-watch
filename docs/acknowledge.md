@@ -247,7 +247,7 @@ What it does **not** touch, and why:
 | `event:<key>` and its `count` | The fold owns that number. A second writer decrementing it would race the fold and produce a count that disagrees with the stored state. The row's count therefore still includes the deleted event until the next fold write — an honest visible artefact rather than a silent corruption. |
 | `journal:{key}` | Keyed by the record, and a LIST beside it rather than fields on it. The fold owns the hash and rewrites it atomically, so the notes live elsewhere and survive a record delete ([journal.md](journal.md) §2.1). |
 | The RabbitMQ audit copy (`q.audit.events`) | It is a plain-text log written before the ack. There is no operator path to delete from it, so the event is **not** fully erased — only the queryable record is gone. Anyone relying on delete for compliance (GDPR-style erasure) must know this. |
-| The Valkey AOF | The append log still holds the write that created the record until the next `BGREWRITEAOF`, which runs hourly. AOF replay after a crash inside that window can therefore resurrect a just-deleted record ([valkey.md](valkey.md) §4.2). |
+| The Valkey AOF | The append log still holds the write that created the record until the next `BGREWRITEAOF`, which now happens at 32 MB of growth rather than on a clock — so the window is bounded by write volume, not time. AOF replay after a crash inside that window can therefore resurrect a just-deleted record ([valkey.md](valkey.md) §4.2). |
 
 So: gone from the board and from history, recoverable from the audit log by anyone
 with broker access.

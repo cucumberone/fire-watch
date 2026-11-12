@@ -27,7 +27,7 @@ Implementation order, open decisions, and known deviations from the spec.
 
 1. `valkey` Secret (password) + ConfigMap (`valkey.conf`)
 2. `valkey-headless` Service
-3. `valkey` StatefulSet with AOF, the hourly-rewrite sidecar, PDB
+3. `valkey` StatefulSet with AOF, the 32 MB-rotation sidecar, PDB
 4. `sentinel` ConfigMap + StatefulSet + `sentinel-headless` Service
 5. `sentinel-bridge` Deployment + RBAC (patch Service, exec into pods) — **implemented**, source in [services/sentinel-bridge](../services/sentinel-bridge/)
 6. Verify: master + 2 stable_sync replicas, sentinels agree, Service points at the master
@@ -59,7 +59,7 @@ Implementation order, open decisions, and known deviations from the spec.
 | `base/11-rabbitmq-config.yaml` | `enabled_plugins`, `rabbitmq.conf`, `definitions.json` ConfigMaps |
 | `base/13-rabbitmq-services.yaml` | headless + client Services |
 | `base/14-rabbitmq-statefulset.yaml` | StatefulSet |
-| `base/20-valkey-config.yaml` | `valkey.conf` + entrypoint + hourly AOF-rewrite script |
+| `base/20-valkey-config.yaml` | `valkey.conf` + entrypoint + AOF-rotation script |
 | `base/20-event-fold-config.yaml` | `event-fold.lua` mounted into the worker |
 | `base/22-valkey-services.yaml` | headless + master-pointer Service |
 | `base/23-valkey-statefulset.yaml` | StatefulSet + `aof-rewriter` sidecar |
@@ -113,7 +113,7 @@ Overlay rule: **overlays change replicas, resources, storage, schedules and host
 
 | Spec statement | Reality | Resolution |
 |---|---|---|
-| "Valkey shall use AOF feature" | **now met** — Valkey implements AOF, unlike the Dragonfly it replaced | `appendonly yes` + `appendfsync everysec`, with an hourly `BGREWRITEAOF` sidecar for restart speed ([valkey.md](valkey.md) §4) |
+| "Valkey shall use AOF feature" | **now met** — Valkey implements AOF, unlike the Dragonfly it replaced | `appendonly yes` + `appendfsync everysec`, with rotation at 32 MB of growth enforced by a sidecar because the engine cannot express that rule ([valkey.md](valkey.md) §4.2) |
 | "always find 2 replicas to receive writes" | **now met in the engine** — `min-replicas-to-write 2` | the flag refuses writes on the master itself; `sentinel-bridge` still empties `Endpoints/valkey` so stale READS are blocked too ([valkey.md](valkey.md) §5) |
 | "Redis Sentinels are needed for the workers, I think" | confirmed: needed, and also needed for the gateway and Service selector | [redis-sentinel.md](redis-sentinel.md) |
 | "Valkey operator is off the table" | honoured — everything is raw manifests plus a small bridge controller | this document |

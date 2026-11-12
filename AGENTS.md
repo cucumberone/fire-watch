@@ -21,7 +21,7 @@ This repo sets up an event server.
 - **One record per condition.** The Valkey key is derived from `EVT_Device` + `EVT_Summary` (`event:<sha256[0:32]>`), so a duplicate is dropped by updating `lastSeen` / `count` on the existing hash instead of storing a second record.
 - **Workers:** 3 replicas getting messages from RabbitMQ. For now, write a small JavaScript service that writes whatever comes to the worker into Valkey.
 - **Probes:** if you see the need for readiness probes, create them and handle them.
-- **Valkey persistence:** use the AOF feature, but every hour refresh that file with a new one from what's left in Valkey. This is to make restart and reread fast. Implemented as `appendonly yes` + `appendfsync everysec` with an hourly `BGREWRITEAOF` sidecar.
+- **Valkey persistence:** use the AOF feature, but refresh that file with a new one from what's left in Valkey once it reaches 32 MB. This is to make restart and reread fast. Implemented as `appendonly yes` + `appendfsync everysec`, with rotation at 32 MB of AOF growth enforced by the `aof-rewriter` sidecar (the engine has no "N bytes of growth" setting, and `auto-aof-rewrite-percentage 0` disables its own trigger rather than relaxing it).
 - **Redis Sentinels:** needed for the workers, I think.
 - **Sizing:** 1 000 events/min sustained (500/s storm peaks), 7-day retention — see [docs/sizing.md](docs/sizing.md), which shows this needs ~52 GiB limit per Valkey pod.
 

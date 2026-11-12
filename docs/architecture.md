@@ -238,7 +238,7 @@ ZRANGE idx:source:sensor-a 0 0 WITHSCORES
 | Valkey master lost | Unaffected | Sentinel promotes a replica (quorum 2/3) | Clients re-resolve master via Sentinel | Seconds of write stalls, no loss |
 | 1 node lost (1 pod of each component) | Cluster stays quorate (2/3) | 1 replica gone, master still has 2 peers unless it was the master | Pod rescheduled onto a surviving node | Survives, degraded until reschedule |
 | Network partition, Valkey master isolated | Unaffected | Master sees 0 replicas → write guard pulls it out of the Service; Sentinel promotes majority-side replica | Clients follow the new master | Split brain prevented, see [redis-sentinel.md](redis-sentinel.md) §6 |
-| Full cluster power loss | Quorum queues recover from journal | Newest hourly snapshot loads; the gap is replayed from `q.audit.events` | Reconnect | RPO 0 for accepted events, see [persistence-and-durability.md](persistence-and-durability.md) |
+| Full cluster power loss | Quorum queues recover from journal | The AOF loads (snapshot base + <= 32 MB tail); anything older is replayed from `q.audit.events` | Reconnect | RPO 0 for accepted events, see [persistence-and-durability.md](persistence-and-durability.md) |
 | Valkey PVC wiped on all 3 pods | Unaffected | Empty on start; `replay-gap` Job refills the **full 7 days** from `q.audit.events` | Clients see a temporary gap | RPO 0 — the WAL and the retention window now match |
 
 ## 8. Cross-cutting rules

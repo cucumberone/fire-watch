@@ -241,7 +241,7 @@ spec:
           labels: { severity: warning }
           annotations:
             summary: "Valkey {{ $labels.pod }} at {{ $value | humanizePercentage }} of its memory limit"
-            description: "An AOF rewrite forks a copy-on-write image on top of the dataset. Above 90% an OOMKill during the hourly rewrite is likely."
+            description: "An AOF rewrite forks a copy-on-write image on top of the dataset. The log now rotates at 32 MB of growth, which is frequent, so above 90% an OOMKill during a rewrite is likely."
 
         # --- persistence failing: the restart path is broken
         #
@@ -261,8 +261,8 @@ spec:
           for: 1h
           labels: { severity: warning }
           annotations:
-            summary: "Valkey's hourly AOF rewrite keeps failing"
-            description: "Restart time will degrade: the AOF grows with every write in the 7-day window and is replayed at boot."
+            summary: "Valkey's AOF rotation keeps failing"
+            description: "The 32 MB rotation is not completing, so the AOF keeps growing and a restart replays an ever-larger log. Check PV space and the aof-rewriter sidecar log for the growth figure it reports."
 
         # --- a replica that has been disconnected from the master for 5 min
         - alert: ValkeyReplicaDown

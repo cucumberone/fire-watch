@@ -162,11 +162,11 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 | Anti-affinity | required | **removed** (1 replica, no spread to enforce; required would still schedule but blocks nothing) |
 | PDBs | all 8 workloads | **deleted** — a PDB with 1 replica and `minAvailable: 2` makes the pod impossible to evict |
 | Valkey `maxmemory` | 40gb | **512mb** |
+| Valkey AOF rotation | 32 MB of growth | **same 32 MB** — a larger lab value would mean the lab never rotates, so the restart path would never run there |
 | Valkey mem limit/request | 52Gi / 8Gi | **1Gi / 256Mi** |
 | Valkey PV | 64Gi | **2Gi** |
 | RabbitMQ PV | 96Gi | **2Gi** |
 | Sentinel PV | 1Gi | **256Mi** |
-| Snapshot schedule | hourly | **every 15 min** (`*/15 * * * *`), so the restart path is exercised quickly |
 | CPU/memory per pod | full | **tiny** (see §3.3) |
 | HPA | 3..12 gateway | **removed**, fixed 1 |
 | NetworkPolicies | absent (deliberate, shared namespace) | **absent** — nothing to remove |

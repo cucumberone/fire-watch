@@ -125,11 +125,17 @@ spec:
             periodSeconds: 30
             failureThreshold: 6
             timeoutSeconds: 10
-        # ------------------------------------------------------ AOF rewriter
-        # Hourly BGREWRITEAOF, so restart replays a small recent file rather than
-        # a 7-day history. This is the requirement as written; the Dragonfly
-        # version could only approximate it with snapshots because Dragonfly has
-        # no AOF at all (docs/valkey.md §4.4).
+        # ---------------------------------------------------- AOF rotation guard
+        # The engine rotates the AOF itself at 32 MB
+        # (`auto-aof-rewrite-min-size 32mb` + `auto-aof-rewrite-percentage 0`).
+        # This sidecar is the guard, not the trigger: it reads `aof_current_size`
+        # and forces a rewrite if the size is above the threshold and nothing is
+        # already running. That covers the two ways the engine's own trigger can
+        # leave you with an unbounded AOF — the setting being overridden, and a
+        # rewrite having failed while writes continued.
+        #
+        # It also prints the size it read every interval, because "the AOF never
+        # rotated" is otherwise only discovered as a slow restart months later.
         - name: aof-rewriter
           image: docker.io/valkey/valkey:8.1
           imagePullPolicy: IfNotPresent
@@ -138,7 +144,12 @@ spec:
             - name: VALKEY_PASSWORD
               valueFrom:
                 secretKeyRef: { name: fire-watch-valkey, key: password }
-            - { name: FW_AOF_REWRITE_INTERVAL, value: "3600" }
+            # How often to CHECK the size — not how often to rewrite. The trigger
+            # is the threshold below.
+            - { name: FW_AOF_CHECK_INTERVAL, value: "300" }
+            # 32 MB, written out because POSIX sh has no `32m` literal. Must agree
+            # with `auto-aof-rewrite-min-size 32mb` in the ConfigMap.
+            - { name: FW_AOF_REWRITE_BYTES, value: "33554432" }
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits:   { cpu: 100m, memory: 64Mi }
@@ -151,10 +162,10 @@ spec:
             - { name: rewrite, mountPath: /opt/rewrite, readOnly: true }
             - { name: tmp, mountPath: /tmp }
           livenessProbe:
-            # rewrite.sh touches /tmp/alive on every pass (1 h apart); a hung
-            # rewriter would let the AOF grow until an OOM or a slow restart.
+            # rewrite.sh touches /tmp/alive on every pass. The window is generous
+            # (10x the 300s check interval) so a slow INFO read cannot trip it.
             exec:
-              command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/alive) )) -lt 9000"]
+              command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/alive) )) -lt 3000"]
             periodSeconds: 60
             failureThreshold: 3
             timeoutSeconds: 10

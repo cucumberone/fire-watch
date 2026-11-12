@@ -114,6 +114,16 @@ const HISTORY_COLS = ['Severity', 'Received', 'Summary', 'Key'];
 const HISTORY_DEFAULT_W = [96, 172, 380, 240];
 
 /**
+ * Page sizes offered by the History tab.
+ *
+ * 50 is the default. The trail is read by skimming RECENT arrivals, and the
+ * gateway's maximum of 1000 rows is a scroll marathon that also drags a thousand
+ * hashes out of Valkey per query.
+ */
+const HISTORY_PAGE_SIZES = [50, 100, 200];
+const HISTORY_PAGE_DEFAULT = 50;
+
+/**
  * Default widths, in px, for every real column.
  *
  * Every column needs an explicit width, not just the ones the operator has
@@ -699,6 +709,13 @@ function useSocket(config) {
     // How many arrivals the WINDOW held when the last query answered. `null` until
     // one has, because "we have not asked" is not "there are none".
     total: null,
+    // How many rows to ask for. A PAGE size, not the window: `total` still reports
+    // the whole window, so the notice can say "showing 50 of 812".
+    //
+    // 50 by default rather than the gateway's maximum of 1000: a trail is read by
+    // SKIMMING recent arrivals, and 1000 rows is a scroll marathon that also makes
+    // every query drag a thousand hashes out of Valkey.
+    limit: HISTORY_PAGE_DEFAULT,
   });
 
   const wsRef = useRef(null);
@@ -1017,17 +1034,22 @@ function useSocket(config) {
         const payload = await decodePayload(row.payload, gunzip, MSG_MAX_BYTES);
         next.push(toViewEvent({ ...row, payload }));
       }
-      setHistory({
+      setHistory((prev) => ({
+        ...prev,
         events: next,
         loading: false,
         error: null,
         truncated: Boolean(frame.truncated),
-        range: frame.range || '24h',
-        // The server's window total, not the page size. `null` is preserved so the
-        // badge can tell "not asked" from "none".
-        total: Number.isFinite(frame.total) ? frame.total : next.length,
+        range: frame.range || prev.range,
+        // The server's window total, not the page size. Falling back to the page
+        // length would claim the window holds exactly what we can see, which is the
+        // opposite of what `truncated` means.
+        total: Number.isFinite(frame.total) ? frame.total : prev.total,
         loadedAt: Date.now(),
-      });
+        // `limit` is NOT in the reply: it is what the CLIENT asked for, and it is
+        // what the picker renders. Leaving it out of this object reset it to
+        // undefined on every reply, which blanked the control.
+      }));
       return;
     }
     if (frame.op === 'snapshot') {
@@ -1491,6 +1513,17 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Change what the NEXT history query will ask for, without issuing it.
+   *
+   * The pickers call this and the effect on `range`/`limit` performs the fetch, so
+   * one interaction cannot produce two identical requests. Exposed rather than
+   * letting the component mutate `history` directly, because that state lives here.
+   */
+  const setHistoryQuery = useCallback((patch) => {
+    setHistory((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  /**
    * Ask for every event in a time window.
    *
    * A QUERY, not a stream: the window is bounded, it changes slowly relative to a
@@ -1529,7 +1562,7 @@ function useSocket(config) {
    * describe the SAME set the table shows; filtering a page client-side would let
    * the badge say 3 while the table held 3 of 40.
    */
-  const loadHistory = useCallback((range, key = null) => {
+  const loadHistory = useCallback((range, { key = null, limit = null } = {}) => {
     const ws = wsRef.current;
     const nextRange = range || '24h';
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1537,9 +1570,16 @@ function useSocket(config) {
       return;
     }
     setHistory((prev) => ({
-      ...prev, range: nextRange, loading: true, error: null, total: null,
+      ...prev,
+      range: nextRange,
+      // The page size is recorded immediately so the picker shows what was asked
+      // for even while the reply is in flight.
+      limit: limit ?? prev.limit,
+      loading: true,
+      error: null,
+      total: null,
     }));
-    const frame = { op: 'history', range: nextRange };
+    const frame = { op: 'history', range: nextRange, limit: limit ?? undefined };
     if (key) frame.key = key;
     ws.send(JSON.stringify(frame));
   }, []);
@@ -1547,7 +1587,7 @@ function useSocket(config) {
   return {
     status, events, alerts, acks, notice, bulk, deleteEvent,
     loadAllEvents, allEvents,
-    loadHistory, history,
+    loadHistory, setHistoryQuery, history,
     journals, loadJournal, addJournalEntry,
     dbUp,
   };
@@ -2162,7 +2202,7 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadAllEvents, allEvents, loadHistory, history, dbUp,
+    loadAllEvents, allEvents, loadHistory, setHistoryQuery, history, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2176,6 +2216,12 @@ function App() {
     setTabState(id);
     writePref(TAB_KEY, id);
   }, []);
+  // Signature of the last query each query-backed tab issued, so entering a tab
+  // fetches exactly once. Without it the effect would re-fire on its own response:
+  // `loading` goes false, the effect runs, the loader sets `total` back to null, and
+  // the table sits beside a "showing 50 of 0" notice forever.
+  const historyReqRef = useRef(null);
+  const allEventsReqRef = useRef(null);
   // Pause freezes the RENDER, not the socket. The socket keeps draining and the
   // buffer keeps accumulating, so resuming shows everything that arrived while
   // paused instead of silently skipping a window of events.
@@ -2250,19 +2296,52 @@ function App() {
     loadAllEvents(allEvents.range);
   }, [status, allEvents.loadedAt, allEvents.loading, allEvents.range, loadAllEvents]);
 
-  // History is fetched on first open ONLY, unlike All events.
+  // ...and re-read every time the tab is SELECTED.
   //
-  // The two differ in cost and in how often they are read: All events is the log an
-  // operator scans habitually, so its badge is kept honest from the first frame.
-  // History is the deeper audit trail — a page of up to 1000 rows — and nobody needs
-  // its badge before they open it. Fetching it on every connect would spend a large
-  // read on a tab most sessions never touch.
+  // The effect above is guarded on `loadedAt`, so it fires once per connection. That
+  // is right for the BADGE and wrong for the TABLE: clicking All events a minute
+  // later showed rows from whenever the socket connected, with nothing on screen
+  // saying so. A query-backed tab whose content silently ages is worse than an empty
+  // one, because the operator reads it as current.
+  //
+  // Separate effect rather than dropping the guard above: without it every reconnect
+  // would re-read a page it already had, and the badge arithmetic in `windowAdded`
+  // assumes ONE baseline query per connection.
   useEffect(() => {
-    if (tab !== 'history') return;
+    if (tab !== 'all') {
+      // Leaving clears the signature, so returning re-fetches instead of showing
+      // whatever was on screen when the operator last looked.
+      allEventsReqRef.current = null;
+      return;
+    }
     if (status !== 'connected') return;
-    if (history.loadedAt || history.loading) return;
-    loadHistory(history.range);
-  }, [tab, status, history.loadedAt, history.loading, history.range, loadHistory]);
+    const sig = `${status}|${allEvents.range}`;
+    if (allEventsReqRef.current === sig) return;
+    allEventsReqRef.current = sig;
+    loadAllEvents(allEvents.range);
+  }, [tab, status, allEvents.range, loadAllEvents]);
+
+  // History is fetched every time the tab is SELECTED, not just the first time.
+  //
+  // It used to be guarded on `loadedAt`, which meant clicking the tab a second time
+  // showed the rows from whenever it was first opened — with no indication that they
+  // were old, on a trail whose whole value is recency. The guard existed to avoid
+  // re-reading a large page on every tab switch; a page is now 50 rows by default,
+  // so refreshing is cheap enough to do unconditionally.
+  //
+  // `loading` is still checked so a switch during an in-flight read does not queue a
+  // second one.
+  useEffect(() => {
+    if (tab !== 'history') {
+      historyReqRef.current = null;
+      return;
+    }
+    if (status !== 'connected') return;
+    const sig = `${status}|${history.range}|${history.limit}`;
+    if (historyReqRef.current === sig) return;
+    historyReqRef.current = sig;
+    loadHistory(history.range, { limit: history.limit });
+  }, [tab, status, history.range, history.limit, loadHistory]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -2724,22 +2803,24 @@ function App() {
                 the field stayed 228px wide next to a 240px void. `auto` on the
                 last item absorbs whatever the capped field leaves over. */}
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
-              {/* Icon-only and compact: the tab strip already says what the pane is,
-                  so a labelled filled button was the loudest control on the screen
-                  for a read-only refresh. `span` wrapper because a disabled
-                  IconButton swallows pointer events and the tooltip would stop
-                  showing. */}
-              <IconButton
+              {/* LABELLED, not icon-only. A bare refresh glyph was easy to miss
+                  beside four equally-quiet controls, and "does this pane re-read
+                  itself?" was a real question an operator had to answer by pressing
+                  it. The word removes the guess. `span` wrapper because a disabled
+                  Button swallows pointer events and the tooltip would stop showing. */}
+              <Button
+                variant="outlined"
                 size="small"
+                startIcon={allEvents.loading
+                  ? <CircularProgress size={14} />
+                  : <RefreshIcon />}
                 onClick={() => loadAllEvents(allEvents.range)}
                 disabled={allEvents.loading}
                 aria-label="Reload events"
-                sx={{ flex: '0 0 auto' }}
+                sx={{ flex: '0 0 auto', whiteSpace: 'nowrap' }}
               >
-                {allEvents.loading
-                  ? <CircularProgress size={16} />
-                  : <RefreshIcon fontSize="small" />}
-              </IconButton>
+                Refresh
+              </Button>
             </span>
           </Tooltip>
         </Stack>
@@ -2966,7 +3047,7 @@ function App() {
               labelId="hist-range-label"
               label="Window"
               value={history.range}
-              onChange={(e) => loadHistory(e.target.value)}
+              onChange={(e) => setHistoryQuery({ range: e.target.value })}
             >
               {HISTORY_RANGES.map((r) => (
                 <MenuItem key={r.id} value={r.id}>{r.label}</MenuItem>
@@ -2987,6 +3068,29 @@ function App() {
               ))}
             </Select>
           </FormControl>
+          {/* PAGE SIZE. A separate control from Window on purpose: the window is
+              "how far back", the page is "how many rows". Conflating them would
+              force an operator who wants deeper history to also triple the render
+              cost.
+              Changing it re-queries rather than slicing locally, because the server
+              is what holds the rest of the window — slicing a 50-row page in the
+              browser cannot produce row 51. */}
+          {/* Both pickers below only RECORD the choice; the effect on `range` and
+              `limit` issues the query. Having the handler fetch AND change a
+              dependency is what sent two identical requests per selection. */}
+          <FormControl sx={{ width: 120, flex: '0 0 auto' }}>
+            <InputLabel id="hist-limit-label">Show</InputLabel>
+            <Select
+              labelId="hist-limit-label"
+              label="Show"
+              value={history.limit}
+              onChange={(e) => setHistoryQuery({ limit: e.target.value })}
+            >
+              {HISTORY_PAGE_SIZES.map((n) => (
+                <MenuItem key={n} value={n}>{n}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <TextField
             type="search"
             value={historyFilter}
@@ -2997,17 +3101,22 @@ function App() {
           />
           <Tooltip title={history.loading ? 'Loading…' : 'Re-read this window'}>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
-              <IconButton
+              {/* LABELLED for the same reason as All events: a bare glyph beside
+                  three pickers does not say what it re-reads, and the audit trail
+                  is exactly where "is this current?" matters most. */}
+              <Button
+                variant="outlined"
                 size="small"
-                onClick={() => loadHistory(history.range)}
+                startIcon={history.loading
+                  ? <CircularProgress size={14} />
+                  : <RefreshIcon />}
+                onClick={() => loadHistory(history.range, { limit: history.limit })}
                 disabled={history.loading}
                 aria-label="Reload history"
-                sx={{ flex: '0 0 auto' }}
+                sx={{ flex: '0 0 auto', whiteSpace: 'nowrap' }}
               >
-                {history.loading
-                  ? <CircularProgress size={16} />
-                  : <RefreshIcon fontSize="small" />}
-              </IconButton>
+                Refresh
+              </Button>
             </span>
           </Tooltip>
         </Stack>
@@ -3034,8 +3143,8 @@ function App() {
             {history.truncated ? (
               <MuiAlert severity="warning" sx={{ mb: 1 }}>
                 Showing the newest {history.events.length} of {history.total ?? 0}
-                {' '}arrivals in this window — narrow the window or the filter to see
-                older ones.
+                {' '}arrivals in this window — raise <strong>Show</strong>, narrow the
+                window, or filter to see older ones.
               </MuiAlert>
             ) : null}
             <PaneBoundary name="History">

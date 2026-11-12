@@ -547,7 +547,9 @@ wss.on('connection', async (ws) => {
       const range = RANGE_MS[frameIn.range] ? frameIn.range : '24h';
       const now = Date.now();
       const since = now - RANGE_MS[range];
-      const limit = Math.min(frameIn.limit || 1000, 1000);
+      // Mirror the gateway's clamp: `limit` is a PAGE size, and `total` still
+      // reports the whole window so the client can say "showing 50 of 812".
+      const limit = Math.max(1, Math.min(Number(frameIn.limit) || 50, 1000));
       const all = [...mockEventLog.values()]
         .filter((e) => (e.brokerTs ?? 0) > since)
         .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));

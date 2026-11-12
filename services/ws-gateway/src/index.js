@@ -776,11 +776,11 @@ async function handleHistoryQuery(conn, frame, send) {
     return;
   }
 
-  // `key` narrows the CLIENT-side view. It is applied here rather than pushed into
-  // the read because the index is scored by arrival time and members are
-  // `<key>|<id>`: a server-side prefix filter would be a full range walk per
-  // request. The window is bounded at 1000 rows, so filtering it here is cheap and
-  // keeps the read a plain ZREVRANGEBYSCORE.
+  // `key` narrows the result AFTER the read, and is applied here rather than pushed
+  // into it because the index is scored by arrival time and the condition key is a
+  // FIELD, not part of the member — a server-side filter would have to walk the
+  // range and read hashes. The page is bounded (default 50, max 1000), so filtering
+  // it here is cheap and keeps the read a plain ZREVRANGEBYSCORE.
   if (verdict.key) {
     rows = rows.filter((r) => r.key === verdict.key);
   }

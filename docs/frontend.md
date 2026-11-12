@@ -705,6 +705,12 @@ re-reads the window those narrow, so they are one group. A status caption stays 
 the right edge — it is a status line, not a control, and separating it from the
 buttons is what makes the grouping read correctly.
 
+It is **labelled `Refresh`, not an icon**. A bare glyph beside four equally-quiet
+controls did not answer "does this pane re-read itself?", which is a question an
+operator had to press it to find out. Query-backed tabs also re-read on **every tab
+entry** ([history.md](history.md) §5.1) — a pane whose content silently ages is
+worse than an empty one, because it reads as current.
+
 **Two chips joined by a line: connection → database.** They are separate because
 they fail separately — the socket can be perfectly healthy while the gateway's reads
 fail, which is a stale board behind a green chip. The line between them shows the

@@ -143,16 +143,34 @@ would be a constant 1. No Result column either — see §2.1.
 that lives on the other tabs. The one action offered is the inspector, because
 reading the full payload of a specific delivery is the thing this tab is for.
 
-### 5.1 Fetching
+### 5.1 Fetching, and the page size
 
-On first open only, unlike All events (which is fetched on connect so its badge is
-honest from the first frame).
+Re-queried **every time the tab is selected**, not once per connection.
 
-The difference is cost and habit: All events is the log an operator scans
-constantly, while History is a page of up to 1000 audit rows nobody needs a count
-of before they ask for it. Fetching it on every connect would spend a large read on
-a tab most sessions never open. This mirrors the old Closed tab's rule, which was
-right about *when* to fetch even though the tab itself was redundant.
+The earlier rule was "first open only", guarded on `loadedAt`, to avoid re-reading a
+large page on every tab switch. That was wrong in a way the operator sees: clicking
+the tab a second time showed rows from whenever it was first opened, with nothing on
+screen saying they were old — on a trail whose entire value is recency. A page is 50
+rows now, so refreshing is cheap enough to do unconditionally.
+
+The guard that replaced it is a **request signature** (`tab`, `status`, `range`,
+`limit`), held in a ref and cleared on leaving the tab. It fetches once per entry and
+does not re-fire on its own response — the failure mode without it is a loop:
+`loading` goes false, the effect runs, `total` resets to null, and the table sits
+beside a "showing 50 of 0" notice forever.
+
+**Page size is a separate control from the window.** The window is "how far back",
+the page is "how many rows"; conflating them would force an operator who wants more
+rows to also change the time range.
+
+| Show | default |
+|---|---|
+| 50 / 100 / 200 | **50** |
+
+50 rather than the gateway's maximum of 1000: the trail is read by skimming recent
+arrivals, and 1000 rows is both a scroll marathon and 1000 hashes out of Valkey per
+query. `total` still reports the whole window, so the notice can say
+"showing the newest 50 of 812" and point at `Show`.
 
 ### 5.2 `op: history`
 

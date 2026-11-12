@@ -1161,3 +1161,35 @@ test('CLOSED and CLEAR both read as a retirement', () => {
 test('CLOSED takes the retirement colour, not the unknown colour', () => {
   assert.equal(colourSeverity('CLOSE', 'CLOSED'), 'CLOSE');
 });
+
+// ---------------------------------- an operator DELETE is recorded in History
+test('a DELETED row is displayed and coloured as itself, not as a retirement', () => {
+  // Erasing a record is an ACTION, not a resolution. Mapping it onto the green
+  // retirement colour would claim the incident ended properly, when it was erased.
+  const v = toViewEvent({
+    id: 'delete-1', source: 'shop', type: 'check-001', severity: 'DELETED',
+    payload: { msg: 'disk almost full', EVT_Severity: 'DELETED' },
+  });
+  assert.equal(v.severity, 'DELETED');
+  assert.equal(v.displaySeverity, 'DELETED');
+  assert.equal(colourSeverity('DELETED', 'DELETED'), 'DELETED');
+  assert.equal(isRetirement('DELETED'), false, 'a delete is not a retirement');
+});
+
+test('DELETED ranks below every real severity', () => {
+  // It is a trail entry, never something to triage.
+  assert.ok(SEVERITY_RANK.DELETED > SEVERITY_RANK.CLOSE);
+  assert.ok(SEVERITY_RANK.DELETED > SEVERITY_RANK.FATAL);
+});
+
+test('a DELETED row keeps the severity it HAD, in the payload', () => {
+  // Otherwise deleting a CRITICAL and deleting a WARNING leave identical rows and
+  // the trail stops answering "what did we lose".
+  const v = toViewEvent({
+    id: 'delete-2', source: 'shop', type: 'check-001', severity: 'DELETED',
+    payload: {
+      msg: 'disk almost full', EVT_Severity: 'DELETED', EVT_WasSeverity: 'MAJOR',
+    },
+  });
+  assert.equal(v.payload.EVT_WasSeverity, 'MAJOR');
+});

@@ -115,6 +115,12 @@ export function loadConfig() {
     amqpExchange: optional('AMQP_EXCHANGE', ''),
     amqpRoutingKey: optional('AMQP_ROUTING_KEY', ''),
 
+    // Retention for the per-delivery audit trail. MUST match the worker's
+    // `FW_HISTORY_TTL`, or the two writers would age out of the same index at
+    // different rates — the gateway's entries would linger after the worker's
+    // hashes were gone, which reads as empty rows.
+    historyTtlMs: int('FW_HISTORY_TTL', 259200) * 1000,
+
     port: int('FW_PORT', 8080),
     logLevel: optional('FW_LOG_LEVEL', 'info'),
   };
@@ -142,4 +148,12 @@ export const keys = {
   event: (bare) => `event:${bare}`,
   /** Operator journal, a LIST per record. Separate from the hash on purpose. */
   journal: (bare) => `journal:${bare}`,
+  /**
+   * One audit row per DELIVERY. Written by the worker for every arrival, and by
+   * the GATEWAY for an operator delete — which destroys the record, so no pipeline
+   * downstream of it can ever see the event.
+   */
+  history: (deliveryId) => `hist:${deliveryId}`,
+  /** History index, scored by broker timestamp. Backs the History tab. */
+  historyIndex: 'idx:history',
 };

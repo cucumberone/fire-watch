@@ -43,6 +43,11 @@ const css = `
   --sev-warning-bg:#f59e0b;  --sev-warning-fg:#1a1a1a;
   --sev-harmless-bg:#16a34a; --sev-harmless-fg:#fff;
   --sev-close-bg:#15803d;    --sev-close-fg:#fff;
+  /* DELETED is an ACTION, not a condition severity, so it does not reuse the green
+     of a retirement: erasing an incident is not the same statement as resolving it.
+     Muted slate rather than a loud red — it is a fact in an audit trail, not an
+     alarm, and a red badge would read as "this is firing". */
+  --sev-deleted-bg:#4b5563;  --sev-deleted-fg:#fff;
   --row-fatal:#000;          --row-fatal-fg:#f5f5f5;
   --row-critical:#fdeaea;    --row-critical-fg:#7f1d1d;
   --row-warning:#fdf3dc;     --row-warning-fg:#5c3d05;
@@ -66,6 +71,11 @@ const css = `
     --sev-warning-bg:#f59e0b;  --sev-warning-fg:#1a1a1a;
     --sev-harmless-bg:#16a34a; --sev-harmless-fg:#fff;
     --sev-close-bg:#15803d;    --sev-close-fg:#fff;
+  /* DELETED is an ACTION, not a condition severity, so it does not reuse the green
+     of a retirement: erasing an incident is not the same statement as resolving it.
+     Muted slate rather than a loud red — it is a fact in an audit trail, not an
+     alarm, and a red badge would read as "this is firing". */
+  --sev-deleted-bg:#4b5563;  --sev-deleted-fg:#fff;
     --row-fatal:#000;          --row-fatal-fg:#f5f5f5;
     --row-critical:#381414;    --row-critical-fg:#fecaca;
     --row-warning:#33280c;     --row-warning-fg:#fde68a;
@@ -85,6 +95,11 @@ const css = `
   --sev-warning-bg:#f59e0b;  --sev-warning-fg:#1a1a1a;
   --sev-harmless-bg:#16a34a; --sev-harmless-fg:#fff;
   --sev-close-bg:#15803d;    --sev-close-fg:#fff;
+  /* DELETED is an ACTION, not a condition severity, so it does not reuse the green
+     of a retirement: erasing an incident is not the same statement as resolving it.
+     Muted slate rather than a loud red — it is a fact in an audit trail, not an
+     alarm, and a red badge would read as "this is firing". */
+  --sev-deleted-bg:#4b5563;  --sev-deleted-fg:#fff;
   --row-fatal:#000;          --row-fatal-fg:#f5f5f5;
   --row-critical:#381414;    --row-critical-fg:#fecaca;
   --row-warning:#33280c;     --row-warning-fg:#fde68a;
@@ -247,6 +262,7 @@ tr.retirement td:first-child { opacity:1; }
 .sev-warning  { background:var(--sev-warning-bg);  color:var(--sev-warning-fg); }
 .sev-harmless { background:var(--sev-harmless-bg); color:var(--sev-harmless-fg); }
 .sev-close    { background:var(--sev-close-bg);    color:var(--sev-close-fg); }
+.sev-deleted  { background:var(--sev-deleted-bg);  color:var(--sev-deleted-fg); }
 /* A row whose severity was never learned: it was incremented by a content
    duplicate that carried no event, so there is nothing to colour it by.
    Without this rule the badge would be unstyled rather than obviously unknown. */

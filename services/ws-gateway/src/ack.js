@@ -231,6 +231,60 @@ export function isValidEventId(id) {
 }
 
 /**
+ * Build the HISTORY ROW for an operator delete.
+ *
+ * A delete is the one operation that produces no delivery: it removes the record
+ * and its index members, so the worker never sees the event and can never fork it
+ * into `hist:` (docs/history.md §3). The gateway writes the row itself, from the
+ * record it read immediately before deleting it — afterwards there is nothing left
+ * to describe.
+ *
+ * SEVERITY. The row keeps `DELETED` as both the internal and the display value.
+ * That is deliberate and slightly unusual: every other row's `severity` is drawn
+ * from the fold's five-value scale. This one is not a condition severity at all, it
+ * is an ACTION, and mapping it onto `CLOSE` would claim the incident was resolved
+ * when it was actually erased. Keeping it distinct means the History tab can render
+ * it as its own thing rather than as a retirement.
+ *
+ * The record's ORIGINAL severity is preserved in the payload as `EVT_WasSeverity`,
+ * so "this CRITICAL was deleted" is still answerable from the row.
+ *
+ * @param {object} record  the stored record, read before deletion
+ * @param {string} by      the operator's name
+ * @param {number} nowMs   when the delete happened
+ */
+export function operatorDeleteRow(record, by, nowMs, deliveryId = `delete-${record?.key ?? ''}-${nowMs}`) {
+  const source = String(record?.source ?? '');
+  const summary = String(record?.summary ?? '');
+  const wasSeverity = String(record?.displaySeverity || record?.severity || '');
+  return {
+    // `id` is the PRODUCER message id in an arrival row. A delete has no message,
+    // so it carries its own delivery id — that is what the History tab renders next
+    // to the timestamp, and leaving it blank would make the row identify nothing.
+    id: deliveryId,
+    key: String(record?.key ?? ''),
+    source,
+    type: String(record?.type ?? ''),
+    severity: 'DELETED',
+    displaySeverity: 'DELETED',
+    msg: summary,
+    brokerTs: nowMs,
+    ts: new Date(nowMs).toISOString(),
+    payload: {
+      msg: summary,
+      EVT_Severity: 'DELETED',
+      EVT_Device: source,
+      EVT_Summary: summary,
+      EVT_Agent: by,
+      EVT_DeletedBy: by,
+      // What it WAS. Without this, deleting a CRITICAL and deleting a WARNING
+      // leave identical rows and the trail stops being an audit.
+      EVT_WasSeverity: wasSeverity,
+    },
+  };
+}
+
+/**
  * Frame telling clients an event was deleted.
  *
  * A distinct op rather than an `alert` frame, because the two clients that care need

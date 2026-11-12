@@ -410,7 +410,7 @@ test('every method index.js calls exists on the reader', () => {
   // gateway without adding it here is the review point, and the assertion is
   // against the real prototype.
   const used = [
-    'ackAlert', 'appendJournal', 'closeAlert', 'deleteEvent', 'isSubscribed',
+    'ackAlert', 'appendHistory', 'appendJournal', 'closeAlert', 'deleteEvent', 'isSubscribed',
     'ping', 'publish', 'quit', 'readAcks', 'readAlert', 'readAllEvents',
     'readClosedAlerts', 'readEvent', 'readEvents', 'readHistory', 'readIndex',
     'readIndexRange', 'readJournals', 'readOpenAlerts', 'subscribe',

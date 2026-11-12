@@ -107,6 +107,42 @@ is the correct trade — a gap in the log is worse than a gap in the cache, and 
 broker will redeliver the message anyway (producing a second audit row, which is
 accurate).
 
+## 3.2 The one row the worker cannot write: an operator DELETE
+
+`hist:` is normally owned by the worker, which forks every delivery before the fold
+(§3). A **delete** is the exception, and it has to be.
+
+Deleting removes the record and every index member it appears in
+([acknowledge.md](acknowledge.md) §8.2). There is no delivery left for the worker to
+see — the event never enters the pipeline at all — so the trail would have a hole
+exactly where a human made an irreversible decision.
+
+So the gateway writes that row itself, via `appendHistory()`, **before** it deletes:
+
+| | |
+|---|---|
+| **Why before** | The summary, device and severity live only in the hash about to be removed. Afterwards there is nothing left to describe. |
+| **Why it aborts the delete on failure** | Losing the audit trail for an irreversible action is worse than the operator retrying. The row is the only proof the event existed. |
+| **Severity** | `DELETED`, in both `severity` and `displaySeverity` |
+| **`EVT_WasSeverity`** | what the event was, so "we deleted a CRITICAL" stays answerable |
+| **`key`** | the condition key, so the row points at what it erased |
+
+### 3.2.1 `DELETED` is not a severity
+
+It is an **action**, and it is deliberately not mapped onto `CLOSE`:
+
+- `CLOSE` says the incident was resolved. A delete says it was **erased**. Those are
+  opposite claims and the trail must not blur them.
+- It is therefore not a `isRetirement()` value either, so it does not get the dimmed
+  retirement styling.
+- Its badge is muted slate, not the retirement green and not alarm red: it is a fact
+  in a log, not something to triage.
+- It sorts **last** in `SEVERITY_RANK`, below every real severity.
+
+The colour and the label are wired through `colourSeverity` and the `.sev-deleted`
+class, so a deleted row is visually distinct from every condition severity without
+inventing a sixth level of urgency.
+
 ## 4. Retention — 3 days, on its own clock
 
 `FW_HISTORY_TTL`, default `259200` (3 days), against the record's 7.

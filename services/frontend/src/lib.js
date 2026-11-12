@@ -421,7 +421,12 @@ export function formatClock(ms) {
  * and `MINOR`/`INDETERMINATE` as `WARNING`, mapped once in the ingress, so the UI
  * never has to know the source scale.
  */
-export const SEVERITY_RANK = { FATAL: 0, CRITICAL: 1, WARNING: 2, HARMLESS: 3, CLOSE: 4 };
+export const SEVERITY_RANK = {
+  FATAL: 0, CRITICAL: 1, WARNING: 2, HARMLESS: 3, CLOSE: 4,
+  // `DELETED` ranks last: an erased record is a trail entry, not something to
+  // triage, and it must never sort above a live incident.
+  DELETED: 5,
+};
 
 /**
  * Retirement signals: these end an alert episode rather than starting one.
@@ -466,6 +471,10 @@ const DISPLAY_TO_COLOUR = {
   // but the display label `CLOSED`, so an operator can tell a human-ended incident
   // from a source-sent CLEAR at a glance. Same green as every other retirement.
   CLOSED: 'CLOSE',
+  // An operator DELETE. Not a severity at all — an ACTION — so it maps to itself
+  // and gets its own colour. Mapping it onto `CLOSE` would say the incident was
+  // resolved when it was erased, which is the opposite claim.
+  DELETED: 'DELETED',
 };
 
 /**

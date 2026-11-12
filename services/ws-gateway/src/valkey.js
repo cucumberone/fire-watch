@@ -615,6 +615,64 @@ export class ValkeyReader {
   }
 
   /**
+   * Write ONE audit row for an action the gateway itself performed.
+   *
+   * The worker owns `hist:` for arrivals — it forks every delivery before the fold
+   * (docs/history.md §3). This exists for the one operation that produces no
+   * delivery the worker can ever see: an operator DELETE, which destroys the record
+   * and its index members outright.
+   *
+   * A delete therefore has to be recorded where it happens, or the trail would have
+   * a hole exactly where a human made an irreversible decision — the same argument
+   * that made an operator close an event (docs/event-lifecycle.md §8.2).
+   *
+   * The row is built from the record READ BEFORE the delete, because afterwards
+   * there is nothing left to describe.
+   *
+   * @param {string} deliveryId  unique id for this action (the index member)
+   * @param {object} row         hash fields; `key`, `source`, `type`, `severity`,
+   *                             `displaySeverity`, `msg`, `payload`, `brokerTs`
+   */
+  async appendHistory(deliveryId, row, ttlMs) {
+    const key = `hist:${deliveryId}`;
+    const fields = [];
+    for (const [name, value] of Object.entries(row)) {
+      if (value === undefined || value === null) continue;
+      // Objects are JSON-encoded, not string-coerced: `String({...})` is
+      // "[object Object]", which is what the History inspector would have shown
+      // for every deleted row's payload. The reader `safeParse`s it back.
+      fields.push(name, typeof value === 'object' ? JSON.stringify(value) : String(value));
+    }
+    if (fields.length === 0) return false;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const c = await this.connect();
+      try {
+        const res = await c
+          .multi()
+          .hset(key, ...fields)
+          .pexpire(key, ttlMs)
+          .zadd('idx:history', Number(row.brokerTs) || Date.now(), deliveryId)
+          .exec();
+        // ioredis reports per-command errors in the tuples rather than throwing.
+        // Swallowing one would leave an index member with no hash behind it, which
+        // renders as an empty row.
+        for (const [err] of res || []) {
+          if (err) throw err;
+        }
+        return true;
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const retryable = msg.includes('READONLY') || msg.includes('Connection is closed');
+        if (!retryable || attempt === 1) throw err;
+        this.log.warn('history write hit a demoted node, re-resolving master', { err: msg });
+        await this.reset();
+      }
+    }
+    throw new Error('unreachable');
+  }
+
+  /**
    * Delete one event record permanently.
    *
    * Removes the hash and its member from EVERY index the record appears in, so no

@@ -24,6 +24,7 @@ import {
   validateHistoryQuery,
   HISTORY_RANGES,
   operatorCloseEvent,
+  operatorDeleteRow,
 } from './ack.js';
 
 const key = (c = 'a') => c.repeat(KEY_LEN);
@@ -210,4 +211,56 @@ test('each operator close gets its own event id', () => {
   const a = operatorCloseEvent(r, 'alice', 1000);
   const b = operatorCloseEvent(r, 'alice', 2000);
   assert.notEqual(a.id, b.id, 'two closes are two events, not one overwriting the other');
+});
+
+// ------------------------------------------------- operator DELETE gets a row
+test('the delete row describes what was erased', () => {
+  // A delete removes the record and its index members, so the worker never sees a
+  // delivery and can never fork this into the audit trail. The gateway writes the
+  // row from the record it read immediately before deleting.
+  const record = {
+    key: GOOD, source: 'db-node-03', type: 'hw.psu.voltage',
+    summary: 'PSU 2 input voltage out of range',
+    severity: 'CLOSE', displaySeverity: 'MAJOR',
+  };
+  const row = operatorDeleteRow(record, 'alice', 1_800_000_000_000);
+
+  assert.equal(row.key, GOOD, 'the row points at the condition it erased');
+  assert.equal(row.source, 'db-node-03');
+  assert.equal(row.msg, 'PSU 2 input voltage out of range',
+    'the summary survives only in this row');
+  assert.equal(row.severity, 'DELETED');
+  assert.equal(row.payload.EVT_DeletedBy, 'alice');
+});
+
+test('the delete row records the severity the event HAD', () => {
+  // Without this, deleting a CRITICAL and deleting a WARNING leave identical rows
+  // and the trail stops being an audit.
+  const row = operatorDeleteRow(
+    { key: GOOD, source: 's', type: 't', summary: 'x', severity: 'CLOSE', displaySeverity: 'MAJOR' },
+    'bob', 1000,
+  );
+  assert.equal(row.payload.EVT_WasSeverity, 'MAJOR',
+    'the PRODUCER label is what an operator recognises');
+});
+
+test('the delete row falls back to the internal severity when there is no label', () => {
+  const row = operatorDeleteRow(
+    { key: GOOD, source: 's', type: 't', summary: 'x', severity: 'CRITICAL' },
+    'bob', 1000,
+  );
+  assert.equal(row.payload.EVT_WasSeverity, 'CRITICAL');
+});
+
+test('every field the history reader expects is present', () => {
+  // HISTORY_FIELDS in valkey.js: key, id, source, type, severity, displaySeverity,
+  // msg, payload, brokerTs, ts. A missing one is a blank column, not an error.
+  const row = operatorDeleteRow(
+    { key: GOOD, source: 's', type: 't', summary: 'x', severity: 'WARNING' },
+    'alice', 1000,
+  );
+  for (const f of ['key', 'source', 'type', 'severity', 'displaySeverity', 'msg', 'payload', 'brokerTs', 'ts']) {
+    assert.ok(row[f] !== undefined && row[f] !== null && row[f] !== '', `${f} must be set`);
+  }
+  assert.equal(typeof row.payload, 'object', 'payload is stored as a value; the writer stringifies');
 });

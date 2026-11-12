@@ -35,6 +35,7 @@ import {
   validateClosedQuery,
   validateAllEventsQuery,
   operatorCloseEvent,
+  operatorDeleteRow,
   validateHistoryQuery,
   normaliseAck,
   ackFrame,
@@ -609,6 +610,34 @@ async function handleDelete(conn, frame, send) {
     return;
   }
 
+  // ---- audit the deletion FIRST.
+  //
+  // Before the record is destroyed, because afterwards there is nothing left to
+  // describe: the summary, the device and the severity all live only in the hash
+  // this call is about to remove. Written before the delete so a crash in between
+  // leaves a row for an event that still exists (wrong, but harmless and visible)
+  // rather than a deletion nobody can prove happened.
+  //
+  // A failure here ABORTS the delete. Losing the audit trail for an irreversible
+  // action is worse than the operator retrying, and the row is the only record that
+  // the event ever existed.
+  const nowMs = Date.now();
+  const deliveryId = `delete-${verdict.id}-${nowMs}`;
+  const deleteRow = operatorDeleteRow({ ...evt, key: verdict.id }, verdict.by, nowMs, deliveryId);
+  try {
+    await reader.appendHistory(deliveryId, deleteRow, cfg.historyTtlMs);
+  } catch (err) {
+    log.error('delete: could not write the history row, aborting', {
+      id: verdict.id, err: String(err),
+    });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'delete_failed',
+      message: 'could not record the delete, retry',
+    }));
+    return;
+  }
+
   try {
     // The device is passed so the per-device index member is removed as well. It is
     // read from the record above, which is why the read happens before the delete:
@@ -636,7 +665,9 @@ async function handleDelete(conn, frame, send) {
 
   // Loud on purpose: this is the one irreversible action in the system, so it
   // leaves a trace in the gateway log naming who did it and what was destroyed.
-  log.warn('event deleted', { id: verdict.id, source: evt.source, by: verdict.by });
+  log.warn('event deleted', {
+    id: verdict.id, source: evt.source, by: verdict.by, wasSeverity: evt.displaySeverity || evt.severity,
+  });
 
   send(deletedFrame(verdict.id));
 

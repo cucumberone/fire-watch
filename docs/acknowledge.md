@@ -238,9 +238,20 @@ is otherwise absolute and a reader needs to know exactly where the exception is.
 ### 10.1 What it does, and what it cannot undo
 
 ```text
+HSET hist:<delete-id>                   the AUDIT ROW, written first
+ZADD idx:history <ts> <delete-id>
 DEL  event:<key>                        the record
 ZREM idx:event:all idx:event:open idx:event:closed  its index members
 ```
+
+**The audit row comes first, and aborts the delete if it fails.** A delete is the
+one operation that never enters the worker pipeline — the record is destroyed, so no
+delivery exists for it to fork into `hist:` — which means this is the only place the
+trail can record that a human erased something. Losing that row would be worse than
+a failed delete, so the order is write-then-delete, not delete-then-log. The row is
+built from the record read just above, because afterwards there is no summary,
+device or severity left to describe
+([history.md](history.md) §3.2).
 
 Both keys must go together. `ZADD` members never expire on their own, so a
 leftover index entry is a **dangling id**: backfill reads it, finds no record, and

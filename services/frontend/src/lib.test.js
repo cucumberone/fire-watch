@@ -460,6 +460,60 @@ test('toViewEvent prefers worker-enriched occurrence fields', () => {
   assert.equal(view.count, 7);
 });
 
+test('toViewEvent keeps the RECORD episode bounds when the payload has none', () => {
+  // Regression: All events rendered `firstOccurrence` straight from this mapper,
+  // which only consulted the payload and then fell back to `brokerTs`. `brokerTs`
+  // is rewritten on every delivery, so after three identical events the All events
+  // tab showed first == last == the newest delivery while Count was 3 — and the
+  // Open alerts tab, which reads `firstSeen` off the row, showed the true start.
+  // Two tabs, one record, disagreeing. The fold's values must win over `brokerTs`.
+  const view = toViewEvent({
+    brokerTs: 3000,          // newest delivery, NOT the episode start
+    firstOccurrence: 1000,   // the fold's `firstSeen`
+    lastOccurrence: 3000,    // the fold's `lastSeen`
+    payload: {},
+  });
+  assert.equal(view.firstOccurrence, 1000, 'must not use brokerTs as the start');
+  assert.equal(view.lastOccurrence, 3000);
+});
+
+test('toViewEvent falls back to lastSeen when the row only carries that', () => {
+  const view = toViewEvent({ brokerTs: 3000, lastSeen: 2500, payload: {} });
+  assert.equal(view.lastOccurrence, 2500);
+});
+
+test('a payload occurrence field still beats the record field', () => {
+  // A producer that reports its own window is authoritative: the fold bounds are
+  // when the BROKER saw the condition, not when the device observed it.
+  const view = toViewEvent({
+    brokerTs: 3000,
+    firstOccurrence: 1000,
+    payload: { FirstOccurrence: 500 },
+  });
+  assert.equal(view.firstOccurrence, 500);
+});
+
+test('toViewEvent maps the record count onto alertCount', () => {
+  // The All events table renders `alertCount` — a name left over from when that
+  // column was a rollup joined in from a separate alert hash. The row IS the record
+  // now, so the fold's `count` is that same number, but nothing copied it across and
+  // the column read `—` on every row: the `EVT_*` schema has no producer `Count`
+  // field, so the payload never supplied one.
+  const view = toViewEvent({ brokerTs: 3000, count: 3, payload: {} });
+  assert.equal(view.alertCount, 3, 'the row count must reach the column that renders it');
+});
+
+test('alertCount is null when nothing has told us the count', () => {
+  // `null` renders as `—`, which is the honest answer. Falling back to 1 would
+  // claim "reported once" for a record we know nothing about.
+  const view = toViewEvent({ brokerTs: 3000, payload: {} });
+  assert.equal(view.alertCount, null);
+});
+
+test('a producer Count wins over the record count', () => {
+  const view = toViewEvent({ brokerTs: 3000, count: 5, payload: { Count: 9 } });
+  assert.equal(view.alertCount, 9);
+});
 test('toViewEvent accepts snake_case and camelCase occurrence spellings', () => {
   const snake = toViewEvent({ payload: { first_occurrence: 10, last_occurrence: 20, count: 3 } });
   assert.equal(snake.firstOccurrence, 10);

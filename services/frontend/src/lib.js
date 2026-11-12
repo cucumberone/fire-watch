@@ -201,15 +201,34 @@ export function toViewEvent(evt) {
     // showed. Decoding happens in `decodePayload` on the paths that can await;
     // where it did not run, this yields '' and the row simply has no fold.
     msgCompleteString: asPayloadText(firstPresent(payload, [WIRE_FIELD.msgCompleteString])),
+    // Order matters: a producer-supplied timestamp wins, then the RECORD's own
+    // value, and only then `brokerTs`.
+    //
+    // `firstSeen` / `lastSeen` on the row are the fold's authoritative episode
+    // boundaries. Falling straight through to `fallbackTs` threw them away, and
+    // `brokerTs` is rewritten on EVERY delivery — so All events showed a "first
+    // occurrence" that advanced with each repeat, and First == Last on a row whose
+    // Count was 3. Open alerts read `row.firstSeen` directly and were correct, which
+    // is what made the two tabs disagree about the same record.
     firstOccurrence: asTime(
       firstPresent(payload, ['FirstOccurrence', 'firstOccurrence', 'first_occurrence']),
-      fallbackTs,
+      asTime(evt?.firstOccurrence, fallbackTs),
     ),
     lastOccurrence: asTime(
       firstPresent(payload, ['LastOccurrence', 'lastOccurrence', 'last_occurrence']),
-      fallbackTs,
+      asTime(evt?.lastOccurrence, asTime(evt?.lastSeen, fallbackTs)),
     ),
     count: asCount(firstPresent(payload, ['Count', 'count']), 1),
+    // The record's own repeat counter. The All events table renders `alertCount`
+    // because it used to be a ROLLUP column joined in from a separate alert hash;
+    // now the row IS the record, so the fold's `count` on the row is the same
+    // number and there is nothing to join. Without this the column read `—` on
+    // every row whose payload had no producer-side `Count` — i.e. all of them,
+    // since the `EVT_*` schema has no such field.
+    alertCount: asCount(
+      firstPresent(payload, ['Count', 'count']),
+      asCount(evt?.count, asCount(evt?.alertCount, null)),
+    ),
   };
 
   // The badge must show the PRODUCER's severity, not the internal one.

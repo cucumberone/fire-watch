@@ -94,6 +94,8 @@ export class ValkeyReader {
     // SHA of the snapshot script, memoised after the first SCRIPT LOAD so a
     // reconnect does not pay for it again.
     this._snapSha = null;
+    // In-flight connect(), shared by concurrent callers. See connect().
+    this._connecting = null;
   }
 
   async resolveMaster() {
@@ -128,30 +130,55 @@ export class ValkeyReader {
     throw new Error(`no sentinel could resolve the master: ${lastErr ? String(lastErr) : 'none'}`);
   }
 
+  /**
+   * Connect on demand, with ONE attempt in flight at a time.
+   *
+   * Every call used to build a brand-new client, overwrite `this.client`, and then
+   * `await connect()`. That is not safe when several callers arrive together, which
+   * is exactly what happens at boot: the snapshot, the ack-state read and the tick
+   * all fire at once. The second call replaced the client the first was still
+   * connecting, so commands went out on a socket that had not reached `ready` yet and
+   * were rejected with
+   *
+   *   Stream isn't writeable and enableOfflineQueue options is false
+   *
+   * which is what left the board empty on first load ("alert snapshot failed"). The
+   * `lazyConnect` fix addressed issuing commands before connect() was CALLED; this
+   * addresses two connect() calls racing each other.
+   */
   async connect() {
     if (this.client && this.client.status === 'ready') return this.client;
-    const master = await this.resolveMaster();
-    this.log.info('resolved valkey master for reads', master);
+    if (this._connecting) return this._connecting;
 
-    const opts = {
-      host: master.host,
-      port: master.port,
-      password: this.cfg.valkeyPassword,
-      // lazyConnect + explicit connect(). With enableOfflineQueue:false any command
-      // sent before the socket is ready is rejected with
-      //   "Stream isn't writeable and enableOfflineQueue options is false"
-      // so issuing ping() right after the constructor was a race. The gateway lost
-      // it at boot and logged "subscribe failed, retrying in 3s".
-      lazyConnect: true,
-      enableOfflineQueue: false,
-      maxRetriesPerRequest: 2,
-      retryStrategy: (times) => Math.min(times * 200, 3000),
-    };
-    this.client = new Redis(opts);
-    this.client.on('error', (e) => this.log.warn('read socket error', { err: String(e) }));
-    await this.client.connect();
-    await this.client.ping();
-    return this.client;
+    this._connecting = (async () => {
+      const master = await this.resolveMaster();
+      this.log.info('resolved valkey master for reads', master);
+
+      const opts = {
+        host: master.host,
+        port: master.port,
+        password: this.cfg.valkeyPassword,
+        // lazyConnect + explicit connect(). With enableOfflineQueue:false any command
+        // sent before the socket is ready is rejected with
+        //   "Stream isn't writeable and enableOfflineQueue options is false"
+        // so issuing ping() right after the constructor was a race. The gateway lost
+        // it at boot and logged "subscribe failed, retrying in 3s".
+        lazyConnect: true,
+        enableOfflineQueue: false,
+        maxRetriesPerRequest: 2,
+        retryStrategy: (times) => Math.min(times * 200, 3000),
+      };
+      const client = new Redis(opts);
+      client.on('error', (e) => this.log.warn('read socket error', { err: String(e) }));
+      await client.connect();
+      await client.ping();
+      // Only publish it once it is usable: a half-open client must never be handed to
+      // another caller, or the failure mode above comes straight back.
+      this.client = client;
+      return client;
+    })().finally(() => { this._connecting = null; });
+
+    return this._connecting;
   }
 
   /** Subscribe to a channel. Callback receives the raw message string. */

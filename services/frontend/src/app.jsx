@@ -829,13 +829,34 @@ function useSocket(config) {
           let changed = false;
           const events = prev.events.map((e) => {
             if (e.key !== frame.key) return e;
-            if (e.alertState === nowState) return e;
+            // The record fields come from the row, not from this frame: `op: event`
+            // carries the producer's message and nothing else, while the row is the
+            // FOLD's view of the condition — `count`, `firstSeen`, `lastSeen`.
+            //
+            // Without this merge a live arrival rendered Count `—` and
+            // First == Last, because `op: event` has no counters at all; only a
+            // fresh `allEvents` QUERY filled them in. Measured: the same record read
+            // `3 | 19:33:21 -> 19:33:23` from a query and `— | 19:33:36 -> 19:33:36`
+            // after one live delivery — two tabs disagreeing about one record, and
+            // the All events tab contradicting itself depending on how it was loaded.
+            const enriched = frame.row
+              ? {
+                ...e,
+                count: frame.row.count ?? e.count,
+                firstOccurrence: frame.row.firstOccurrence ?? e.firstOccurrence,
+                lastOccurrence: frame.row.lastOccurrence ?? e.lastOccurrence,
+                alertCount: frame.row.count ?? e.alertCount,
+                alertClosedAt: frame.row.alertClosedAt ?? e.alertClosedAt,
+                alertState: frame.row.alertState ?? nowState,
+              }
+              : { ...e, alertState: nowState };
+            if (enriched.alertState === e.alertState
+                && enriched.count === e.count
+                && enriched.lastOccurrence === e.lastOccurrence) {
+              return e;
+            }
             changed = true;
-            return {
-              ...e,
-              alertState: nowState,
-              alertClosedAt: nowState === 'closed' ? Date.now() : null,
-            };
+            return enriched;
           });
           return changed ? { ...prev, events } : prev;
         });
@@ -1146,11 +1167,18 @@ function useSocket(config) {
       // would disagree with the stored state until the next write
       // (docs/acknowledge.md §10.1). What is dropped is the row's reference to the
       // dead record, so it stops offering an id that resolves to nothing.
-      setEvents((prev) => prev.filter((e) => e.id !== frame.id));
-      setAllEvents((prev) => (prev.events.some((e) => e.id === frame.id)
+      // A row is identified by its RECORD KEY here, not by its message id. A live
+      // `op: event` row carries the arrival's id in `id` (so two deliveries to the
+      // same condition are distinguishable in the tail) while `key` holds the record
+      // key — and `op: delete` addresses the RECORD. Filtering on `id` therefore
+      // removed the row only when a query had loaded it (where id === key) and left
+      // it in place when it had arrived live: delete looked like it did nothing.
+      const isTarget = (e) => (e.key ?? e.id) === frame.id;
+      setEvents((prev) => prev.filter((e) => !isTarget(e)));
+      setAllEvents((prev) => (prev.events.some(isTarget)
         ? {
           ...prev,
-          events: prev.events.filter((e) => e.id !== frame.id),
+          events: prev.events.filter((e) => !isTarget(e)),
           // The window no longer holds it either, so the count must follow or the
           // badge would outlive the row it was counting.
           // The window total plus whatever has arrived since, so the badge and the
@@ -1163,25 +1191,42 @@ function useSocket(config) {
         }
         : prev));
       setAlerts((prev) => {
-        let changed = false;
+        // The row IS the record now: one hash per condition, and the gateway's
+        // snapshot/reply rows carry the record fields directly, not under `event`.
+        // This still asked for `row.event.id`, which no row has had since the
+        // Valkey migration — so the branch matched nothing, the alert stayed in the
+        // map, and "Open alerts" kept a badge of 1 with `dbsize: 0` behind it. The
+        // row must be REMOVED, not blanked: a condition with no record has nothing
+        // to display, and the old code left a skeleton row behind.
+        const has = prev.has(frame.id);
+        if (!has) return prev;
         const next = new Map(prev);
-        for (const [key, row] of next) {
-          if (row?.event?.id !== frame.id) continue;
-          next.set(key, { ...row, event: undefined });
-          changed = true;
-        }
-        return changed ? next : prev;
+        next.delete(frame.id);
+        return next;
       });
-      setClosedState((prev) => (prev.alerts.some((r) => r?.event?.id === frame.id)
-        ? {
-          ...prev,
-          alerts: prev.alerts.map((r) => (r?.event?.id === frame.id ? { ...r, event: undefined } : r)),
+      setClosedState((prev) => {
+        // A delete removes the record from `idx:event:closed` too, so the Closed
+        // tab must lose the row AND the badge must lose one — `count` is not a
+        // cumulative closure counter: the `op: closed` reply sets it to
+        // `alerts.length` on every fetch. Leaving it alone here let the badge claim
+        // a closure the server no longer had (measured: badge 1, list "0 of 0
+        // loaded", and the row only reappearing after an unrelated reload).
+        const had = prev.alerts.some((r) => (r?.key ?? r?.id) === frame.id);
+        if (!had) {
+          // The row may not be loaded yet while the badge already counts it, so
+          // force the next open to re-fetch rather than trust a list that predates
+          // this delete.
+          return prev.loadedAt === null ? prev : { ...prev, loadedAt: null };
         }
-        : prev));
+        return {
+          ...prev,
+          alerts: prev.alerts.filter((r) => (r?.key ?? r?.id) !== frame.id),
+          count: Math.max(0, prev.count - 1),
+        };
+      });
       return;
     }
-    if (frame.op === 'error') {
-      // A gateway older than this bundle does not know `resync`. That is a deploy
+    if (frame.op === 'error') {      // A gateway older than this bundle does not know `resync`. That is a deploy
       // skew, not something the operator can act on, and retrying cannot fix it:
       // stop sending it and say so once. Showing the raw frame (
       // `bad_op: unknown op resync`) every 60 seconds reads as a frontend bug.
@@ -1956,13 +2001,18 @@ function ClosedRow({ row, onContextMenu }) {
       className={severityRowClass(row.severity, 'retirement')}
       onContextMenu={onContextMenu}
     >
-      <td><Badge severity={row.severity} label={row.event?.displaySeverity} /></td>
-      <td className="mono">{formatClock(row.closedAt)}</td>
-      <td className="mono">{formatClock(row.firstSeen)}</td>
-      <td className="mono">{formatClock(row.lastSeen)}</td>
+      <td><Badge severity={row.severity} label={row.displaySeverity ?? row.event?.displaySeverity} /></td>
+      {/* Field names follow the WIRE row, not the old alert-rollup shape: the gateway
+          sends `alertClosedAt` / `firstOccurrence` / `lastOccurrence` (plus `count`).
+          Reading `closedAt` / `firstSeen` / `lastSeen` matched nothing, so all three
+          timestamp columns rendered empty on a row that had every value. The old
+          names are kept as fallbacks because the snapshot path reshapes rows. */}
+      <td className="mono">{formatClock(row.alertClosedAt ?? row.closedAt ?? row.event?.alertClosedAt)}</td>
+      <td className="mono">{formatClock(row.firstOccurrence ?? row.firstSeen ?? row.event?.firstOccurrence)}</td>
+      <td className="mono">{formatClock(row.lastOccurrence ?? row.lastSeen ?? row.event?.lastOccurrence)}</td>
       <td className="num">{row.count}</td>
       <td className="summary">
-        {row.event?.summary || <span className="dim">—</span>}
+        {row.summary ?? row.msg ?? row.event?.summary ?? <span className="dim">—</span>}
       </td>
       <td className="mono nowrap">{row.key}</td>
       <td />
@@ -1984,14 +2034,14 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
       // explicit affordance (see the selection bar) rather than a hidden mode.
       aria-selected={selected || undefined}
     >
-      <td><Badge severity={alert.severity} label={alert.event?.displaySeverity} /></td>
+      <td><Badge severity={alert.severity} label={alert.displaySeverity ?? alert.event?.displaySeverity} /></td>
       {/* Order follows the live table: severity, first, last, count, summary.
           Key is last: it is a stable identifier, read once when you need it,
           not scanned down the column on every glance. */}
       <td className="mono">{formatClock(alert.firstSeen)}</td>
       <td className="mono">{formatClock(alert.lastSeen)}</td>
       <td className="num">{alert.count}</td>
-      <td className="summary">{alert.event?.summary || <span className="dim">—</span>}</td>
+      <td className="summary">{alert.summary ?? alert.msg ?? alert.event?.summary ?? <span className="dim">—</span>}</td>
       <td className="ackcell">
         {acked
           ? <span className="acked-tag" title={`${ack.by} at ${formatClock(ack.at)}`}>acked · {ack.by}</span>

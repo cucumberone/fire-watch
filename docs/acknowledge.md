@@ -143,7 +143,7 @@ CLEAR event from the source produces* — including a real event record:
 |---|---|
 | `HSET event:<key> state=closed` (+ `closedBy`, `closedAt`) | otherwise the row still reads as firing |
 | `ZREM idx:event:open` | otherwise the snapshot resurrects a closed row on every client's next page load — a phantom row nobody can clear |
-| `ZADD idx:event:closed` | otherwise the **Closed tab cannot enumerate the closure at all** |
+| `ZADD idx:event:closed` | otherwise **nothing can enumerate the closure** — the open index no longer holds the key |
 | `HDEL event:<key> ackedBy ackedAt` | an ack belongs to one EPISODE; a retired row must not come back still marked "acked by alice" |
 | `HSET state=closed severity=CLOSE closedBy=… closedAt=… lastId=…` | the record itself, now pointing at the close event |
 | `HDEL ackedBy ackedAt` | the ack belonged to the episode that has just ended |
@@ -156,7 +156,7 @@ first, second and last rows — it flipped the hash and moved the indexes. The a
 disappeared and that looked correct, but the closure existed nowhere else: no
 entry in the retention window, no summary, no author, and a gap in the audit
 trail exactly where a human made a decision. It also could not appear in the
-Closed tab, which enumerates from an index no part of that write maintained.
+retired set, which enumerates from an index no part of that write maintained.
 
 The record is a normal event with `severity: CLOSE` and
 `payload.EVT_Severity: CLEAR`, so it flows through the same paths as a
@@ -174,7 +174,7 @@ nobody overwrites the record of who actually closed it.
 
 The broadcast is two frames: `op: alert` with `applied: 3` (retire the row, the
 same frame a source CLOSE produces) and `op: event` with `applied: 3` (show the
-CLEAR in the live tail). The client also marks the Closed tab stale, so it
+CLEAR in the live tail). The client also marks its query-backed views stale, so it
 re-fetches on next open rather than after every single close in a bulk action.
 
 **Bulk actions.** Rows select with a plain click, `Shift+click` for a range and

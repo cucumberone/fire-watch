@@ -487,7 +487,7 @@ async function handleClose(conn, frame, send) {
   // identically.
   //
   // A fan-out failure is logged but not fatal: the record is already durable in
-  // Dragonfly and the Closed tab is a query, so it will show there regardless.
+  // Dragonfly and `op: closed` is a query, so it will show there regardless.
   if (result.eventId) {
     try {
       await reader.publish(cfg.channelEvents, JSON.stringify({
@@ -520,7 +520,7 @@ async function handleClose(conn, frame, send) {
       // Tagged with this pod so the subscriber can skip re-sending it to clients
       // this pod ALREADY confirmed above. Without the tag the originator got the
       // frame twice: once from `send(closeFrame(...))` and once from its own
-      // pub/sub echo, which made the Closed tab's badge count one closure
+      // pub/sub echo, which once made a closure badge count one closure
       // twice.
       origin: POD_NAME,
       key: verdict.key,
@@ -695,7 +695,7 @@ async function handleResync(conn, frame, send) {
 /**
  * `{"op":"closed"}` — the recently retired alerts, newest closure first.
  *
- * Backs the Closed tab, which is why an `op` exists rather than a snapshot field:
+ * Exists as an `op` rather than a snapshot field because:
  * the window is a query, not part of "what is firing now", and a client that
  * never opens that tab should not pay for it.
  *
@@ -703,30 +703,15 @@ async function handleResync(conn, frame, send) {
  * the rows; `truncated` tells the client the limit was hit, so the UI can say so
  * instead of silently presenting a partial window as complete.
  *
- * `{"op":"closed","countOnly":true}` answers with `op: closedCount` and one
- * integer instead. That exists for the tab BADGE, which is visible from every tab
- * and therefore has to be right after a browser refresh — while the ROWS stay on
- * demand. Seeding the badge only when the Closed tab was opened left it reading 0
- * on the Open alerts tab until the operator selected Closed, which looked like the
- * closures had been lost.
+ * No UI consumes this since the Closed tab was removed. It is kept as the
+ * supported read for the retired set — `scripts/verify-close.sh` and any
+ * operator tooling can ask what is closed without a SCAN — but nothing on the
+ * board depends on it.
  */
 async function handleClosedQuery(conn, frame, send) {
   const verdict = validateClosedQuery(frame);
   if (!verdict.ok) {
     send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
-    return;
-  }
-
-  if (frame.countOnly === true) {
-    let count;
-    try {
-      count = await reader.readClosedCount({ sinceMs: verdict.sinceMs });
-    } catch (err) {
-      log.warn('closed count failed', { err: String(err) });
-      send(JSON.stringify({ op: 'error', code: 'closed_failed', message: 'could not count closed alerts' }));
-      return;
-    }
-    send(JSON.stringify({ op: 'closedCount', count, sinceMs: verdict.sinceMs }));
     return;
   }
 

@@ -228,9 +228,9 @@ tbody tr { scroll-margin-top: 2.2rem; }
    cleared". The dimming still marks the row through the timestamp, summary and key
    cells, which is where the operator is not reading colour.
 
-   Column 1 is Severity in EVERY table (ALERT_COLS, CLOSED_COLS, EVENT_COLS,
-   ALL_EVENT_COLS all begin with it), so this is one rule rather than a class
-   sprinkled over three row components. */
+   Column 1 is Severity in EVERY table (ALERT_COLS, EVENT_COLS, ALL_EVENT_COLS
+   all begin with it), so this is one rule rather than a class sprinkled over
+   three row components. */
 tr.retirement td { opacity:.55; }
 tr.retirement td:first-child { opacity:1; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.8rem; }
@@ -365,17 +365,6 @@ html, body, #root { height:100%; }
    than to a row. Kept in the h2 so they never shift the table down the page. */
 .h2actions { display:inline-flex; align-items:center; gap:.6rem; margin-left:auto; }
 
-/* Closed-tab filters. One row above the table: a free-text box that matches every
-   visible column, plus a severity select whose options come from the data. */
-.closedfilters { display:flex; align-items:center; gap:.5rem; margin:.1rem 0 .45rem;
-                 flex-wrap:wrap; flex:0 0 auto; }
-.filterinput { font:inherit; font-size:.78rem; padding:.3rem .5rem; min-width:16rem;
-               background:var(--pre-bg); color:var(--fg);
-               border:1px solid var(--line); border-radius:.25rem; }
-.filterinput:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
-.filterselect { font:inherit; font-size:.78rem; padding:.3rem .4rem;
-                background:var(--pre-bg); color:var(--fg);
-                border:1px solid var(--line); border-radius:.25rem; }
 /* The live table is inside .tablewrap now, so the old per-column caps are gone:
    widths are user-controlled and nothing wraps (see the table rules above). */
 

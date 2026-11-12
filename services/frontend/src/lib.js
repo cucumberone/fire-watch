@@ -728,46 +728,6 @@ export function isUnsupportedOpError(frame, op) {
 
 
 /**
- * Filter the Closed tab's rows.
- *
- * Pure and exported so it can be tested without a DOM — the matching rules have
- * enough edge cases (case, absent fields, the producer-vs-internal severity) that
- * asserting them through a rendered table would be both slow and indirect.
- *
- * @param {Array} rows      closed alerts as the gateway sent them
- * @param {string} text     free text, matched case-insensitively across every
- *                          column the operator can see plus the summary
- * @param {string} severity exact internal severity, or '' for all
- */
-export function filterClosedAlerts(rows, text, severity) {
-  const needle = String(text || '').trim().toLowerCase();
-  const out = (rows || []).filter((r) => {
-    if (severity && r.severity !== severity) return false;
-    if (!needle) return true;
-    // Both the internal severity and the producer's own value are searchable:
-    // an operator searching "CLEAR" should find a row the badge shows as CLEAR,
-    // even though the stored value is CLOSE.
-    const hay = [
-      r.key, r.severity, r.event?.displaySeverity, r.event?.summary,
-      r.event?.device, r.event?.agent, r.event?.agentOwner,
-      r.event?.eventKey, r.event?.environment, r.closedBy,
-    ].filter(Boolean).join(' ').toLowerCase();
-    return hay.includes(needle);
-  });
-  // Newest closure first, matching the server's order so filtering cannot silently
-  // reorder the table.
-  out.sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0));
-  return out;
-}
-
-/** Distinct severities present in the closed set, for the filter's options. */
-export function closedSeverities(rows) {
-  const set = new Set();
-  for (const r of rows || []) if (r.severity) set.add(r.severity);
-  return [...set].sort();
-}
-
-/**
  * Distinct severities present in the All Events rows, for the filter's options.
  *
  * Returns what the operator SEES — `displaySeverity`, the producer's own value —
@@ -790,10 +750,9 @@ export function eventSeverities(events) {
 /**
  * Filter the All Events rows.
  *
- * Same shape as `filterClosedAlerts` and for the same reason: pure and exported so
- * the matching rules can be tested without a DOM. It searches the fields an
- * operator can actually see plus the summary, because "which switch was flapping
- * last Tuesday" is a free-text question.
+ * Pure and exported so the matching rules can be tested without a DOM. It
+ * searches the fields an operator can actually see plus the summary, because
+ * "which switch was flapping last Tuesday" is a free-text question.
  *
  * @param {Array} events   view events (already through `toViewEvent`)
  * @param {string} text    free text, case-insensitive
@@ -843,10 +802,8 @@ export function tabBadgeCount(tabId, counts) {
     case 'alerts': return counts.alerts;
     case 'events': return counts.events;
     // Loaded rows, not a live total: this tab is a bounded query, so its badge is
-    // "how many I currently hold". The Closed tab is different — it tracks closures
-    // observed, because a closure happens without being fetched.
+    // "how many I currently hold".
     case 'all': return counts.allEvents;
-    case 'closed': return counts.closed;
     default:
       throw new Error(`tabBadgeCount: unknown tab "${tabId}" — give it an explicit count`);
   }

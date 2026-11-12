@@ -191,12 +191,13 @@ function mockOpenAlerts() {
 }
 
 /**
- * Retired alerts for the Closed tab.
+ * Retired alerts, kept for the State chip in Live events / All events.
  *
- * Populated from the same fold path that feeds the open set, so a retirement in
- * the demo moves a key from one tab to the other rather than duplicating it —
- * which is the invariant the real fold maintains by writing both indexes in one
- * script.
+ * A row's `alertState` is a property of the RECORD it belongs to, so the mock has
+ * to remember what retired even though no tab lists closures any more. Populated
+ * from the same fold path that feeds the open set, so a retirement moves a key
+ * rather than duplicating it — the invariant the real fold maintains by writing
+ * both indexes in one script.
  */
 const closedMock = new Map();
 
@@ -232,10 +233,8 @@ function logMockEvent(evt) {
 // for, or it hides the bug it exists to reveal.
 for (let i = 0; i < 14; i += 1) logMockEvent(mkEvent(i));
 
-// Seeded at load, not on subscribe. Seeding inside the subscribe handler made the
-// tab's contents depend on whether `op: closed` arrived before or after the first
-// subscribe — the app asks for the list when the tab is opened, which can happen
-// first. Seeding here makes the mock deterministic.
+// Seeded at load, not on subscribe, so the State chip has closed rows to report
+// from the first frame.
 {
   const seeds = [
     { key: 'db-node-03:hw.psu.voltage', severity: 'CLOSE', at: 6 * 3600e3,
@@ -424,7 +423,7 @@ wss.on('connection', async (ws) => {
         ws.send(JSON.stringify({ op: 'alert', key, applied: 3, closedBy: frameIn.by || 'operator' }));
         return;
       }
-      // Build a CLEAR record so the Closed tab has something to show, exactly like
+      // Build a CLEAR record so the row's State chip reads `closed`, exactly like
       // retireMock does for a CLOSE event from a producer.
       const now = Date.now();
       const [source, ...rest] = key.split(':');
@@ -533,21 +532,6 @@ wss.on('connection', async (ws) => {
         truncated: page.length === limit,
         sinceMs: since,
         untilMs: now,
-      }));
-      return;
-    }
-
-    if (frameIn.op === 'closed') {
-      const now = Date.now();
-      const rows = [...closedMock.values()]
-        .sort((a, b) => b.closedAt - a.closedAt)
-        .slice(0, Math.min(frameIn.limit || 500, 500))
-        .map((r) => ({ ...r, event: { ...r.event } }));
-      ws.send(JSON.stringify({
-        op: 'closed',
-        alerts: rows,
-        truncated: closedMock.size > rows.length,
-        sinceMs: now - 7 * 24 * 60 * 60 * 1000,
       }));
       return;
     }

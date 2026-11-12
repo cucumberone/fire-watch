@@ -106,7 +106,7 @@ export const keys = {
    * Index of RETIRED conditions, scored by `closedAt`.
    *
    * Needed because retiring removes a key from the open index, so without this
-   * there is no way to list what closed — the Closed tab would have to SCAN.
+   * there is no way to list what closed — `op: closed` would have to SCAN.
    * Maintained by the fold and not by a second write, so a key is in at most one of
    * the two: a crash between the two would otherwise list a row as both open and
    * closed.

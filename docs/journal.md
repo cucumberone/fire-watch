@@ -167,7 +167,7 @@ Reply to the writer, then fan out to everyone else:
 
 The frame carries the **whole entry**, not a "something changed" notice — a notice
 would force another round trip to display it, which is the reload-to-see-it bug the
-Closed tab already had once.
+a query-backed tab already had once.
 
 The fan-out publishes `{kind:"journal", origin:POD_NAME}` on `fw:ch:alerts` and is
 filtered by `shouldFanOut`, exactly like ack and close. Without that guard the writer

@@ -132,7 +132,7 @@ export function validateJournalQuery(frame) {
  *
  * Carries the whole entry rather than a bare "something changed": a note is small,
  * and a client that only learned "there is new text" would have to make another
- * round trip to show it — which is the reload-to-see-it bug the Closed tab already
+ * round trip to show it — which is the reload-to-see-it bug a query-backed tab already
  * had once.
  */
 export function journalEntryFrame(key, entry) {

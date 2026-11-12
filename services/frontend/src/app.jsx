@@ -39,8 +39,6 @@ import {
   ENRICHED_FIELDS,
   SEVERITY_RANK,
   isUnsupportedOpError,
-  filterClosedAlerts,
-  closedSeverities,
   filterEvents,
   eventSeverities,
   tabBadgeCount,
@@ -82,13 +80,6 @@ const FRAME_BUDGET_PER_SEC = 8;
 // Column labels, defined once so the header, the colgroup and the resize state
 // cannot drift out of order. Order is documented in docs/frontend.md §4.3.
 const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
-// The Closed tab. "Closed at" is the column that matters there — it is what the
-// 7-day window is measured from and what the rows are sorted by — so it leads
-// alongside severity. Ack is absent on purpose: the ack belonged to the episode
-// and the fold deletes it when the episode ends, so a column of "—" would imply
-// a state that does not exist.
-const CLOSED_COLS = ['Severity', 'Closed at', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Key'];
-const CLOSED_DEFAULT_W = [96, 172, 172, 172, 64, 340, 240];
 
 // The enriched columns are fixed-width labels, so only the leading four are
 // user-resizable; ENRICHED_FIELDS is appended after them.
@@ -132,15 +123,13 @@ const THEME_KEY = 'fw:theme';
 const ROW_COLOR_KEY = 'fw:rowColor';
 // Who is at the keyboard, used to sign journal notes. A preference, not a login.
 const OPERATOR_KEY = 'fw:operator';
-// Which tab was last open. A workspace preference like the drawer it replaces:
-// an operator who works from the Closed tab should not be reset to Alerts every
-// reload.
+// Which tab was last open. A workspace preference: an operator who works from
+// Live events should not be reset to Alerts every reload.
 const TAB_KEY = 'fw:tab';
 const TABS = [
   { id: 'alerts', label: 'Open alerts' },
   { id: 'events', label: 'Live events' },
   { id: 'all', label: 'All events' },
-  { id: 'closed', label: 'Closed' },
 ];
 
 /**
@@ -648,24 +637,10 @@ function useSocket(config) {
   // first and "no notes yet" for the second.
   const [journals, setJournals] = useState(new Map());
   const [notice, setNotice] = useState(null);
-  // The Closed tab's data. Held here rather than in the tab component so it
-  // survives switching tabs — re-fetching 7 days of closures every time the
-  // operator flips between tabs would be both slow and pointless.
-  //
-  // `count` exists separately from `alerts.length` because the two can disagree:
-  // a retirement increments `count` IMMEDIATELY (so the tab badge is honest the
-  // moment something closes) while `alerts` only catches up on the next fetch.
-  // Deriving the badge from `alerts.length` made it look frozen until the tab was
-  // opened — the badge was reporting "rows I happen to have loaded", not "closures
-  // that have happened".
-  const [closedState, setClosedState] = useState({
-    alerts: [], count: 0, loading: false, error: null, truncated: false,
-    loadedAt: null,
-  });
 
-  // The All Events tab's data: a windowed server query, like Closed but over the
-  // raw event log rather than the alert rollups. Held here so switching tabs does
-  // not re-fetch, and keyed by the range so changing range is an explicit reload.
+  // The All Events tab's data: a windowed server query over the raw event log.
+  // Held here so switching tabs does not re-fetch, and keyed by the range so
+  // changing range is an explicit reload.
   const [allEvents, setAllEvents] = useState({
     events: [], loading: false, error: null, truncated: false,
     range: '24h', loadedAt: null,
@@ -682,13 +657,10 @@ function useSocket(config) {
   const attemptRef = useRef(0);
   const timerRef = useRef(null);
   const lastTsRef = useRef(null);
+  // Set when WE close the socket (unmount), so `onclose` does not schedule a
+  // reconnect. The name predates the removal of the Closed tab; it is about
+  // connection teardown, not about closed alerts.
   const closedByUsRef = useRef(false);
-  // Alert keys already counted toward the Closed badge. Prevents a duplicate
-  // retirement frame — two pods delivering the same close, or a snapshot after a
-  // reconnect — from inflating the count. A key that re-fires and retires again is
-  // a genuinely new closure and is re-added by `applyAlert` handling, so the set is
-  // cleared for a key when it is seen OPEN again.
-  const closedCountedRef = useRef(new Set());
   // Set when the gateway rejects `resync` as an unknown op — i.e. the deployed
   // ws-gateway predates this bundle. Stops the client from asking every interval
   // for an op that can only work after a redeploy.
@@ -765,12 +737,6 @@ function useSocket(config) {
           // repairs it. Loud only at debug: this is a rolling-update case.
           if (evt.brokerTs) lastTsRef.current = evt.brokerTs;
           return;
-        }
-        // Re-opening forgets the "already counted" marker, so the NEXT retirement
-        // of this key is counted as a genuinely new closure. Without this, an alert
-        // that closed and re-fired would never raise the badge again.
-        if (frame.applied === 1 || frame.applied === 2) {
-          closedCountedRef.current.delete(alertKey);
         }
         // ------------------------------------------------------------------
         // ONE ARRIVAL, ONE COUNT — and this half of it was missing.
@@ -889,11 +855,6 @@ function useSocket(config) {
         return;
       }
       if (arrival) lastFoldedRef.current.set(frame.key, arrival);
-      // Re-opening forgets the "already counted" marker (see the retirement
-      // handling below), so a later retirement of this key counts as a new closure.
-      if (frame.applied === 1 || frame.applied === 2) {
-        closedCountedRef.current.delete(frame.key);
-      }
       setAlerts((prev) => applyAlert(prev, {
         key: frame.key,
         applied: frame.applied,
@@ -926,28 +887,10 @@ function useSocket(config) {
           return next;
         });
       }
-      // A retirement means the Closed tab just gained a row.
-      //
-      // `count` moves NOW so the tab badge is honest without waiting for a fetch.
-      // `loadedAt` is cleared so the list re-fetches on next open — the rows
-      // themselves are not appended here because the frame does not carry the
-      // closure metadata (closedAt / closedBy) the tab needs, and inventing it
-      // would show a row that disagrees with the server.
-      //
-      // Counted ONCE PER KEY. A duplicated frame must not inflate the badge, and
-      // duplicates do happen: two pods can each deliver a retirement, and a
-      // client that reconnects receives a snapshot of the same closures again.
-      // The set of keys already counted is therefore kept for the session — a key
-      // that retires, is counted, and later re-fires and retires again is a
-      // second closure, but the same frame arriving twice is not.
-      if (frame.applied === 3) {
-        if (!closedCountedRef.current.has(frame.key)) {
-          closedCountedRef.current.add(frame.key);
-          setClosedState((prev) => ({ ...prev, count: prev.count + 1, loadedAt: null }));
-        } else {
-          setClosedState((prev) => (prev.loadedAt ? { ...prev, loadedAt: null } : prev));
-        }
-      }
+      // A retirement means the alert has left the board. Its record stays in
+      // storage (the `Closed` tab that used to list it has been removed), so
+      // there is nothing to do here beyond the alert-map delete `applyAlert`
+      // already performed above.
       return;
     }
     if (frame.op === 'alerts') {
@@ -1008,52 +951,6 @@ function useSocket(config) {
           windowAdded: 0,
         };
       });
-      return;
-    }
-    if (frame.op === 'closed') {
-      // The answer to `op: closed`. Replaces the list wholesale rather than
-      // merging: it is a windowed query, so a row it omits is outside the window,
-      // not missing from this response.
-      const rows = Array.isArray(frame.alerts) ? frame.alerts : [];
-      // Decode before mapping, same as every other path: a closed row carries its
-      // own `payload`, and `msgc` can be compressed there too.
-      //
-      // `row.event` is the OLD shape and no longer exists — the row IS the record.
-      // Keeping the old read left the Closed tab's Summary and timestamps blank for
-      // the same reason the Open tab's were.
-      const next = [];
-      for (const row of rows) {
-        if (!row || typeof row.key !== 'string') continue;
-        const payload = await decodePayload(row.payload, gunzip, MSG_MAX_BYTES);
-        next.push({ ...row, event: toViewEvent({ ...row, payload }) });
-      }
-      setClosedState({
-        alerts: next,
-        // A fetch is authoritative: it resets the count to what the server
-        // actually holds, correcting any drift from closures observed while the
-        // tab was open (or a `truncated` page, where `alerts` is capped but the
-        // real total is larger).
-        count: next.length,
-        loading: false,
-        error: null,
-        truncated: Boolean(frame.truncated),
-        loadedAt: Date.now(),
-      });
-      return;
-    }
-    if (frame.op === 'closedCount') {
-      // The badge-only answer, sent on every connect so the Closed tab does not
-      // read 0 after a browser refresh. It deliberately does NOT set `loadedAt`:
-      // this says how many closures exist, not that their rows were read, so the
-      // tab still fetches on open and still shows its `stale` chip until it has.
-      //
-      // A LOWER number than the local one is accepted. The local count is
-      // optimistic — it increments on every retirement frame — while this is the
-      // server's own total, so the correction runs in both directions.
-      if (!Number.isFinite(frame.count)) return;
-      setClosedState((prev) => (
-        prev.count === frame.count ? prev : { ...prev, count: frame.count }
-      ));
       return;
     }
     if (frame.op === 'snapshot') {
@@ -1220,26 +1117,6 @@ function useSocket(config) {
         next.delete(frame.id);
         return next;
       });
-      setClosedState((prev) => {
-        // A delete removes the record from `idx:event:closed` too, so the Closed
-        // tab must lose the row AND the badge must lose one — `count` is not a
-        // cumulative closure counter: the `op: closed` reply sets it to
-        // `alerts.length` on every fetch. Leaving it alone here let the badge claim
-        // a closure the server no longer had (measured: badge 1, list "0 of 0
-        // loaded", and the row only reappearing after an unrelated reload).
-        const had = prev.alerts.some((r) => (r?.key ?? r?.id) === frame.id);
-        if (!had) {
-          // The row may not be loaded yet while the badge already counts it, so
-          // force the next open to re-fetch rather than trust a list that predates
-          // this delete.
-          return prev.loadedAt === null ? prev : { ...prev, loadedAt: null };
-        }
-        return {
-          ...prev,
-          alerts: prev.alerts.filter((r) => (r?.key ?? r?.id) !== frame.id),
-          count: Math.max(0, prev.count - 1),
-        };
-      });
       return;
     }
     if (frame.op === 'error') {      // A gateway older than this bundle does not know `resync`. That is a deploy
@@ -1256,17 +1133,9 @@ function useSocket(config) {
         }
         return;
       }
-      // A failed closed-list read belongs to that tab, not to the whole page: an
-      // operator reading the alert board should not get a banner about a tab they
-      // are not looking at.
-      if (frame.code === 'closed_failed') {
-        setClosedState((prev) => ({
-          ...prev, loading: false, error: frame.message || 'could not read closed alerts',
-        }));
-        return;
-      }
-      // Same rule for the All Events tab: a failed read belongs to that pane, not
-      // to the whole page.
+      // A failed read belongs to its own pane, not to the whole page: an operator
+      // reading the alert board should not get a banner about a tab they are not
+      // looking at.
       if (frame.code === 'all_events_failed') {
         setAllEvents((prev) => ({
           ...prev, loading: false, error: frame.message || 'could not read events',
@@ -1407,10 +1276,6 @@ function useSocket(config) {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ op: 'resync' }));
-        // The Closed badge is corrected on the same tick. Its local value is
-        // optimistic (incremented per retirement frame), so a frame lost across a
-        // reconnect would leave it high with no way back; one ZCOUNT bounds that.
-        ws.send(JSON.stringify({ op: 'closed', countOnly: true }));
       }
     };
     const id = setInterval(tick, ms);
@@ -1543,53 +1408,12 @@ function useSocket(config) {
   }, []);
 
   /**
-   * Ask for the recently closed alerts.
-   *
-   * A QUERY, not a stream: the Closed tab is a 7-day window that changes slowly,
-   * so it is fetched on demand (opening the tab, pressing refresh) rather than
-   * pushed. Live changes are not needed — a closure that happens while you are
-   * looking at the tab shows up on the next refresh, and the alert it came from
-   * has just left the Open tab anyway.
-   */
-  const loadClosed = useCallback(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setNotice('not connected — closed list not requested');
-      return;
-    }
-    setClosedState((prev) => ({ ...prev, loading: true,
-      error: null }));
-    ws.send(JSON.stringify({ op: 'closed' }));
-  }, []);
-
-  /**
-   * Seed ONLY the Closed badge.
-   *
-   * The badge is rendered on every tab, so it must be right after a browser
-   * refresh — but the ROWS are a 7-day query that a client which never opens the
-   * tab should not pay for. Seeding the badge only when the tab was opened left it
-   * reading 0 on Open alerts until Closed was selected, which reads as "the
-   * closures were lost", not "this number is not loaded yet".
-   *
-   * `countOnly` is a ZCOUNT server-side, so this costs one integer per connection
-   * rather than a window read. `loadedAt` is deliberately NOT set: the badge is now
-   * honest, the rows still are not fetched, and the tab must keep fetching them on
-   * open (and keep showing its `stale` chip until it has).
-   */
-  const loadClosedCount = useCallback(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ op: 'closed', countOnly: true }));
-  }, []);
-
-  /**
    * Ask for every event in a time window.
    *
-   * A QUERY, like the Closed list, not a stream: the window is bounded, it changes
-   * slowly relative to a 24-hour span, and re-reading it on demand is cheaper and
-   * simpler than maintaining a second subscription. The range is sent to the
-   * server so filtering happens there — a 1-hour request reads far less than a
-   * 7-day one.
+   * A QUERY, not a stream: the window is bounded, it changes slowly relative to a
+   * 24-hour span, and re-reading it on demand is cheaper and simpler than
+   * maintaining a second subscription. The range is sent to the server so
+   * filtering happens there — a 1-hour request reads far less than a 7-day one.
    */
   const loadAllEvents = useCallback((range) => {
     const ws = wsRef.current;
@@ -1612,7 +1436,6 @@ function useSocket(config) {
 
   return {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadClosed, loadClosedCount, closed: closedState,
     loadAllEvents, allEvents,
     journals, loadJournal, addJournalEntry,
     dbUp,
@@ -1789,8 +1612,8 @@ function RecordInspector({ state, onClose, journal }) {
   // that submenu is intrinsic to the inspector rather than something a row should
   // have to remember to add. A caller that adds one anyway gets two identical
   // entries — and because the injected one is not wired to `setView('info')`, it
-  // does nothing when clicked. That exact bug shipped: the Closed tab's menu
-  // showed two Information rows and only the second worked.
+  // does nothing when clicked. That exact bug shipped: a context menu once showed
+  // two Information rows and only the second worked.
   //
   // Filtering here rather than trusting callers means the mistake cannot recur:
   // the panel owns its own affordance.
@@ -2037,47 +1860,6 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
   );
 }
 
-/**
- * One row in the Closed tab.
- *
- * Distinct from AlertRow because the facts are different: the ack is gone, the
- * meaningful timestamp is `closedAt` rather than "last occurrence", and the
- * severity shown is the one that RETIRED the alert (a `CLEAR`), not the severity
- * it was firing at. Reading a closed row as "this was a CLEAR alert" is the
- * correct reading — the original severity lives in the event record, reachable
- * through Information.
- *
- * The COLOUR class is derived from the severity being displayed, not from the
- * stored one (`colourSeverity`): an operator close overwrites `severity` with
- * `CLOSE` while the payload still says `WARNING`, so a stored-only class tinted the
- * row green in row-colour mode next to an amber WARNING badge.
- */
-function ClosedRow({ row, onContextMenu }) {
-  const label = row.displaySeverity ?? row.event?.displaySeverity;
-  return (
-    <tr
-      className={severityRowClass(colourSeverity(row.severity, label), 'retirement')}
-      onContextMenu={onContextMenu}
-    >
-      <td><Badge severity={row.severity} label={label} /></td>
-      {/* Field names follow the WIRE row, not the old alert-rollup shape: the gateway
-          sends `alertClosedAt` / `firstOccurrence` / `lastOccurrence` (plus `count`).
-          Reading `closedAt` / `firstSeen` / `lastSeen` matched nothing, so all three
-          timestamp columns rendered empty on a row that had every value. The old
-          names are kept as fallbacks because the snapshot path reshapes rows. */}
-      <td className="mono">{formatClock(row.alertClosedAt ?? row.closedAt ?? row.event?.alertClosedAt)}</td>
-      <td className="mono">{formatClock(row.firstOccurrence ?? row.firstSeen ?? row.event?.firstOccurrence)}</td>
-      <td className="mono">{formatClock(row.lastOccurrence ?? row.lastSeen ?? row.event?.lastOccurrence)}</td>
-      <td className="num">{row.count}</td>
-      <td className="summary">
-        {row.summary ?? row.msg ?? row.event?.summary ?? <span className="dim">—</span>}
-      </td>
-      <td className="mono nowrap">{row.key}</td>
-      <td />
-    </tr>
-  );
-}
-
 function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   const acked = Boolean(ack);
   // Colour follows what the badge shows, so the row tint and the badge cannot
@@ -2236,7 +2018,7 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadClosed, loadClosedCount, closed, loadAllEvents, allEvents, dbUp,
+    loadAllEvents, allEvents, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2269,11 +2051,6 @@ function App() {
     beginResize: beginEventResize,
   } = useColumnWidths('events', EVENT_COLS, EVENT_DEFAULT_W);
 
-  const {
-    widthOf: closedWidthOf,
-    beginResize: beginClosedResize,
-  } = useColumnWidths('closed', CLOSED_COLS, CLOSED_DEFAULT_W);
-
   // Its own width state: the All Events table has the same columns as the live
   // tail but is a different table, and sizing one must not resize the other.
   const {
@@ -2281,15 +2058,8 @@ function App() {
     beginResize: beginAllResize,
   } = useColumnWidths('all', ALL_EVENT_COLS, ALL_EVENT_DEFAULT_W);
 
-  // Closed-tab filters. Case-insensitive substring across the columns an operator
-  // can see, plus the summary text, which is where the human-readable detail
-  // lives. Deliberately client-side: the window is capped at 7 days / 500 rows,
-  // so a round trip per keystroke would make typing feel broken for no gain.
-  const [filter, setFilter] = useState('');
-  const [severityFilter, setSeverityFilter] = useState('');
-
-  // All Events filter. Same reasoning as the Closed tab: the page is bounded, so
-  // filtering client-side keeps typing instant.
+  // All Events filter. The page is bounded, so filtering client-side keeps typing
+  // instant.
   const [eventFilter, setEventFilter] = useState('');
   const [eventSeverity, setEventSeverity] = useState('');
   const allEventRows = useMemo(
@@ -2302,51 +2072,6 @@ function App() {
     () => eventSeverities(allEvents.events),
     [allEvents.events],
   );
-
-  const closedRows = useMemo(
-    () => filterClosedAlerts(closed.alerts, filter, severityFilter),
-    [closed.alerts, filter, severityFilter],
-  );
-
-  // Severity options come from the DATA, not a fixed list: the Closed tab shows
-  // the retirement severity, and offering options that match nothing would be a
-  // dropdown full of dead ends.
-  const closedSeverityOptions = useMemo(
-    () => closedSeverities(closed.alerts),
-    [closed.alerts],
-  );
-
-  // Load the closed list when the tab is first opened.
-  //
-  // On demand rather than on connect: a client that never opens the tab should
-  // not pay for a 7-day read, and the window changes slowly enough that a query
-  // is the right shape. The `loadedAt` guard means switching back and forth does
-  // not re-fetch — the tab has an explicit refresh for that.
-  //
-  // `status` is a dependency for a reason: on a reload with this tab already
-  // selected, the effect runs BEFORE the socket is open, `loadClosed` finds no
-  // connection and returns without setting anything — and because nothing
-  // changed, the effect would never run again. The list then stayed empty until
-  // the operator pressed refresh. Gating on `open` makes it fire at the moment
-  // the request can actually be sent.
-  useEffect(() => {
-    if (tab !== 'closed') return;
-    if (status !== 'connected') return;
-    if (closed.loadedAt || closed.loading) return;
-    loadClosed();
-  }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
-
-  // Seed the Closed BADGE on every connect, whatever tab is showing.
-  //
-  // The badge is rendered on all four tabs, so a browser refresh on Open alerts
-  // that left it reading 0 while the list behind it held closures was a lie that
-  // corrected itself only when the Closed tab was selected — which reads as "the
-  // closures were lost". Same contract as All events, but a COUNT rather than the
-  // rows: one ZCOUNT server-side, and the 7-day row read stays on demand.
-  useEffect(() => {
-    if (status !== 'connected') return;
-    loadClosedCount();
-  }, [status, loadClosedCount]);
 
   // Same contract for All Events: re-fetch on an explicit range change or refresh.
   //
@@ -2512,15 +2237,9 @@ function App() {
             aria-label="Views"
           >
             {TABS.map((t) => {
-              // The Closed badge reads `closed.count`, not `alerts.length`: the
-              // count moves the moment something closes, while the rows only
-              // catch up on the next fetch. Using the row count made the badge
-              // look frozen until the tab was opened.
-              //
               // Every tab has its own branch. The old form was a chain of ternaries
-              // ending in `closed.count`, so a NEW tab silently inherited the Closed
-              // count — which is why "All events" showed a number with an empty
-              // table: the badge was reporting the wrong tab's data.
+              // ending in a closed-alert count, so a NEW tab silently inherited it —
+              // which is why "All events" once showed a number with an empty table.
               const count = tabBadgeCount(t.id, {
                 alerts: sortedAlerts.length,
                 events: shownEvents.length,
@@ -2532,7 +2251,6 @@ function App() {
                 allEvents: allEvents.total === null
                   ? allEvents.events.length
                   : allEvents.total + (allEvents.windowAdded ?? 0),
-                closed: closed.count,
               });
               return (
                 <Tab
@@ -2543,9 +2261,7 @@ function App() {
                   label={(
                     <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
                       <span>{t.label}</span>
-                      {t.id === 'closed' && closed.loading
-                        ? <CircularProgress size={11} />
-                        : <Chip label={count} size="small" variant="outlined" />}
+                      <Chip label={count} size="small" variant="outlined" />
                     </Stack>
                   )}
                 />
@@ -3046,168 +2762,14 @@ function App() {
         )}
       </Box>
       ) : null}
-
-      {tab === 'closed' ? (
-      <Box role="tabpanel" id="panel-closed" aria-labelledby="tab-closed"
-           sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
-                 p: 2, pt: 1.5 }}>
-        {/* No heading: the tab above names the pane. The chips stay — "last 7
-            days" is the WINDOW, which the tab badge does not show, and "stale"
-            describes the fetched list rather than the badge's live count.
-            The count chip is GONE: it duplicated the tab badge, and the badge is
-            the one that moves the moment something closes, so the two disagreed
-            for the length of a fetch — two numbers for one thing, one of them
-            behind. `N of M loaded` in the filter row already reports what was
-            actually read. */}
-        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
-          <Chip label={`last 7 days`} size="small" variant="outlined" />
-          {/* Stale means "closures have happened since these rows were read".
-              Without saying so, the chip and the list disagree and both look
-              wrong rather than one looking out of date. */}
-          {closed.loadedAt ? null : (
-            <Chip label="stale" size="small" color="warning" variant="outlined" />
-          )}
-        </Stack>
-
-        {/* Search. Client-side, over the rows already fetched, because the window
-            is bounded (7 days) and a server round trip per keystroke would make
-            typing feel broken. It matches every column the operator can see plus
-            the summary, so "which switch was flapping last Tuesday" is one box. */}
-        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1.5 }}>
-          <TextField
-            type="search"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter by key, severity, summary, agent…"
-            inputProps={{ 'aria-label': 'Filter closed alerts' }}
-            // `flex:1` with `minWidth:0` is what lets it shrink: a flex item
-            // defaults to min-width:auto, so it refuses to go below its content
-            // width and pushes the select off the right edge.
-            sx={{ flex: '1 1 260px', minWidth: 0, maxWidth: 460 }}
-          />
-          <FormControl sx={{ width: 160, flex: '0 0 auto' }}>
-            <InputLabel id="sev-filter-label">Severity</InputLabel>
-            <Select
-              labelId="sev-filter-label"
-              label="Severity"
-              value={severityFilter}
-              onChange={(e) => setSeverityFilter(e.target.value)}
-            >
-              <MenuItem value="">All severities</MenuItem>
-              {closedSeverityOptions.map((sev) => (
-                <MenuItem key={sev} value={sev}>{sev}</MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-          {filter || severityFilter ? (
-            <Button onClick={() => { setFilter(''); setSeverityFilter(''); }}>
-              clear
-            </Button>
-          ) : null}
-          <Tooltip title={closed.loading ? 'Loading…' : 'Re-read the closed list'}>
-            <span style={{ display: 'flex', alignItems: 'center' }}>
-              <IconButton
-                size="small"
-                onClick={loadClosed}
-                disabled={closed.loading}
-                aria-label="Reload closed alerts"
-                sx={{ flex: '0 0 auto' }}
-              >
-                {closed.loading ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
-              </IconButton>
-            </span>
-          </Tooltip>
-          <Box sx={{ flex: 1 }} />
-          <Typography variant="caption" color="text.secondary">
-            {closedRows.length} of {closed.alerts.length} loaded
-          </Typography>
-        </Stack>
-
-        {closed.error ? (
-          <MuiAlert severity="error">Closed list failed: {closed.error}</MuiAlert>
-        ) : closed.loading && closed.alerts.length === 0 ? (
-          <Stack direction="row" spacing={1} sx={{ alignItems: 'center', p: 2 }}>
-            <CircularProgress size={16} />
-            <Typography variant="body2" color="text.secondary">Loading…</Typography>
-          </Stack>
-        ) : closed.alerts.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
-            Nothing has closed in the last 7 days.
-            {closed.loadedAt ? null : ' Open this tab to load.'}
-          </Typography>
-        ) : closedRows.length === 0 ? (
-          <Typography variant="body2" color="text.secondary">
-            No closed alerts match the filter.
-          </Typography>
-        ) : (
-          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-            {closed.truncated ? (
-              <MuiAlert severity="warning" sx={{ mb: 1 }}>
-                Showing the {closed.alerts.length} most recent closures — narrow the
-                filter to see older ones.
-              </MuiAlert>
-            ) : null}
-            <PaneBoundary name="Closed">
-              <ScrollTable
-                cols={(
-                  <>
-                    {CLOSED_COLS.map((c, i) => (
-                      <col key={c} style={{ width: `${closedWidthOf(i)}px` }} />
-                    ))}
-                    <col />
-                  </>
-                )}
-                head={(
-                  <>
-                    {CLOSED_COLS.map((label, i) => (
-                      <ResizableTh
-                        key={label}
-                        index={i}
-                        width={closedWidthOf(i)}
-                        onBegin={beginClosedResize}
-                      >
-                        {label}
-                      </ResizableTh>
-                    ))}
-                    <th />
-                  </>
-                )}
-                rows={closedRows.map((row) => (
-                  <ClosedRow
-                    key={row.key}
-                    row={row}
-                    // No actions. A closed alert offers nothing an operator can
-                    // do to it: it cannot be re-opened (an alert is open because
-                    // a source reported it, and inventing one from the UI would
-                    // be a severity the operator made up), and the ack was
-                    // cleared when the episode ended.
-                    //
-                    // Passing an `Information` action here was a bug: the
-                    // inspector ALWAYS appends its own Information row, so the
-                    // menu showed two — the injected one with an empty `run`
-                    // (dead on click) and the real one below it.
-                    onContextMenu={(ev) => openInspector(
-                      ev,
-                      row.event?.wire ?? row.event ?? row,
-                      row.key,
-                      [],
-                    )}
-                  />
-                ))}
-              />
-            </PaneBoundary>
-          </Box>
-        )}
-      </Box>
-      ) : null}
       </Box>
 
       <RecordInspector
         state={inspector}
         // Resolved at RENDER, not captured when the panel opened. The inspector
         // holds a snapshot of `journal` from the open call, so an entry appended
-        // while it is open would never appear — the same stale-copy bug the Closed
-        // tab had when `loadedAt` was captured instead of derived.
+        // while it is open would never appear — the stale-copy bug a captured
+        // `loadedAt` caused on a query-backed tab.
         journal={inspector?.journal
           ? {
             key: inspector.journal.key,

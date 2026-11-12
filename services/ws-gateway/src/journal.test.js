@@ -139,7 +139,7 @@ test('validateJournalQuery rejects a wrong op', () => {
 // ------------------------------------------------------------------------ frames
 test('journalEntryFrame carries the whole entry, not just a notice', () => {
   // A frame that only said "there is new text" would force a round trip to show it
-  // — the reload-to-see-it bug the Closed tab already had.
+  // — the reload-to-see-it bug a query-backed tab already had.
   const f = JSON.parse(journalEntryFrame('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', { id: 'e1', by: 'alice', at: 1, text: 'hi' }));
   assert.equal(f.op, 'journal');
   assert.equal(f.key, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');

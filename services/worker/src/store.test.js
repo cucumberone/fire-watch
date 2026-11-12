@@ -61,7 +61,7 @@ function makeValkey() {
           // The record's own fields are applied BEFORE the branch, exactly as the
           // real script does: a retirement can arrive for a condition with no
           // stored record yet, and it must still store `msg`, `source` and
-          // `payload` or the Closed tab renders blanks.
+          // `payload` or the retired set renders blanks.
           const fields = {};
           for (let i = 6; i + 1 < argv.length; i += 2) fields[argv[i]] = argv[i + 1];
           if (Object.keys(fields).length > 0) hashSet(recordKey, fields);
@@ -276,7 +276,7 @@ test('a CLOSE with no stored record still stores the row, not a blank shell', as
   // restart can deliver the CLEAR first — and if the fields were only written on
   // the occurrence path, the record would be `state=closed` with no `msg`, no
   // `source` and no `payload`: a row that is blank in every column and unfindable
-  // in the Closed tab.
+  // in the retired set.
   const valkey = makeValkey();
   const res = await persistEvent({
     valkey,

@@ -430,7 +430,7 @@ export class ValkeyReader {
   /**
    * Read recently RETIRED records, newest closure first.
    *
-   * Backs the Closed tab. The open index cannot answer this — retiring removes a key
+   * Backs `op: closed`. The open index cannot answer this — retiring removes a key
    * from that index — so the worker's fold maintains a second zset scored by
    * `closedAt` (docs/event-lifecycle.md §5.2).
    *
@@ -450,25 +450,6 @@ export class ValkeyReader {
 
     const flat = await this._evalSnapshot(c, keys);
     return this._rowsFromFlat(keys, flat);
-  }
-
-  /**
-   * Count the recently retired records WITHOUT reading them.
-   *
-   * Exists for exactly one reason: the Closed tab's BADGE. The tab's rows are a
-   * query fetched on demand — a client that never opens the tab should not pay for
-   * a 7-day read — but the badge is visible on every tab, so it has to be right
-   * after a browser refresh. Seeding it only when the tab was opened is the bug
-   * this fixes: the badge read 0 on the Open alerts tab after a reload, then
-   * corrected itself the moment the Closed tab was selected.
-   *
-   * ZCOUNT, not ZRANGE: the badge needs one integer, and counting the window is
-   * cheap while building its rows is not. Same `sinceMs` bound as the row read, so
-   * the two cannot disagree about which window they describe.
-   */
-  async readClosedCount({ sinceMs = 0 } = {}) {
-    const c = await this.connect();
-    return c.zcount('idx:event:closed', `(${Math.max(0, sinceMs)}`, '+inf');
   }
 
   /**
@@ -811,7 +792,7 @@ export class ValkeyReader {
    *
    * One `LRANGE` per key in a single pipeline, bounded by the caller. Returns an entry
    * per requested key even when the journal is empty, so a client can tell "read it
-   * and there is nothing" from "never answered" — the distinction the Closed tab
+   * and there is nothing" from "never answered" — the distinction a query-backed tab
    * needed a `loadedAt` flag for.
    */
   async readJournals(keys, limit) {

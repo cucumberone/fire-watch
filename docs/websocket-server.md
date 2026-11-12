@@ -302,9 +302,9 @@ latency matters, raise that limit before optimising the reads further.
 
 ### 3.5 `op: closed` — the retired alerts
 
-The Closed tab needs what is no longer firing, and neither existing op can supply
-it: a snapshot is the OPEN set, and backfill replays events without knowing which
-alert each one left behind.
+Answers "what is no longer firing", which neither of the other ops can: a snapshot
+is the OPEN set, and backfill replays events without knowing which alert each one
+left behind.
 
 ```json
 {"op":"closed"}
@@ -339,24 +339,11 @@ rather than the server building the full set and the client discarding most of i
 which the UI shows as a notice. Returning the newest N and saying nothing would
 make a busy week look smaller than it is.
 
-#### `countOnly` — the badge without the rows
-
-```json
-{"op":"closed","countOnly":true}
-{"op":"closedCount","count":12,"sinceMs":1762000000000}
-```
-
-The Closed badge is drawn on **every** tab, so it has to be right after a browser
-refresh — while the 7-day row read stays on demand. `countOnly` splits the two: it
-answers with a `ZCOUNT` over `idx:event:closed` instead of building rows.
-
-`sinceMs` is honoured, so the count and the list always describe the same window.
-The client sends it once per connection and once per resync tick; the local count
-is optimistic (incremented on each retirement fan-out), and this is the only thing
-that corrects it downwards when a frame is lost.
-
-Same `closed_failed` error code as the row read: a caller that asked for a count
-and got an error must not render 0 as if it were an answer.
+The UI no longer consumes this op: the **Closed tab was removed** as redundant
+with All events ([frontend.md](frontend.md) §5.7). The op and the index behind it
+stay, because `idx:event:closed` is the only bounded way to enumerate retirements
+— the alternative is the `SCAN` this design forbids everywhere — and
+`scripts/verify-close.sh` uses the index to assert the fold's close path.
 
 ### 3.6 `op: allEvents` — the raw log, windowed
 

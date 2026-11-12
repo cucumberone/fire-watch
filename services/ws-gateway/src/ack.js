@@ -206,12 +206,12 @@ export function deletedFrame(id) {
 /**
  * Largest number of closed records one request may ask for.
  *
- * The Closed tab shows a 7-day window; at a realistic incident rate that is a few
+ * The retired set spans a 7-day window; at a realistic incident rate that is a few
  * hundred rows, so 500 covers it without letting one client ask a pod to build a
  * response of arbitrary size.
  */
 export const MAX_CLOSED_LIMIT = 500;
-/** Default window for the Closed tab: 7 days, matching event retention. */
+/** Default window for the retired set: 7 days, matching event retention. */
 export const DEFAULT_CLOSED_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**

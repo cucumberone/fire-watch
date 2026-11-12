@@ -351,15 +351,16 @@ not sent to the gateway and they do not affect `applied` handling.
 |---|---|---|---|
 | Theme | `auto`, `light`, `dark` | `auto` | `localStorage['fw:theme']` |
 | Colour rows | on, off | off | `localStorage['fw:rowColor']` |
-| Selected tab | `alerts`, `events`, `closed` | `alerts` | `localStorage['fw:tab']` |
+| Selected tab | `alerts`, `events`, `all` | `alerts` | `localStorage['fw:tab']` |
 
 Column widths are persisted separately per table (`fw:colw:alerts`,
-`fw:colw:events`, `fw:colw:all`, `fw:colw:closed` — §4), keyed by column label.
+`fw:colw:events`, `fw:colw:all` — §4), keyed by column label.
 
 The selected tab is persisted because it is a **workspace preference, not
-transient UI state**: an operator working the Closed tab should not be reset to
-Alerts on every reload. An unknown stored value falls back to `alerts` rather than
-throwing or rendering an empty page.
+transient UI state**: an operator working All events should not be reset to Alerts
+on every reload. An unknown stored value — including a `closed` left behind by the
+removed tab — falls back to `alerts` rather than throwing or rendering an empty
+page.
 
 Both toggles are **icon buttons**, not checkboxes:
 
@@ -548,7 +549,7 @@ loop. The panel waits for the next state change or a reload.
 This was verified by forcing a render throw in the alert table and confirming the
 header, the other pane and the socket all stayed functional.
 
-### 5.5 Four tabs: Open alerts, Live events, All events, Closed
+### 5.5 Three tabs: Open alerts, Live events, All events
 
 The drawer is gone. It was a primary view with an accessory bolted underneath: it
 could only be expanded or invisible, it competed with the alert table for vertical
@@ -556,19 +557,29 @@ space, and at `max-height:38vh` it either hid during an incident or ate a third 
 the screen.
 
 Three peers replace it, because "what is firing", "what did we receive", and "what
-already finished" are parallel questions rather than a hierarchy:
+happened in this window" are parallel questions rather than a hierarchy:
 
 | Tab | Answers | Source |
 |---|---|---|
 | **Open alerts** | what is firing right now | `op: snapshot` on connect + `op: alert` live |
 | **Live events** | what did we actually receive, and when | `op: event` frames, arrival order |
 | **All events** | what happened in the last N, searchable | `op: allEvents`, a windowed query |
-| **Closed** | what ended in the last 7 days | `op: closed`, a windowed query |
+
+A fourth **Closed** tab existed and has been **removed**. Everything it showed is
+already answerable from All events, which lists every stored record including the
+retirements (`severity: CLOSE`), carries a **State** column joined from the fold,
+and can be narrowed with the severity filter — so a separate 7-day closure window
+was a second view of the same records with its own filters, its own badge and its
+own staleness rules to keep honest. Fewer surfaces, one source of truth.
+
+The server side stayed: `idx:event:closed` is still maintained by the fold and
+`op: closed` still answers, because the index is what makes "what is closed" a
+bounded read rather than a SCAN (`docs/websocket-server.md` §3.5).
 
 Badges come from `tabBadgeCount(tabId, counts)` in `lib.js`, which switches
 explicitly per tab and **throws on an unknown id**. It used to be a ternary chain
-ending in `: closed.count`, so adding the All events tab silently gave it the
-Closed count — a number beside an empty table, which reads as a broken query rather
+ending in the Closed count, so adding the All events tab silently gave it another
+tab's number — a count beside an empty table, which reads as a broken query rather
 than a wrong badge. A new tab must now decide what its badge counts.
 
 **All events vs Live events** is the distinction worth stating, because they look
@@ -685,13 +696,13 @@ after the heading and chip were removed there was nothing left in it — an empt
 band of vertical space above the data. **Live events** kept its row for the
 `N of last 500` chip, which is NOT redundant with the badge: it carries the buffer
 LIMIT, the difference between "all of it" and "the newest slice", which matters when
-reading a tail. **Closed** and **All events** keep a row for their own controls.
+reading a tail. **All events** keeps a row for its own controls.
 
 **The refresh button belongs next to the control it re-runs**, not pushed to the far
-right. On the Closed tab that is the severity picker: the button re-reads the list
-that the picker filters, so they are one group. The `N of M loaded` caption is what
-stays at the right edge — it is a status line, not a control, and separating it from
-the buttons is what makes the grouping read correctly.
+right. On All events that is the window picker and the severity filter: the button
+re-reads the window those narrow, so they are one group. A status caption stays at
+the right edge — it is a status line, not a control, and separating it from the
+buttons is what makes the grouping read correctly.
 
 **Two chips joined by a line: connection → database.** They are separate because
 they fail separately — the socket can be perfectly healthy while the gateway's reads
@@ -818,89 +829,37 @@ backfill instead: `subscribe` replays the events in the window since `since`
 time range, and the newest row is a real arrival rather than whatever the fold
 happened to leave as `lastId`.
 
-### 5.7 Closed tab
+### 5.7 The Closed tab, and why it was removed
 
-Shows what retired in the last **7 days**, newest closure first. It is a
-**query**, not a stream: `{"op":"closed"}` is fetched on demand — when the tab is
-first opened, or on `refresh` — because the window changes slowly and a client
-that never opens the tab should not pay for a 7-day read
-([websocket-server.md](websocket-server.md) §3.5).
+A fourth tab listed what retired in the last 7 days (`op: closed`, newest closure
+first, its own filter row, its own `stale` chip and its own badge). It has been
+removed as redundant: **All events already lists the same records.** Every
+retirement is a stored event with `severity: CLOSE`, All events carries the
+fold-joined **State** column, and its severity filter narrows to exactly those
+rows — so the second tab was another view of one source of truth, with a second
+set of filter rules, badge semantics and staleness states to keep correct.
 
-| Column | Note |
+What that tab needed, and where each need now lives:
+
+| Need | Now |
 |---|---|
-| Severity | the severity that RETIRED the alert (`CLEAR` / `INFORMATION`), not the one it was firing at. The original lives in the event record, reachable through Information |
-| **Closed at** | the timestamp the window is measured from, and the sort key |
-| First / Last occurrence, Count | kept, so a closed row still explains how bad it got |
-| Summary, Key | as elsewhere |
+| see a retirement | All events, `severity: CLOSE` (the badge reads `CLEAR` — the producer's own label) |
+| know whether a record's alert is still firing | the **State** column on Live events and All events |
+| when it closed | the record's `lastOccurrence`, plus `alertClosedAt` in the inspector |
+| filter to closures | the All events severity select |
 
-**No Ack column.** The ack belonged to the episode and the fold deletes it when
-the episode ends, so a column of `—` would imply a state that does not exist.
+**The server side is unchanged and still supported.** `idx:event:closed` is
+maintained inside `event-fold.lua` in the same atomic step as `idx:event:open`, so
+a record can never be in both or neither, and `op: closed` still answers with the
+retired rows ([websocket-server.md](websocket-server.md) §3.5). Keeping the index
+is what makes "what is closed" a bounded `ZRANGEBYSCORE` rather than a `SCAN`, and
+`scripts/verify-close.sh` asserts the index movement directly.
 
-**Filtering is client-side** (`filterClosedAlerts` in `lib.js`, exported so it is
-tested directly rather than through a rendered table):
-
-- free text, case-insensitive and trimmed, matched across every visible column
-  plus the summary and the enriched fields
-- an exact severity select whose options come from the **data** — a fixed list
-  would offer dead ends
-- both the internal severity and the producer's value are searchable, so searching
-  `CLEAR` finds a row whose stored severity is `CLOSE`
-- sorting is newest-first *after* filtering, so a filter cannot silently reorder
-  the table
-
-`truncated` from the server is surfaced as a notice rather than a silent cut: a
-busy week must not look smaller than it is.
-
-**The tab badge counts closures, not loaded rows.** `closedState` carries a
-separate `count` that a retirement frame increments immediately, so the badge is
-honest the moment something closes. Deriving it from `alerts.length` made it look
-frozen until the tab was opened, because the badge was reporting "rows I happen to
-have fetched" rather than "closures that have happened". A fetch resets `count` to
-what the server actually holds, which also corrects drift and the case where a
-`truncated` page caps `alerts`.
-
-#### The badge is seeded on connect, like All events
-
-The badge is rendered on **all four tabs**, so it has to be right after a browser
-refresh on Open alerts — but the 7-day row read stays on demand. The two needs are
-satisfied separately:
-
-| | when | cost |
-|---|---|---|
-| the **badge** | a `{"op":"closed","countOnly":true}` on every connect, and on each resync tick | one `ZCOUNT` over `idx:event:closed` |
-| the **rows** | on first open of the tab, and on `refresh` | the windowed row read |
-
-The answer is `{"op":"closedCount","count":N,"sinceMs":…}`. It deliberately does
-**not** set `loadedAt`: it says how many closures exist, not that their rows were
-read, so the tab still fetches on open and still shows its `stale` chip until it
-has.
-
-Without this, a refresh on Open alerts left the badge at 0 while storage held
-closures, and it only corrected itself once Closed was selected — which reads as
-"the closures were lost", not "this number is not loaded yet". The local count is
-optimistic (it increments on every retirement frame), so the `ZCOUNT` also
-corrects drift **downwards** after a frame is lost across a reconnect.
-
-Because the rows lag the count, the pane says so explicitly with a `stale` chip
-when `loadedAt` is null. Without it the chip and the list disagree and both read
-as wrong, rather than one reading as out of date.
-
-**There is no count chip in the pane.** It showed `closed.count`, which is exactly
-what the tab badge shows — two numbers for one thing, and on a busy board they
-disagree for the length of a fetch, so one of them is always behind. The badge is
-the live one and it is already visible; `N of M loaded` in the filter row reports
-what was actually read, which is the different question.
-
-Two loading states, deliberately distinct: "Nothing has closed in the last 7 days"
-is a real answer (the list was fetched), whereas "Open this tab to load" means it
-has not been fetched yet. Conflating them would make an unfetched tab look like a
-quiet week.
-
-**The auto-load effect depends on the connection status, not just the tab.** On a
-reload with this tab already selected the effect runs *before* the socket opens;
-without the `status === 'connected'` guard the request was dropped and nothing changed,
-so the effect never ran again and the list stayed empty until `refresh` was
-pressed.
+Removed with the tab: `CLOSED_COLS`, `ClosedRow`, the `closedState` reducer, the
+`closed`/`closedCount` frame handlers, `loadClosed`, `loadClosedCount`, the
+`countOnly` branch of `op: closed`, `readClosedCount`, `filterClosedAlerts`,
+`closedSeverities` and the `.closedfilters` CSS. `tabBadgeCount` lost its `closed`
+branch.
 
 ### 5.8 Pause
 
@@ -983,7 +942,7 @@ keys the table does not show.
 | Size | `620px` wide, `max-height:min(560px, 100vh-1rem)`, from the stylesheet only. The action list is short, so the panel only reaches full height on the Information view — which is the view that needs it: 16 typical fields fit with no scrolling, where the previous `460x320` cap forced a scrollbar through the very values the panel exists to reveal |
 | No horizontal scroll | `table-layout:fixed` with a 34% key column and `overflow-wrap:anywhere` on values. Without it the table sized to its longest cell and the panel grew a sideways scrollbar |
 | Positioning | clamped to the viewport **using the element's measured size** (`offsetWidth/offsetHeight` after layout), re-run when the view toggles because the Information table is a different height from the action list. The size is deliberately not duplicated in JS — the two copies disagreed when the panel grew, and the stale clamp pushed it off the bottom of the screen |
-| Information is intrinsic | the panel always renders its own **Information** row, and caller-supplied actions are filtered for that label. A row that added one anyway produced TWO identical entries, and because the injected one was not wired to `setView('info')` it did nothing when clicked — that exact bug shipped on the Closed tab |
+| Information is intrinsic | the panel always renders its own **Information** row, and caller-supplied actions are filtered for that label. A row that added one anyway produced TWO identical entries, and because the injected one was not wired to `setView('info')` it did nothing when clicked — that exact bug shipped |
 | Dismissal | Escape, click outside, or the ✕ button. The ✕ is present in both levels; the back link returns to the action list |
 
 **Why Information exists instead of wrapping cells.** Cells never wrap (see §4.3),

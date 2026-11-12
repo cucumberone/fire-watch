@@ -1058,6 +1058,15 @@ test('each tab reports its OWN count', () => {
   assert.equal(tabBadgeCount('all', counts), 3);
 });
 
+test('History has no badge, and asking for one throws', () => {
+  // Its count would be the operator's own page size (50/100/200), not a fact about
+  // the system. A number reporting the limit you just set is noise, so the branch
+  // was removed AND the tab opts out. If someone re-adds a `history` branch without
+  // re-adding the badge, this test is the tripwire.
+  assert.throws(() => tabBadgeCount('history', { alerts: 1, events: 2, allEvents: 3 }),
+    /unknown tab/, 'history must not have a badge count');
+});
+
 test('an unknown tab throws instead of borrowing another tab count', () => {
   // Regression: the badge was a ternary chain ending in `: closed.count`, so the
   // All events tab silently showed the CLOSED count — a number beside an empty

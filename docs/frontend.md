@@ -578,7 +578,9 @@ The server side stayed: `idx:event:closed` is still maintained by the fold and
 bounded read rather than a SCAN (`docs/websocket-server.md` §3.5).
 
 Badges come from `tabBadgeCount(tabId, counts)` in `lib.js`, which switches
-explicitly per tab and **throws on an unknown id**. It used to be a ternary chain
+explicitly per tab and **throws on an unknown id**. A tab opts out with
+`badge: false` in `TABS` — **History** does, because its count would be the page
+size the operator just picked (50/100/200) rather than a fact about the system. It used to be a ternary chain
 ending in the Closed count, so adding the All events tab silently gave it another
 tab's number — a count beside an empty table, which reads as a broken query rather
 than a wrong badge. A new tab must now decide what its badge counts.
@@ -707,7 +709,13 @@ buttons is what makes the grouping read correctly.
 
 It is **labelled `Refresh`, not an icon**. A bare glyph beside four equally-quiet
 controls did not answer "does this pane re-read itself?", which is a question an
-operator had to press it to find out. Query-backed tabs also re-read on **every tab
+operator had to press it to find out.
+
+It is also **docked immediately after the search field**, not pushed to the pane's
+right edge. Two changes were needed: dropping `marginLeft: auto` on the button, and
+making the search field stop GROWING (`flex: 0 1 <basis>` rather than `1 1 <basis>`).
+A growing field consumes all the slack and drags whatever follows it to the far
+edge, which is how the button ended up a screen away from the box it re-reads. Query-backed tabs also re-read on **every tab
 entry** ([history.md](history.md) §5.1) — a pane whose content silently ages is
 worse than an empty one, because it reads as current.
 

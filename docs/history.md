@@ -167,6 +167,12 @@ rows to also change the time range.
 |---|---|
 | 50 / 100 / 200 | **50** |
 
+**The tab carries no badge.** Every other tab's badge is a fact about the system
+(alerts firing, arrivals received, events in the window); this one's would be the
+page size the operator just chose, which tells them nothing they did not type. The
+tab opts out via `badge: false`, and `tabBadgeCount('history', …)` throws — so
+re-adding a count without re-adding the UI fails loudly instead of silently.
+
 50 rather than the gateway's maximum of 1000: the trail is read by skimming recent
 arrivals, and 1000 rows is both a scroll marathon and 1000 hashes out of Valkey per
 query. `total` still reports the whole window, so the notice can say

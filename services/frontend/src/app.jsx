@@ -155,7 +155,8 @@ const TABS = [
   { id: 'alerts', label: 'Open alerts' },
   { id: 'events', label: 'Live events' },
   { id: 'all', label: 'All events' },
-  { id: 'history', label: 'History' },
+  // No badge: the count would be the operator's own page size, not a system fact.
+  { id: 'history', label: 'History', badge: false },
 ];
 
 /**
@@ -2494,10 +2495,16 @@ function App() {
             aria-label="Views"
           >
             {TABS.map((t) => {
-              // Every tab has its own branch. The old form was a chain of ternaries
-              // ending in a closed-alert count, so a NEW tab silently inherited it —
-              // which is why "All events" once showed a number with an empty table.
-              const count = tabBadgeCount(t.id, {
+              // Some tabs carry NO badge: `t.badge === false` in TABS. History is
+              // one, because its count would be the page size the operator just
+              // picked (50/100/200) rather than a fact about the system — a number
+              // that reports your own limit tells you nothing.
+              //
+              // Every other tab has its own branch, and `tabBadgeCount` throws on an
+              // unknown id. The old form was a chain of ternaries ending in a
+              // closed-alert count, so a NEW tab silently inherited it — which is why
+              // "All events" once showed a number with an empty table.
+              const count = t.badge === false ? null : tabBadgeCount(t.id, {
                 alerts: sortedAlerts.length,
                 events: shownEvents.length,
                 // Server window total + rows appended since that query. Deriving the
@@ -2508,12 +2515,6 @@ function App() {
                 allEvents: allEvents.total === null
                   ? allEvents.events.length
                   : allEvents.total + (allEvents.windowAdded ?? 0),
-                // Not asked yet is NOT zero: `total` stays null until the first
-                // query answers, so the badge shows the rows it holds (none) rather
-                // than claiming the trail is empty.
-                history: history.total === null
-                  ? history.events.length
-                  : history.total,
               });
               return (
                 <Tab
@@ -2524,7 +2525,7 @@ function App() {
                   label={(
                     <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
                       <span>{t.label}</span>
-                      <Chip label={count} size="small" variant="outlined" />
+                      {count === null ? null : <Chip label={count} size="small" variant="outlined" />}
                     </Stack>
                   )}
                 />
@@ -2795,14 +2796,25 @@ function App() {
             onChange={(e) => setEventFilter(e.target.value)}
             placeholder="Filter by key, device, severity, summary, agent…"
             inputProps={{ 'aria-label': 'Filter all events' }}
-            sx={{ flex: '1 1 260px', minWidth: 0, maxWidth: 460 }}
+            // `flex-grow: 0` — the field must NOT expand. With `1 1 260px` it ate
+            // all the free width and shoved the Refresh button against the pane's
+            // right edge, a screen away from the box it re-reads. Docked means the
+            // button sits directly after the field and the leftover space falls to
+            // the right of BOTH. The 240px basis leaves visible slack after the
+            // button (measured 27px at 360px, ~150px here); it can still shrink, so
+            // a narrow window is fine.
+            sx={{ flex: '0 1 240px', minWidth: 0, maxWidth: 460 }}
           />
           <Tooltip title={allEvents.loading ? 'Loading…' : 'Re-read this window'}>
-            {/* marginLeft:auto, not a flex spacer: a spacer Box and the search
-                field both carrying flex:1 SPLIT the free width between them, so
-                the field stayed 228px wide next to a 240px void. `auto` on the
-                last item absorbs whatever the capped field leaves over. */}
-            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+            {/* DockED to the search field, NOT pushed to the far right.
+                `marginLeft: auto` put the button against the window's right edge,
+                a screen away from the controls it re-reads. The button belongs to
+                the same group as the pickers and the filter, so it sits directly
+                after them and the free space falls to their right.
+                `flex: 0 0 auto` keeps it from being squeezed by the shrinking
+                search field. `span` wrapper because a disabled Button swallows
+                pointer events and the tooltip would stop showing. */}
+            <span style={{ display: 'flex', alignItems: 'center' }}>
               {/* LABELLED, not icon-only. A bare refresh glyph was easy to miss
                   beside four equally-quiet controls, and "does this pane re-read
                   itself?" was a real question an operator had to answer by pressing
@@ -3097,10 +3109,19 @@ function App() {
             onChange={(e) => setHistoryFilter(e.target.value)}
             placeholder="Filter by key, device, severity, summary…"
             inputProps={{ 'aria-label': 'Filter history' }}
-            sx={{ flex: '1 1 240px', minWidth: 0, maxWidth: 420 }}
+            // `flex-grow: 0` for the same reason as All events: a growing field
+            // pushes the Refresh button to the far edge instead of docking it.
+            // The 200px basis is what keeps the button on the SAME ROW — the row
+            // wraps, and a 320px field plus three pickers plus the button overran
+            // the pane, dropping the button onto a second line where it looked
+            // detached from everything.
+            sx={{ flex: '0 1 200px', minWidth: 0, maxWidth: 420 }}
           />
           <Tooltip title={history.loading ? 'Loading…' : 'Re-read this window'}>
-            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+            {/* Docked to the search field for the same reason as All events: a
+                button parked at the far edge is a screen away from the controls it
+                belongs to. */}
+            <span style={{ display: 'flex', alignItems: 'center' }}>
               {/* LABELLED for the same reason as All events: a bare glyph beside
                   three pickers does not say what it re-reads, and the audit trail
                   is exactly where "is this current?" matters most. */}

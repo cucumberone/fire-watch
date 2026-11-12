@@ -217,7 +217,13 @@ test('a 403 is NOT treated as a missing object', async () => {
   assert.equal(created, false, 'a 403 must be logged, not retried as a create');
 });
 
-test('setWritableLabel uses the positional patch signature', async () => {
+test('setWritableLabel uses the positional patch signature and sets a Content-Type', async () => {
+  // THE BUG THIS PINS. Without `Content-Type: application/merge-patch+json` the
+  // API server answers 415 Unsupported Media Type, `setWritableLabel` logs at
+  // debug (deliberately), and the label is never applied. The symptom is quiet:
+  // `kubectl get pods -L fire-watch.io/writable` is blank, and the
+  // `ValkeyServiceEndpointEmpty` alert that watches that label can never fire
+  // because the value never exists.
   const calls = [];
   const core = {
     async patchNamespacedPod(...args) {
@@ -229,8 +235,14 @@ test('setWritableLabel uses the positional patch signature', async () => {
   await setWritableLabel(core, 'fire-watch-lab', 'valkey-0', true, 'fire-watch.io/writable', silentLog);
 
   assert.equal(calls.length, 1);
-  const [name, namespace, body] = calls[0];
+  const [name, namespace, body, , , , , , options] = calls[0];
   assert.equal(name, 'valkey-0');
   assert.equal(namespace, 'fire-watch-lab');
   assert.equal(body.metadata.labels['fire-watch.io/writable'], 'true');
+  assert.ok(options, 'the call must pass an options object carrying the header');
+  assert.equal(
+    options.headers['Content-Type'],
+    'application/merge-patch+json',
+    'a patch without a content type is a 415, so the header is load-bearing',
+  );
 });

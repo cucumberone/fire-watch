@@ -286,16 +286,42 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
   }
 }
 
-/** Reflect the write-guard verdict as a pod label, for humans and for alerts. */
+/**
+ * Reflect the write-guard verdict as a pod label, for humans and for alerts.
+ *
+ * THE `Content-Type` HEADER IS REQUIRED. This client does not set one for a patch,
+ * and the API server answers a bare JSON body with
+ *
+ *   415 Unsupported Media Type
+ *
+ * The call then fails every cycle, `setWritableLabel` logs it at `debug` (by
+ * design — a label is cosmetic), and the label is simply never applied. The
+ * visible symptom is subtle rather than loud: `kubectl get pods -L
+ * fire-watch.io/writable` shows an empty column, and the
+ * `ValkeyServiceEndpointEmpty` alert — which watches
+ * `kube_pod_labels{label_fire_watch_io_writable="false"}` — can never fire,
+ * because that label value never exists in the first place.
+ *
+ * `merge-patch+json`, not `strategic-merge-patch+json`: a label map is merged
+ * key-by-key by a merge patch, and a strategic merge on a pod would also let this
+ * controller rewrite list fields it has no business touching.
+ */
 export async function setWritableLabel(core, namespace, podName, writable, labelKey, log) {
   try {
-    // patchNamespacedPod(name, namespace, body, pretty, dryRun, ...)
-    await core.patchNamespacedPod(podName, namespace, {
-      metadata: {
-        labels: { [labelKey]: String(writable) },
-      },
-    });
+    // patchNamespacedPod(name, namespace, body, pretty, dryRun, fieldManager,
+    //                   fieldValidation, force, options)
+    await core.patchNamespacedPod(
+      podName,
+      namespace,
+      { metadata: { labels: { [labelKey]: String(writable) } } },
+      '', undefined, undefined, undefined, undefined,
+      { headers: { 'Content-Type': 'application/merge-patch+json' } },
+    );
   } catch (err) {
+    // Debug, not error: the label is for humans and alerts, and losing it must
+    // never stop the reconcile that actually moves traffic. The 415 above was
+    // invisible for exactly this reason, which is why the test suite now pins the
+    // header rather than trusting the call.
     log.debug('could not set writable label', { pod: podName, err: String(err) });
   }
 }

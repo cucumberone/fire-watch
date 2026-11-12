@@ -575,9 +575,11 @@ async function handleDelete(conn, frame, send) {
   }
 
   try {
-    // One argument now: the bare key addresses the record AND both of its timeline
-    // members, so there is no separate source index to name.
-    const res = await reader.deleteEvent(verdict.id);
+    // The device is passed so the per-device index member is removed as well. It is
+    // read from the record above, which is why the read happens before the delete:
+    // Valkey refuses a script that touches a key it was not given in KEYS, so the
+    // index name has to be known up front rather than derived inside the script.
+    const res = await reader.deleteEvent(verdict.id, evt?.source || '');
     if (res.status === 'missing') {
       // Lost a race with another delete. Report it rather than claiming success.
       send(JSON.stringify({

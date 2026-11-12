@@ -162,6 +162,43 @@ test('readEvent does not require the record to be open', async () => {
   assert.equal(row.alertState, 'closed');
 });
 
+test('readOpenAlerts reloads the script after NOSCRIPT', async () => {
+  // THE BUG THIS PINS. The script SHA is memoised, but the SERVER's script cache
+  // does not survive a restart, a failover or SCRIPT FLUSH. Every EVALSHA then
+  // fails with NOSCRIPT and the client kept using the cached SHA, so the open-alert
+  // snapshot stayed broken until the POD restarted — an empty board during an
+  // incident, which is exactly when it is needed.
+  let loads = 0;
+  let evalshas = 0;
+  const client = {
+    async zrevrange() { return [KEY]; },
+    async script(_sub) { loads += 1; return `sha-${loads}`; },
+    async evalsha() {
+      evalshas += 1;
+      if (evalshas === 1) {
+        const e = new Error('NOSCRIPT No matching script. Please use EVAL.');
+        throw e;
+      }
+      return hashValues();
+    },
+  };
+
+  const rows = await readerWith(client).readOpenAlerts(10);
+  assert.equal(loads, 2, 'the script is loaded again after NOSCRIPT');
+  assert.equal(rows.length, 1, 'and the snapshot is served rather than failing');
+});
+
+test('a non-NOSCRIPT error from the snapshot script still propagates', async () => {
+  // Recovery must be narrow. Swallowing every error would hide a real fault (a
+  // wrong key type, a declared-key violation) behind a pointless reload.
+  const client = {
+    async zrevrange() { return [KEY]; },
+    async script() { return 'sha'; },
+    async evalsha() { throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value'); },
+  };
+  await assert.rejects(() => readerWith(client).readOpenAlerts(10), /WRONGTYPE/);
+});
+
 test('readAlert refuses a record that is not in the open index', async () => {
   // The index is the authority on what is open. Without this check a retired row
   // could be resurrected by an occurrence frame for a stale key.
@@ -240,6 +277,39 @@ test('delete removes the record and all three index members', async () => {
   assert.equal(seen.args[0], `event:${KEY}`);
   assert.deepEqual(seen.args.slice(1, 4), ['idx:event:all', 'idx:event:open', 'idx:event:closed']);
   assert.deepEqual(res, { status: 'deleted' });
+});
+
+test('delete also removes the per-device index member', async () => {
+  // THE LEAK THIS PINS. `idx:source:<device>` is written by the fold, but the
+  // delete script only cleaned the three global indexes — so every deleted record
+  // left an orphan member behind. Measured on the lab: two `idx:source:*` keys
+  // holding members whose `event:<key>` hashes were gone (`ttl=-2`). A filtered
+  // tail query reads that index, so the visible effect is a backfill that asks for
+  // records which no longer exist.
+  let seen;
+  const client = {
+    async eval(script, numKeys, ...args) {
+      seen = { numKeys, args, script };
+      return 'deleted';
+    },
+  };
+  await readerWith(client).deleteEvent(KEY, 'core-sw-07');
+
+  assert.equal(seen.numKeys, 5, 'the device index must be a declared key');
+  assert.equal(seen.args[4], 'idx:source:core-sw-07');
+  assert.match(seen.script, /ZREM', KEYS\[5\]/, 'the script must clean it');
+});
+
+test('delete without a device still works (older callers, unknown source)', async () => {
+  let seen;
+  const client = {
+    async eval(script, numKeys, ...args) {
+      seen = { numKeys, args, script };
+      return 'deleted';
+    },
+  };
+  await readerWith(client).deleteEvent(KEY);
+  assert.equal(seen.numKeys, 4, 'no source key is invented');
 });
 
 test('the journal is a separate key, not a field on the record', () => {

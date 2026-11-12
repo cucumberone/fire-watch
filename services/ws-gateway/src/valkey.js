@@ -333,12 +333,7 @@ export class ValkeyReader {
     const keys = await c.zrevrange('idx:event:open', 0, Math.max(0, limit - 1));
     if (keys.length === 0) return [];
 
-    const flat = await c.evalsha(
-      await this._snapshotSha(c),
-      keys.length,
-      ...keys.map((k) => `event:${k}`),
-    );
-
+    const flat = await this._evalSnapshot(c, keys);
     return this._rowsFromFlat(keys, flat);
   }
 
@@ -365,6 +360,47 @@ export class ValkeyReader {
   }
 
   /**
+   * Run the snapshot script, recovering from NOSCRIPT.
+   *
+   * THE BUG THIS FIXES. The script is loaded once and its SHA memoised forever,
+   * but the server's script cache does NOT survive a restart, a failover to a
+   * replica, or `SCRIPT FLUSH`. After any of those, every EVALSHA fails with
+   *
+   *   ReplyError: NOSCRIPT No matching script.
+   *
+   * and because `_snapSha` was still cached the client never reloaded it — so the
+   * failure was PERMANENT until the pod happened to restart. It was not silent in
+   * the logs, but it degraded exactly the read an operator needs during an
+   * incident: `readOpenAlerts` is the board snapshot, so a browser that loaded
+   * after the restart got an empty board while the cluster was still firing.
+   * `readClosedAlerts` and `readAlert` failed the same way.
+   *
+   * Recovery is to drop the memoised SHA and reload once. Reloading is cheap and
+   * idempotent, and doing it here means every caller gets the fix rather than each
+   * one needing its own retry.
+   */
+  async _evalSnapshot(c, keys) {
+    try {
+      return await c.evalsha(
+        await this._snapshotSha(c),
+        keys.length,
+        ...keys.map((k) => `event:${k}`),
+      );
+    } catch (err) {
+      if (!String(err?.message || err).includes('NOSCRIPT')) throw err;
+      this.log.warn('snapshot script missing from the server cache, reloading', {
+        err: String(err?.message || err),
+      });
+      this._snapSha = null;
+      return c.evalsha(
+        await this._snapshotSha(c),
+        keys.length,
+        ...keys.map((k) => `event:${k}`),
+      );
+    }
+  }
+
+  /**
    * Read recently RETIRED records, newest closure first.
    *
    * Backs the Closed tab. The open index cannot answer this — retiring removes a key
@@ -385,12 +421,7 @@ export class ValkeyReader {
     );
     if (keys.length === 0) return [];
 
-    const flat = await c.evalsha(
-      await this._snapshotSha(c),
-      keys.length,
-      ...keys.map((k) => `event:${k}`),
-    );
-
+    const flat = await this._evalSnapshot(c, keys);
     return this._rowsFromFlat(keys, flat);
   }
 
@@ -444,19 +475,38 @@ export class ValkeyReader {
   /**
    * Delete one event record permanently.
    *
-   * Removes the hash and its members from BOTH timeline indexes, so it cannot stay
-   * listed in All Events and resolve to nothing — a row that can never be opened.
+   * Removes the hash and its member from EVERY index the record appears in, so no
+   * tab can list a row that resolves to nothing.
    *
-   * The count and the open/closed indexes are deliberately NOT touched: they describe
-   * the CONDITION, and an operator deleting one record is not asserting that the
-   * condition never happened. Deleting is per record; closing is per condition.
+   * THE PER-DEVICE INDEX WAS MISSED, and it showed as a leak. `idx:source:<device>`
+   * is written by the fold alongside the global timeline, but the delete script
+   * only removed `idx:event:all`, `idx:event:open` and `idx:event:closed`. Every
+   * deleted record therefore left an orphan member behind, and because the worker's
+   * prune works on a per-source counter it can be a long time before that member is
+   * trimmed — measured on the lab as two `idx:source:*` keys holding members whose
+   * `event:<key>` hashes were gone (`ttl=-2`). A filtered tail query reads that
+   * index, so the visible effect is a backfill that requests records which no longer
+   * exist and silently drops them.
+   *
+   * The device is passed in rather than read from the hash, because the script
+   * needs the index KEY up front and Valkey refuses a script that touches a key it
+   * was not given in `KEYS`.
+   *
+   * The `count` on the alert rollup is deliberately NOT touched: it describes the
+   * CONDITION, and an operator deleting one record is not asserting the condition
+   * never happened. Deleting is per record; closing is per condition.
    */
-  async deleteEvent(bareKey) {
+  async deleteEvent(bareKey, source = '') {
     const script = `
       local existed = redis.call('DEL', KEYS[1])
       redis.call('ZREM', KEYS[2], ARGV[1])
       redis.call('ZREM', KEYS[3], ARGV[1])
       redis.call('ZREM', KEYS[4], ARGV[1])
+      -- KEYS[5] is optional: an older caller (or a record with no known device)
+      -- passes no source index, and the script must still work rather than error.
+      if KEYS[5] then
+        redis.call('ZREM', KEYS[5], ARGV[1])
+      end
       if existed == 0 then
         return 'missing'
       end
@@ -466,15 +516,14 @@ export class ValkeyReader {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const c = await this.connect();
       try {
-        const res = await c.eval(
-          script,
-          4,
+        const keyList = [
           `event:${bareKey}`,
           'idx:event:all',
           'idx:event:open',
           'idx:event:closed',
-          bareKey,
-        );
+        ];
+        if (source) keyList.push(`idx:source:${source}`);
+        const res = await c.eval(script, keyList.length, ...keyList, bareKey);
         return { status: String(res) };
       } catch (err) {
         const msg = String(err?.message || err);

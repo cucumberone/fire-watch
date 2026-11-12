@@ -21,10 +21,10 @@ resources:
   - 12-rabbitmq-user-config.yaml
   - 13-rabbitmq-services.yaml
   - 14-rabbitmq-statefulset.yaml
-  - 20-dragonfly-config.yaml
-  - 20-alert-fold-config.yaml
-  - 22-dragonfly-services.yaml
-  - 23-dragonfly-statefulset.yaml
+  - 20-valkey-config.yaml
+  - 20-event-fold-config.yaml
+  - 22-valkey-services.yaml
+  - 23-valkey-statefulset.yaml
   - 30-sentinel-config.yaml
   - 31-sentinel-statefulset.yaml
   - 32-sentinel-bridge.yaml
@@ -42,7 +42,7 @@ resources:
 #   cp .env.example .env          # then fill in real values
 #   ./scripts/create-secrets.sh
 #
-# Required keys: fire-watch-rabbitmq{password}, fire-watch-dragonfly{password},
+# Required keys: fire-watch-rabbitmq{password}, fire-watch-valkey{password},
 #                fire-watch-ingress{token}
 #
 # The RabbitMQ ACCOUNT NAME is not a Secret key. It is ConfigMap
@@ -52,7 +52,7 @@ resources:
 # AMQP_USER everywhere else — create-secrets.sh and deploy.yaml both enforce it.
 #
 # Do NOT generate these with a one-liner per Secret. `openssl rand` in two
-# separate commands produces two different passwords: the Dragonfly pods read
-# theirs from the Secret, while the Sentinels bake theirs into sentinel.conf at
-# first boot. Mismatched values come up as a cluster where every Sentinel
-# reports the master as down and failover never works. One file, one source.
+# separate commands produces two different passwords: the Valkey pods read theirs
+# from the Secret, while the Sentinels bake theirs into sentinel.conf at first
+# boot. Mismatched values come up as a cluster where every Sentinel reports the
+# master as down and failover never works. One file, one source.

@@ -131,18 +131,20 @@ function text(value, field, { required = false, max = 256 } = {}) {
  *
  * Field mapping, and the reasoning for the non-obvious ones:
  *
- *   EVT_EventKey  -> source:type   (split back apart below)
+ *   EVT_EventKey  -> type          (the device is `source`)
  *   EVT_Severity  -> severity      (via SEVERITY_MAP)
  *   EVT_Summary   -> payload.msg   (the summary line)
  *   EVT_Details   -> payload.msgc  (the long text, compressed downstream)
  *   EVT_Identifier-> id            (or generated when blank)
  *   rest          -> payload.EVT_* (kept as-is for the inspector)
  *
- * The alert key is `source:type`, which is what the fold groups on. `EVT_EventKey`
- * is the only stable identifier the producer guarantees, so it is what those two
- * fields are derived from: `device:eventKey`. Two events with the same event key
- * for the same device are the same alert — which is exactly the semantics the
- * upstream schema implies by calling it a key.
+ * The record key is derived from `EVT_Device` + `EVT_Summary`, NOT from
+ * `EVT_EventKey`: it is
+ * `event:<sha256(device + 0x1f + summary)[0:32]>`, computed by the worker
+ * (services/worker/src/keygen.js). `EVT_EventKey` still becomes `type`, which the
+ * UI shows and the subscription filter matches on, but it is not part of the
+ * identity — two different event keys with the same words on screen are one row
+ * for an operator (docs/valkey.md §2).
  */
 export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {}) {
   // Required fields come from the schema, not from this function. Adding one

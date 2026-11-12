@@ -9,7 +9,7 @@
 # lab has no Prometheus. See overlays/lab/common/delete-monitoring.yaml.
 #
 # Metric names below were taken from the sources, not guessed:
-#   Dragonfly  src/server/metrics.cc
+#   Valkey     redis_exporter v1.66.0 (INFO field -> metric mapping)
 #   RabbitMQ   rabbitmq_prometheus plugin
 #   Sentinel   oliver006/redis_exporter (sentinel mode)
 ---
@@ -36,23 +36,24 @@ spec:
       scrapeTimeout: 10s
 
 ---
-# Dragonfly: metrics on the admin port (9222), not the client port.
+# Valkey master, scraped THROUGH valkey-exporter.
 #
-# Dragonfly also serves /metrics on 6379, but that path returns HTTP over the
-# RESP port and confuses scrapers ("Received HTTP/0.9 when not allowed"). The
-# admin port is the documented one to use.
+# There is no Valkey HTTP endpoint at all — everything is RESP `INFO` — so the
+# ServiceMonitor points at the exporter Service, not at the StatefulSet. The
+# exporter itself targets `valkey:6379`, which sentinel-bridge keeps pointed at
+# the CURRENT MASTER, so every rule below describes the master.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: dragonfly
+  name: valkey-exporter
   labels:
-    app.kubernetes.io/name: dragonfly
+    app.kubernetes.io/name: valkey-exporter
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: dragonfly
+      app.kubernetes.io/name: valkey-exporter
   endpoints:
-    - port: admin
+    - port: metrics
       path: /metrics
       interval: 30s
       scrapeTimeout: 10s
@@ -60,6 +61,8 @@ spec:
 ---
 # Sentinel via redis_exporter. Sentinel speaks RESP only — there is no HTTP
 # endpoint to scrape — so an exporter is required. See 33-redis-exporter.yaml.
+# The VALKEY DATA metrics come from the separate valkey-exporter below: a
+# Sentinel-mode scrape never issues INFO, so it has no memory or eviction numbers.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -163,101 +166,126 @@ spec:
             description: "At 100% the worker's audit publish is rejected and ingest stalls. The 7-day TTL should normally keep this near 19GiB."
 
 ---
+---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: fire-watch-dragonfly
+  name: fire-watch-valkey
   labels:
-    app.kubernetes.io/name: dragonfly
+    app.kubernetes.io/name: valkey
 spec:
   groups:
-    - name: fire-watch.dragonfly
+    - name: fire-watch.valkey
       rules:
-        # --- fewer than 2 replicas: redundancy is degraded
+        # --- the master refuses writes: min-replicas-to-write is unsatisfied
         #
-        # There is no dragonfly_connected_replicas metric. The lag metric is
-        # exported once per connected replica, so counting its series gives the
-        # replica count. The earlier docs named a metric that does not exist.
-        - alert: DragonflyReplicasMissing
-          expr: |
-            count by (namespace) (dragonfly_connected_replica_lag_records) < 2
+        # This is the ENGINE-level half of the split-brain guard, and the most
+        # important alert in the set after eviction. Valkey returns
+        # `NOREPLICAS Not enough good replicas to write`, the worker requeues, and
+        # RabbitMQ accumulates — correctly, because refusing the write is the
+        # intended behaviour when the master cannot see two replicas.
+        #
+        # `redis_connected_slaves` is exporter-owned and comes from INFO
+        # replication. It is read from the master only, since valkey-exporter
+        # targets the `valkey` Service.
+        - alert: ValkeyWriteGateClosed
+          expr: redis_connected_slaves < 2
           for: 2m
-          labels: { severity: warning }
+          labels: { severity: critical }
           annotations:
-            summary: "Dragonfly has {{ $value }} connected replica(s), expected 2"
-            description: "The write guard withholds the Service endpoint below 2, so writes are already blocked if this persists past the grace period."
+            summary: "Valkey master has {{ $value }} connected replica(s), needs 2"
+            description: "min-replicas-to-write 2 is refusing writes. Events are accumulating in q.event.ingest. Check pod status and INFO replication on each pod."
 
         # --- replication falling behind
-        - alert: DragonflyReplicaLag
-          expr: dragonfly_connected_replica_lag_records > 10000
+        - alert: ValkeyReplicaLag
+          expr: redis_connected_slaves > 0 and redis_master_repl_offset - on(instance) group_left redis_slave_repl_offset > 100000000
           for: 5m
           labels: { severity: warning }
           annotations:
-            summary: "Replica {{ $labels.replica_ip }} is {{ $value }} records behind"
-            description: "A large lag means a failover would lose those records from the replica's view. The audit queue still holds them."
+            summary: "A Valkey replica is more than 100 MB of stream behind"
+            description: "A failover now would lose that tail from the replica's view. The audit queue still holds it."
 
         # --- eviction: PAGE. retention is already broken.
         #
-        # maxmemory is sized to the working set on purpose, so a non-zero
-        # eviction counter means the model in sizing.md is wrong. This is the
-        # single most important alert in the whole set.
-        - alert: DragonflyEvictingKeys
-          expr: increase(dragonfly_evicted_keys_total[5m]) > 0
+        # maxmemory-policy is noeviction, so a non-zero eviction counter means
+        # either the flag was overridden or another instance is being scraped.
+        # This is the single most important alert in the whole set.
+        - alert: ValkeyEvictingKeys
+          expr: increase(redis_evicted_keys_total[5m]) > 0
           for: 0m
           labels: { severity: critical }
           annotations:
-            summary: "Dragonfly is EVICTING keys — events are being lost"
-            description: "maxmemory-policy is noeviction, so this should be impossible. If it fires, either the flag was overridden or a different instance is being scraped. Check used_memory vs maxmemory and re-derive sizing.md §3.3."
+            summary: "Valkey is EVICTING keys — events are being lost"
+            description: "maxmemory-policy is noeviction, so this should be impossible. Either the config was overridden or a different instance is scraped. Re-derive sizing.md §3.4."
 
-        # --- memory approaching the pod limit: OOMKill during a snapshot
-        - alert: DragonflyMemoryNearLimit
+        # --- reads/writes are being REJECTED because maxmemory is reached
+        #
+        # The correct failure mode: writes fail loudly instead of evicting. It
+        # still means ingestion is stalled, so it pages too.
+        - alert: ValkeyOutOfMemory
+          expr: redis_commands_processed_total and on() (redis_memory_used_bytes / redis_memory_max_bytes) > 0.98
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Valkey is at the maxmemory ceiling — writes are being rejected"
+            description: "noeviction means OOM errors rather than data loss. The worker requeues and RabbitMQ grows. Raise maxmemory and the pod limit together (sizing.md §3.4)."
+
+        # --- memory approaching the pod limit: OOMKill during an AOF rewrite
+        - alert: ValkeyMemoryNearLimit
           expr: |
-            container_memory_working_set_bytes{container="dragonfly"}
+            container_memory_working_set_bytes{container="valkey"}
             / on (pod, namespace) group_left
-            kube_pod_container_resource_limits{resource="memory", container="dragonfly"}
+            kube_pod_container_resource_limits{resource="memory", container="valkey"}
             > 0.90
           for: 10m
           labels: { severity: warning }
           annotations:
-            summary: "Dragonfly {{ $labels.pod }} at {{ $value | humanizePercentage }} of its memory limit"
-            description: "Snapshot serialization allocates on top of the dataset. Above 90% an OOMKill during the hourly snapshot is likely."
+            summary: "Valkey {{ $labels.pod }} at {{ $value | humanizePercentage }} of its memory limit"
+            description: "An AOF rewrite forks a copy-on-write image on top of the dataset. Above 90% an OOMKill during the hourly rewrite is likely."
 
-        # --- snapshot failing: the restart path is broken
+        # --- persistence failing: the restart path is broken
         #
-        # dragonfly_failed_restores_total is the documented counter. The docs
-        # previously named dragonfly_snapshot_load_num_errors, which does not
-        # exist in Dragonfly's metric set.
-        - alert: DragonflyRestoreFailures
-          expr: increase(dragonfly_failed_restores_total[1h]) > 0
-          for: 0m
+        # redis_rdb_last_bgsave_status / redis_aof_last_write_status are exporter
+        # translations of INFO persistence. A `0` here means the last write to the
+        # AOF FAILED, which is a durability failure even though the process is up.
+        - alert: ValkeyAofWriteFailing
+          expr: redis_aof_last_write_status == 0
+          for: 5m
           labels: { severity: critical }
           annotations:
-            summary: "Dragonfly failed to load a snapshot"
-            description: "A restart loaded the previous generation or nothing. Replay the gap from q.audit.events and investigate the .dfs files."
+            summary: "Valkey cannot write its AOF"
+            description: "Durability is broken: a restart would lose everything since the last good write. Check the PV — a full or detached volume looks exactly like this."
 
-        # --- a snapshot that never completes
-        - alert: DragonflySnapshotStuck
-          expr: dragonfly_save_in_progress == 1
-          for: 30m
+        - alert: ValkeyAofRewriteFailing
+          expr: redis_aof_last_bgrewrite_status == 0
+          for: 1h
           labels: { severity: warning }
           annotations:
-            summary: "Dragonfly snapshot has been running for 30+ minutes"
-            description: "Expected duration is ~seconds at this dataset size. A stuck save blocks the next scheduled one."
+            summary: "Valkey's hourly AOF rewrite keeps failing"
+            description: "Restart time will degrade: the AOF grows with every write in the 7-day window and is replayed at boot."
+
+        # --- a replica that has been disconnected from the master for 5 min
+        - alert: ValkeyReplicaDown
+          expr: redis_connected_slaves < 2
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Valkey master sees {{ $value }} of 2 replicas"
+            description: "Below 2 the write gate is already closed (see ValkeyWriteGateClosed). This rule exists to say which side noticed first."
 
         # --- the write guard has emptied the Service endpoint
         #
-        # The bridge sets this label; kube-state-metrics exposes it. This is a
-        # better signal than a custom counter because it reflects the actual
-        # routing state, which is what workers act on.
-        - alert: DragonflyWriteGateClosed
+        # The bridge sets this label; kube-state-metrics exposes it. A better
+        # signal than a custom counter because it reflects the actual routing
+        # state, which is what writers act on.
+        - alert: ValkeyServiceEndpointEmpty
           expr: |
             kube_pod_labels{label_fire_watch_io_writable="false"} == 1
           for: 5m
           labels: { severity: critical }
           annotations:
-            summary: "Dragonfly {{ $labels.pod }} is marked NOT writable"
-            description: "sentinel-bridge has emptied Endpoints/dragonfly. Writers are blocked and events are accumulating in RabbitMQ. Check INFO REPLICATION for the missing replicas."
-
+            summary: "Valkey {{ $labels.pod }} is marked NOT writable"
+            description: "sentinel-bridge has emptied Endpoints/valkey. Writers are blocked and events are accumulating in RabbitMQ. Check INFO replication for the missing replicas."
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -276,7 +304,7 @@ spec:
         #   kubectl -n fire-watch exec deploy/redis-exporter -- \
         #     wget -qO- localhost:9121/metrics | grep sentinel
         - alert: SentinelMasterNotOk
-          expr: redis_sentinel_master_status{master_name="fire-watch-dragonfly"} != 1
+          expr: redis_sentinel_master_status{master_name="fire-watch-valkey"} != 1
           for: 2m
           labels: { severity: critical }
           annotations:
@@ -286,7 +314,7 @@ spec:
         # --- not enough sentinels agreeing = no quorum
         - alert: SentinelQuorumAtRisk
           expr: |
-            count(redis_sentinel_master_status{master_name="fire-watch-dragonfly"}) < 2
+            count(redis_sentinel_master_status{master_name="fire-watch-valkey"}) < 2
           for: 5m
           labels: { severity: critical }
           annotations:
@@ -296,7 +324,7 @@ spec:
         # --- repeated failovers: something is flapping
         - alert: SentinelFailoverFlapping
           expr: |
-            increase(redis_sentinel_master_role_changes_total{master_name="fire-watch-dragonfly"}[1h]) > 2
+            increase(redis_sentinel_master_role_changes_total{master_name="fire-watch-valkey"}[1h]) > 2
           for: 0m
           labels: { severity: critical }
           annotations:
@@ -305,7 +333,7 @@ spec:
 
         # --- one master only
         - alert: SentinelMasterCountWrong
-          expr: count(redis_sentinel_master_status{master_name="fire-watch-dragonfly"}) != 3
+          expr: count(redis_sentinel_master_status{master_name="fire-watch-valkey"}) != 3
           for: 5m
           labels: { severity: warning }
           annotations:
@@ -350,4 +378,4 @@ spec:
           labels: { severity: warning }
           annotations:
             summary: "{{ $labels.pod }} has been Pending for 15+ minutes"
-            description: "Usually insufficient memory for a rescheduled Dragonfly. See sizing.md §3.3 — a 48Gi limit needs 128 GiB nodes to move."
+            description: "Usually insufficient memory for a rescheduled Valkey. See sizing.md §3.3 — a 52Gi limit needs 128 GiB nodes to move."

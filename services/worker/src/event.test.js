@@ -1,6 +1,6 @@
 /**
  * Tests for the worker's pure logic: validation, compression, timestamp
- * extraction. No broker, no Dragonfly.
+ * extraction. No broker, no Valkey.
  *
  *   node --test src/
  */
@@ -16,7 +16,7 @@ import {
   isGzip,
   isRetirement,
 } from './event.js';
-import { alertKey } from './config.js';
+import { eventKeyFor, bareKeyFor } from './keygen.js';
 
 const valid = {
   id: 'abc-123',
@@ -155,11 +155,22 @@ test('brokerTsMs returns null when no timestamp exists at all', () => {
   assert.equal(brokerTsMs({}), null);
 });
 
-// ------------------------------------------------------------------ alert keys
-test('alertKey is source:type, so different types never share state', () => {
-  assert.equal(alertKey({ source: 'sensor-a', type: 'temp' }), 'sensor-a:temp');
+// ------------------------------------------------------------------ event keys
+test('the event key covers device + summary and ignores the type field', () => {
+  // Deliberate. The board groups on what an operator reads — the device and the
+  // summary line — not on the producer's internal event key. Two different
+  // EVT_EventKey values with the same words on screen are one row, which is what
+  // an operator means by "the same alarm".
+  const a = eventKeyFor({ source: 'sensor-a', type: 'temp', payload: { msg: 'too hot' } });
+  const b = eventKeyFor({ source: 'sensor-a', type: 'other', payload: { msg: 'too hot' } });
+  assert.equal(a, b);
   assert.notEqual(
-    alertKey({ source: 'sensor-a', type: 'temp' }),
-    alertKey({ source: 'sensor-a', type: 'humidity' }),
+    eventKeyFor({ source: 'sensor-a', payload: { msg: 'too hot' } }),
+    eventKeyFor({ source: 'sensor-a', payload: { msg: 'too cold' } }),
   );
+});
+
+test('bareKeyFor strips the prefix, because zsets store the bare key', () => {
+  const evt = { source: 's', payload: { msg: 'm' } };
+  assert.equal(bareKeyFor(evt), eventKeyFor(evt).slice('event:'.length));
 });

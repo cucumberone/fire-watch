@@ -17,16 +17,16 @@ Node.js gateway that streams events to browser clients over WebSocket. Stateless
 
 Anti-affinity is **required**, not preferred. The earlier reasoning ("preferred, because required spread would leave pods Pending on a 2-node cluster") does not apply: the target is 3 nodes ([sizing.md](sizing.md) §3.2), so required spread always schedules. Preferred affinity would allow all three pods to land on one node, and losing that node would take the gateway to **zero replicas** — the opposite of the H/A requirement ([fault-tolerance.md](fault-tolerance.md) §3.4).
 
-Accepted consequence: after a node loss the third pod stays `Pending`, because no node may hold two copies. Same behaviour as RabbitMQ and Dragonfly, and the correct one.
+Accepted consequence: after a node loss the third pod stays `Pending`, because no node may hold two copies. Same behaviour as RabbitMQ and Valkey, and the correct one.
 
 ## 2. Why stateless works
 
-Each gateway pod simply subscribes to Dragonfly pub/sub and fans out to its own sockets. No pod needs to know about any other pod:
+Each gateway pod simply subscribes to Valkey pub/sub and fans out to its own sockets. No pod needs to know about any other pod:
 
 ```text
 on client connect:
   subscribe to fw:ch:events (+ optional filter)
-  backfill: ZRANGEBYSCORE fw:idx:src:{source} (now - since, now) then MGET fw:evt:{id}
+  backfill: ZRANGEBYSCORE idx:source:{device} (now - since, now) then HMGET event:<key>
   stream: forward every fw:ch:events message matching the subscription
 ```
 
@@ -44,9 +44,9 @@ Server → client:
 
 ```json
 { "op": "event", "event": { "id": "...", "source": "sensor-a", "type": "telemetry.temperature", "severity": "CRITICAL", "ts": "...", "payload": {} }, "applied": 1 }
-{ "op": "snapshot", "alerts": [ { "key": "sensor-a:telemetry.temperature", "severity": "CRITICAL", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3, "lastId": "abc", "ackedBy": null, "ackedAt": null, "event": { } } ] }
-{ "op": "alert", "key": "sensor-a:telemetry.temperature", "state": "open", "severity": "CRITICAL", "first_seen": 1762699200000, "last_seen": 1762699260000, "count": 3 }
-{ "op": "alert", "key": "sensor-a:telemetry.temperature", "state": "closed", "closed_at": 1762699900000 }
+{ "op": "snapshot", "alerts": [ { "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "source": "sensor-a", "severity": "CRITICAL", "summary": "inlet temperature above threshold", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3, "lastId": "abc", "ackedBy": null, "ackedAt": null } ] }
+{ "op": "alert", "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "applied": 1, "severity": "CRITICAL", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3 }
+{ "op": "alert", "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "applied": 3, "state": "closed", "closedAt": 1762699900000 }
 { "op": "hello", "server": "ws-gateway-5f7c", "backfill": 42 }
 { "op": "error", "code": "bad_filter", "message": "unknown source" }
 ```
@@ -55,11 +55,19 @@ Rules:
 
 - `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **broker timestamp** index, so they stay correct even when producer clocks are skewed.
 
-  **With no source filter it reads `fw:idx:evt:all`.** It used to be skipped entirely in that case, on the grounds that without a source there was no bounded index to read and scanning every source is the unbounded scan this design forbids. That reasoning predates the global index. The worker writes every event to one timeline, so "everything since T" is a single bounded `ZRANGEBYSCORE` — the same read `op: allEvents` already does.
+  **With no source filter it reads `idx:event:all`.** It used to be skipped entirely in that case, on the grounds that without a source there was no bounded index to read and scanning every source is the unbounded scan this design forbids. That reasoning predates the global index. The worker writes every event to one timeline, so "everything since T" is a single bounded `ZRANGEBYSCORE` — the same read `op: allEvents` already does.
 
   Skipping it made Live events **empty on every refresh**: the only rows were whatever arrived after connecting, so a reload wiped the tail. It now replays the window since `since` (the client asks for 15 minutes by default) and reports the count in `hello.backfill`.
-- `applied` is the alert fold's return code from the worker ([event-lifecycle.md](event-lifecycle.md) §5.2): `0` dropped (duplicate or stale), `1` applied, `3` closed. `2` is a retired alias for `1`. A duplicate never reaches the client at all — the worker's `SET … NX` gate drops it — so treating `0` as an applied event would double-count, and treating it as a close would flicker the row.
-- `op: alert` frames carry an alert row, not the raw event. `count` counts every applied event; a redelivered event is dropped by the worker's `SET … NX` gate before it can affect the count ([event-lifecycle.md](event-lifecycle.md) §5.4). Alert frames are emitted from `fw:ch:alerts`; a client that missed one recovers via the snapshot on reconnect rather than by replaying events.
+- `applied` is the fold's return code from the worker
+  ([event-lifecycle.md](event-lifecycle.md) §5.2): `0` dropped (stale or
+  redelivered), `1` applied, `3` closed. The worker does not publish a frame at all
+  for `0`, so treating it as an applied event would double-count and treating it as
+  a close would flicker the row.
+- `op: alert` frames carry a ROW, not the raw event. `count` counts every applied
+  arrival; a redelivery is dropped by the fold's `(ts, id)` watermark before it can
+  affect the count ([event-lifecycle.md](event-lifecycle.md) §5.4). Alert frames are
+  emitted from `fw:ch:alerts`; a client that missed one recovers via the snapshot on
+  reconnect rather than by replaying events.
 - `payload.msgc` may arrive **gzip-compressed** and base64-encoded. The gateway passes it through untouched — it must not decompress, because that adds per-message CPU to every pod for no benefit ([payload-and-compression.md](payload-and-compression.md) §5.1).
 - Raw events are still delivered on `op: event` for the event log. The UI must not compute alert state from them.
 - Backfill is capped (`FW_BACKFILL_MAX`, default 2000 records); when exceeded, reply with `"truncated": true` and let the client narrow its window.
@@ -71,8 +79,8 @@ Four ops a client may send after `subscribe`:
 
 | Op | Frame | Effect |
 |---|---|---|
-| `ack` | `{"op":"ack","key":"source:type"}` | claim the episode; first ack wins ([acknowledge.md](acknowledge.md) §4) |
-| `close` | `{"op":"close","key":"source:type"}` | retire the alert as an operator ([acknowledge.md](acknowledge.md) §8.1) |
+| `ack` | `{"op":"ack","key":"<32-hex>"}` | claim the episode; first ack wins ([acknowledge.md](acknowledge.md) §4) |
+| `close` | `{"op":"close","key":"<32-hex>"}` | retire the record as an operator ([acknowledge.md](acknowledge.md) §8.1) |
 | `alerts` | `{"op":"alerts","keys":[...]}` | re-read ack state for the displayed rows |
 | `resync` | `{"op":"resync"}` | re-send the open-alert snapshot (§3.3) |
 | `closed` | `{"op":"closed"}` | the last 7 days of retired alerts (§3.5) |
@@ -94,16 +102,16 @@ The first version of this protocol had no snapshot, and the board was **empty on
 every page load** while the cluster held 200 open alerts. That is not a frontend
 bug; it is a missing read path:
 
-- Backfill replays **events**. Events only become alert rows as they arrive, so on
-  a quiet cluster nothing arrives and nothing renders.
-- The event stream cannot reconstruct open state anyway: "an event was stored" and
-  "this alert is still firing" are different observations, and a client that
-  connects between two events has no way to learn about the other 199 alerts.
+- Backfill replays **records**. They only appear as rows as they arrive, so on a
+  quiet cluster nothing arrives and nothing renders.
+- The stream cannot reconstruct open state anyway: "a record exists" and "this
+  condition is still firing" are different observations, and a client that connects
+  between two events has no way to learn about the other 199 open rows.
 
-So on every `subscribe` the gateway sends `op: snapshot` **before** `hello`,
-carrying every open alert the subscription matches, most recently active first,
-each with its newest event attached so the row has a Summary and the inspector has
-a full record.
+So on every `subscribe` the gateway sends `op: snapshot` **before** `hello`, carrying
+every open record the subscription matches, most recently active first. Each row is
+self-contained — the hash holds the payload, so the summary, count and timestamps come
+from one read rather than a second lookup for the newest event.
 
 ### 3.2 `op: alert` carrying a row
 
@@ -111,24 +119,24 @@ a full record.
 arrives on its own `op: event` frame, so attaching the record here would duplicate
 the payload on the hot path.
 
-There is one case where that is not enough: a **content duplicate**. The worker
-discards the copy and publishes `{kind:'occurrence', key, applied}` with no event
-([event-lifecycle.md](event-lifecycle.md) §5.4), so a client that has never seen
-this alert key receives a frame it cannot render a row from. The alert is genuinely
-open in Dragonfly, but the board shows nothing until the next snapshot — which is
-why a repeat after a CLEAR appeared only after a browser refresh.
+There is one case where that is not enough: the worker publishes an `occurrence` frame
+for an arrival whose `op: event` frame a client may have missed (a source filter, a
+reconnect, a dropped pub/sub message). A client that has never seen this key would
+receive a frame it cannot render a row from. The record is genuinely open in Valkey,
+but the board would show nothing until the next snapshot — which is why a repeat after
+a CLEAR once appeared only after a browser refresh.
 
-So for an `occurrence` the gateway reads the alert hash **once** and attaches it:
+So for an `occurrence` the gateway reads the record **once** and attaches it:
 
 ```json
-{"op":"alert","key":"src:type","applied":1,
+{"op":"alert","key":"9f2b8c1e4d7a83be5c61024ffa9d3e07","applied":1,
  "row":{"severity":"WARNING","firstSeen":…,"lastSeen":…,"count":3,
         "event":{ …newest record, or null if it expired… }}}
 ```
 
 - cost is one `HMGET` plus one `GET` of the newest event record, and only on an
   absorbed duplicate — the common path is untouched
-- `readAlert` returns `null` when the key is not in `fw:idx:alert:open`, so a
+- `readAlert` returns `null` when the key is not in `idx:event:open`, so a
   retired alert can never be resurrected as a live row
 - if the read fails the bare frame is still sent: a client that already has the row
   moves its count, and one without it stays as it was rather than inventing a row
@@ -165,7 +173,7 @@ T3  the client shows X forever
 
 The symptom is a row that disappears on a browser refresh but not on its own —
 which is exactly what a refresh fixes: it re-subscribes and receives a fresh
-snapshot. Nothing is wrong in Dragonfly; the client simply never learned.
+snapshot. Nothing is wrong in Valkey; the client simply never learned.
 
 `{"op":"resync"}` re-sends the snapshot on the connection's **existing**
 subscription. It is not "send `subscribe` again", for two reasons:
@@ -231,12 +239,12 @@ Two consequences worth stating:
   The snapshot is the complete open set, so a row it omits is genuinely closed;
   merging would resurrect rows retired while the socket was down.
 
-**`fw:idx:alert:open`.** Enumerating open alerts needs an index, and
-`SCAN fw:alert:open:*` is precisely the unbounded scan §3 forbids. The index is a
-zset (member = alert key, score = last activity) maintained **inside
-`alert-fold.lua`**, not from application code. That placement is the point: the
+**`idx:event:open`.** Enumerating open records needs an index, and
+`SCAN event:*` is precisely the unbounded scan §3 forbids. The index is a
+zset (member = bare record key, score = last activity) maintained **inside
+`event-fold.lua`**, not from application code. That placement is the point: the
 close path and the open path are already atomic there, so the index can never
-drift from `fw:alert:open:*`. A separate `ZADD` after the `EVAL` would leave a
+drift from `event:*`. A separate `ZADD` after the `EVAL` would leave a
 phantom row on every operator's board whenever a worker died between the two
 calls — and a phantom alert that nobody can clear is worse than a missing one.
 
@@ -269,23 +277,26 @@ The shipped path is exactly **three** round trips regardless of alert count:
 `HGETALL` returns a flat field/value array that Lua then has to fold into a table —
 1600 hash-table inserts for 199 alerts, which was the single largest cost.
 
-Two Dragonfly-specific constraints shaped this:
+Two Valkey-specific constraints shaped this:
 
-- **Scripts may only touch declared keys.** Dragonfly enforces Redis Cluster
-  semantics and rejects dynamic key construction:
-  `ERR script tried accessing undeclared key, key: fw:alert:shop:check-175`.
-  So the index must be read by the caller and every alert hash passed in `KEYS`,
-  and the `fw:evt:*` records must be fetched afterwards — their keys are not known
-  until the hashes have been read.
-- **Lua cannot return tables with nil holes**; they truncate silently. Missing
-  values are emitted as `""` and normalised in JS.
+- **Scripts may only touch declared keys.** Valkey enforces Redis Cluster semantics
+  and rejects dynamic key construction:
+  `ERR Script attempted to access a non local key`. So the index is read by the caller
+  and every record hash is passed in `KEYS`. There is no follow-up fetch any more: the
+  record holds the payload, so the script returns the whole row.
+- **Lua cannot return tables with nil holes**; they truncate silently. Missing values
+  are emitted as `""` and normalised in JS.
+
+This is also why the RECORD key is derived in application code rather than inside the
+script: a key minted in Lua could never be declared in `KEYS`
+([valkey.md](valkey.md) §6.1).
 
 **Residual latency is the gateway's CPU limit, not the read path.** Baseline `PING`
-to Dragonfly measured p50 0.93 ms / p95 5.5 ms, but ~1 in 30 operations stalled for
+to Valkey measured p50 0.93 ms / p95 5.5 ms, but ~1 in 30 operations stalled for
 ~80 ms, giving the bimodal 8 ms / ~100 ms pattern above. The cause is CFS
 throttling: the gateway runs with `limits.cpu: 200m` and `/sys/fs/cgroup/cpu.stat`
 showed **111 s** of cumulative `throttled_usec`, climbing ~600 ms every 3 s, while
-Dragonfly was throttled in only 2 % of periods. The snapshot is a burst of CPU work
+Valkey was throttled in only 2 % of periods. The snapshot is a burst of CPU work
 (Node string handling for 199 rows), so it lands right at the quota. If handshake
 latency matters, raise that limit before optimising the reads further.
 
@@ -316,7 +327,7 @@ Each row is a snapshot row (`key`, `severity`, `firstSeen`, `lastSeen`, `count`,
 `event`) plus the closure metadata the tab sorts and filters on: `closedAt`,
 `closedBy` (the id of the retiring event) and `state`.
 
-Read path: `ZREVRANGEBYSCORE fw:idx:alert:closed` for the keys, one Lua script for
+Read path: `ZREVRANGEBYSCORE idx:event:closed` for the keys, one Lua script for
 every hash, one pipeline for the closure fields, one MGET for the event records.
 Four round trips regardless of row count, because a 7-day window is not small and
 per-row reads would make the tab take seconds to open.
@@ -351,7 +362,7 @@ is **not**:
 | `limit` | 1000 | clamped; a full page sets `truncated` |
 | `before` | now | pages backwards without overlapping the page already held |
 
-**The window is applied server-side** (`ZREVRANGEBYSCORE` on `fw:idx:evt:all`), so a
+**The window is applied server-side** (`ZREVRANGEBYSCORE` on `idx:event:all`), so a
 1-hour request reads strictly less than a 7-day one instead of the server building
 everything and the client discarding most of it.
 
@@ -371,13 +382,13 @@ quiet" from "the request failed" without inferring it from an empty array.
 
 **The global index exists because the per-source one cannot answer this.** There is
 no way to enumerate sources without a SCAN, so the worker writes every accepted
-event to `fw:idx:evt:all` in the same step as `fw:idx:src:{source}`. An operator
+record to `idx:event:all` in the same step as `idx:source:{device}`. An operator
 close writes its CLEAR there too, and an operator delete removes the member —
 otherwise a deleted event would stay listed and resolve to nothing.
 
 ### 5.7 Database health reporting
 
-The gateway probes Dragonfly with a `PING` every `FW_DB_PROBE_MS` (10s) and pushes
+The gateway probes Valkey with a `PING` every `FW_DB_PROBE_MS` (10s) and pushes
 `{"op":"db","up":bool,"checkedAt":ms}` to every client **when the reported state
 changes**. The initial value rides in `hello`.
 
@@ -447,19 +458,19 @@ Two lessons are encoded as tests in `subscription.test.js`:
   looked like a healthy idle gateway while every socket died every 15 seconds
 
 
-## 5. Dragonfly access
+## 5. Valkey access
 
 | Aspect | Decision |
 |---|---|
 | Master discovery | Sentinel-aware client ([redis-sentinel.md](redis-sentinel.md) §5) |
-| Pub/sub | `SUBSCRIBE fw:ch:events` on the **master**, since Dragonfly propagates pub/sub from the primary |
+| Pub/sub | `SUBSCRIBE fw:ch:events` on the **master**, since Valkey propagates pub/sub from the primary |
 | Backfill reads | `ZRANGEBYSCORE` + `MGET` against the master by default |
 | Read scaling (later) | point backfill reads at a replica Service once replica lag is monitored; not needed at current scale |
 | Write access | **exactly one method**: `ackAlert` ([acknowledge.md](acknowledge.md) §4) |
 
-There is no general write surface. `dragonfly.js` has no `set`, `del` or generic `eval`, so the gateway cannot modify events, indexes or alert state beyond the two ack fields. The absence of a method is a stronger guarantee than a comment.
+There is no general write surface. `valkey.js` has no `set`, `del` or generic `eval`, so the gateway cannot modify events, indexes or alert state beyond the two ack fields. The absence of a method is a stronger guarantee than a comment.
 
-Because no event write is possible, de-duplication is an in-process LRU of recent event ids (`FW_DEDUPE_LRU`, default 10 000), not a Dragonfly `SET`.
+Because no event write is possible, de-duplication is an in-process LRU of recent event ids (`FW_DEDUPE_LRU`, default 10 000), not a Valkey `SET`.
 
 ### 5.0 Fan-out must not echo to its own publisher
 
@@ -488,8 +499,9 @@ An operator ack is the one client-initiated mutation, and it is deliberately nar
 
 | Guard | Reason |
 |---|---|
-| fixed Lua, `HSET` of `acked_by` / `acked_at` only | `severity`, `count`, `last_seen` and the watermark belong to the worker's fold; writing them here would race it |
-| `EXISTS` check first | an ack-only hash would render as a phantom row |
+| fixed Lua, `HSET` of `ackedBy` / `ackedAt` only | `severity`, `count`, `lastSeen` and the watermark belong to the worker's fold; writing them here would race it |
+| the key must be 32 lowercase hex | a stale client sending the old `source:type` shape is rejected rather than writing an ack onto a key nothing reads (`ack.js` `isValidKey`) |
+| `EXISTS` check first | an ack written onto a non-existent key would render as a phantom row |
 | first-ack-wins | two clicks cannot fight, and a second click cannot silently re-attribute |
 | `PEXPIRE` extends the existing TTL | never invents retention |
 | READONLY → re-resolve master once, then fail | a demoted node must not report a successful ack |
@@ -533,7 +545,7 @@ spec:
 
 | Probe | Endpoint | Notes |
 |---|---|---|
-| startup | `GET /healthz` | 200 once the Dragonfly subscriber is established |
+| startup | `GET /healthz` | 200 once the Valkey subscriber is established |
 | readiness | `GET /healthz` | false when the subscriber is disconnected — a pod that cannot subscribe should not receive new sockets |
 | liveness | `GET /livez` | process-only |
 

@@ -1,4 +1,4 @@
-# sentinel-bridge — applies REPLICAOF, patches the dragonfly Service selector,
+# sentinel-bridge — applies REPLICAOF, patches the valkey Service selector,
 # and reacts to the write guard.
 #
 # Specified in docs/redis-sentinel.md §4. 2 replicas with Lease leader election
@@ -18,7 +18,7 @@ metadata:
   labels:
     app.kubernetes.io/name: sentinel-bridge
 rules:
-  # Patch the dragonfly Service endpoints, read pods to resolve the master,
+  # Patch the valkey Service endpoints, read pods to resolve the master,
   # read/patch pod labels for the write guard, and hold the leader Lease.
   - apiGroups: [""]
     resources: ["pods", "endpoints"]
@@ -111,14 +111,14 @@ spec:
             # from the pod so the lab and prod share one string.
             - name: SENTINELS
               value: "sentinel-0.sentinel-headless.$(POD_NAMESPACE):26379,sentinel-1.sentinel-headless.$(POD_NAMESPACE):26379,sentinel-2.sentinel-headless.$(POD_NAMESPACE):26379"
-            - { name: FW_DRAGONFLY_MASTER,      value: fire-watch-dragonfly }
-            - { name: FW_DRAGONFLY_SERVICE,     value: dragonfly }
-            - { name: FW_DRAGONFLY_STATEFULSET, value: dragonfly }
-            - { name: FW_DRAGONFLY_HEADLESS,    value: dragonfly-headless }
+            - { name: FW_VALKEY_MASTER,      value: fire-watch-valkey }
+            - { name: FW_VALKEY_SERVICE,     value: valkey }
+            - { name: FW_VALKEY_STATEFULSET, value: valkey }
+            - { name: FW_VALKEY_HEADLESS,    value: valkey-headless }
             - { name: FW_LEASE_NAME,            value: sentinel-bridge-leader }
             - { name: FW_RECONCILE_INTERVAL,    value: "5s" }
             - { name: FW_SENTINEL_PORT,         value: "26379" }
-            - { name: FW_DRAGONFLY_PORT,        value: "6379" }
+            - { name: FW_VALKEY_PORT,        value: "6379" }
             - { name: FW_WRITE_GUARD_MIN_REPLICAS, value: "2" }
             - { name: FW_WRITABLE_LABEL,        value: fire-watch.io/writable }
             # Sentinel is the component that decides a master is gone. Leave
@@ -127,9 +127,9 @@ spec:
             - name: POD_NAME
               valueFrom:
                 fieldRef: { fieldPath: metadata.name }
-            - name: DRAGONFLY_PASSWORD
+            - name: VALKEY_PASSWORD
               valueFrom:
-                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }
           resources:
             requests: { cpu: 20m, memory: 64Mi }
             limits:   { cpu: 200m, memory: 192Mi }

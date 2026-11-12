@@ -1,33 +1,33 @@
 # sentinel-bridge
 
-The control plane DragonflyDB does not have.
+The control plane Valkey does not have.
 
-Dragonfly gives you a primary-replica data plane and nothing else: it will not
+Valkey gives you a primary-replica data plane and nothing else: it will not
 detect that the master died, will not promote a replica, and will not tell
 clients where the new master is. Redis Sentinel decides *who the master should
 be*. This service makes Kubernetes agree with that decision.
 
 Specified by [docs/redis-sentinel.md](../../docs/redis-sentinel.md) §4 and
-[docs/dragonfly.md](../../docs/dragonfly.md) §3.
+[docs/valkey.md](../../docs/valkey.md) §3.
 
 ## What it does
 
 Every `FW_RECONCILE_INTERVAL` (default 5s), if it holds the leader lease:
 
 1. Asks Sentinel for the master address (`SENTINEL get-master-addr-by-name`).
-2. Reads every Dragonfly pod's actual `ROLE`.
+2. Reads every Valkey pod's actual `ROLE`.
 3. Computes a plan (pure function, [`src/plan.js`](src/plan.js)).
 4. Applies it:
    - `REPLICAOF <master>` on any pod that is a master-but-not-the-master, or a replica of the wrong master.
    - `REPLICAOF NO ONE` if the designated master still thinks it is a replica.
-   - Rewrites `Endpoints/dragonfly` so the Service points at exactly the master — or at **nothing** when the master is not safely writable.
+   - Rewrites `Endpoints/valkey` so the Service points at exactly the master — or at **nothing** when the master is not safely writable.
 
 ## Three rules that matter
 
 **Sentinel decides who the master is. Pods report what they are.**
 Disagreements resolve in Sentinel's favour. That is what a quorum is for.
 
-**Write access is published through the Service, never asked of Dragonfly.**
+**Write access is published through the Service, never asked of Valkey.**
 When the designated master has fewer than `FW_WRITE_GUARD_MIN_REPLICAS` connected
 replicas, the endpoint list is emptied. Workers then fail loudly instead of
 writing to a minority master. A degraded database cannot be trusted to report its
@@ -53,11 +53,11 @@ free.
 |---|---|---|
 | `FW_NAMESPACE` | *required* | namespace to reconcile |
 | `SENTINELS` | *required* | `host:port,host:port,host:port` |
-| `FW_DRAGONFLY_MASTER` | *required* | Sentinel master name, e.g. `fire-watch-dragonfly` |
-| `FW_DRAGONFLY_SERVICE` | *required* | Service whose Endpoints it owns |
-| `FW_DRAGONFLY_STATEFULSET` | `dragonfly` | pod label selector value |
-| `FW_DRAGONFLY_PORT` | `6379` | data port |
-| `DRAGONFLY_PASSWORD` | *required* | from Secret |
+| `FW_VALKEY_MASTER` | *required* | Sentinel master name, e.g. `fire-watch-valkey` |
+| `FW_VALKEY_SERVICE` | *required* | Service whose Endpoints it owns |
+| `FW_VALKEY_STATEFULSET` | `valkey` | pod label selector value |
+| `FW_VALKEY_PORT` | `6379` | data port |
+| `VALKEY_PASSWORD` | *required* | from Secret |
 | `FW_WRITE_GUARD_MIN_REPLICAS` | `2` | below this, withhold the endpoint |
 | `FW_WRITABLE_LABEL` | `fire-watch.io/writable` | label set on each pod |
 | `FW_RECONCILE_INTERVAL` | `5s` | loop period |

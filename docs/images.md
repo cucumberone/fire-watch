@@ -61,7 +61,7 @@ the workflow still read as though it did.
 ### 1.2 The environment input, and what it changes
 
 All six workflows ask which environment to target. For `deploy.yaml` that is
-load-bearing: it selects the namespace, kubeconfig, and broker/Dragonfly
+load-bearing: it selects the namespace, kubeconfig, and broker/Valkey
 credentials (§9).
 
 For the five image workflows it changes **nothing about the image path**. The
@@ -216,7 +216,7 @@ The base points at the OpenShift internal registry, so a normal `kubectl apply -
 kubectl apply -k k8s/overlays/ghcr
 ```
 
-That overlay rewrites all five image references. RabbitMQ, Dragonfly and Redis are pulled from `docker.io` and need no credential, so they are not patched.
+That overlay rewrites all five image references. RabbitMQ, Valkey and the exporters are pulled from `docker.io` and need no credential, so they are not patched.
 
 Verified: `kubectl kustomize k8s/overlays/ghcr` renders 5 `ghcr.io` image references, and the base plus both lab overlays still render unchanged.
 
@@ -336,8 +336,8 @@ Set per environment at **Settings → Environments → <lab|prod>**.
 
 | GitHub store | Values | Why there |
 |---|---|---|
-| **Variables** (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `DFLY_MASTER_NAME`, `AMQP_USER` | not credentials. Readable by anyone with repo read access, and printed unmasked in logs — which is fine for a hostname and a namespace |
-| **Secrets** (masked) | `AMQP_PASS`, `DRAGONFLY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` | credentials. Masked in logs and not readable back through the API |
+| **Variables** (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `VALKEY_MASTER_NAME`, `AMQP_USER` | not credentials. Readable by anyone with repo read access, and printed unmasked in logs — which is fine for a hostname and a namespace |
+| **Secrets** (masked) | `AMQP_PASS`, `VALKEY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` | credentials. Masked in logs and not readable back through the API |
 
 `AMQP_USER` is a variable rather than a secret: it is an account name, not a credential, and a GitHub secret cannot be read back after saving, which makes it painful to verify. It is worthless without `AMQP_PASS`, which is a secret.
 
@@ -360,7 +360,7 @@ flowchart LR
   E[.env + create-secrets.sh] -.->|local path, same result| K
 ```
 
-Pods never see GitHub and never see `.env`. They read a Kubernetes Secret injected as an env var by `secretKeyRef`, in eight manifests: RabbitMQ, Dragonfly, the three Sentinels, sentinel-bridge, redis-exporter, http-ingress, workers and ws-gateway.
+Pods never see GitHub and never see `.env`. They read a Kubernetes Secret injected as an env var by `secretKeyRef`, in eight manifests: RabbitMQ, Valkey, the three Sentinels, sentinel-bridge, both exporters, http-ingress, workers and ws-gateway.
 
 `.env` and the GitHub store are two **ways to create the same Secret**, not two layers. Use whichever is convenient; both produce identical objects.
 
@@ -390,12 +390,12 @@ The workflow is written for the first or second case. Nothing about it is wrong 
 
 | Step | Reason |
 |---|---|
-| validate config first | an empty `DRAGONFLY_PASSWORD` would create a Secret with an empty key, and every Sentinel would report the master as down — a failure far from its cause. Only variable *names* are printed, never values |
+| validate config first | an empty `VALKEY_PASSWORD` would create a Secret with an empty key, and every Sentinel would report the master as down — a failure far from its cause. Only variable *names* are printed, never values |
 | reconcile the overlay namespace | the overlays hard-code `namespace:`; a mismatch with `$NAMESPACE` puts Secrets and workloads in different namespaces (§9.0) |
-| Secrets before workloads | on a first install Dragonfly needs `--requirepass` at start, and the Sentinels bake the password into `sentinel.conf` on first boot |
+| Secrets before workloads | on a first install Valkey needs its password at start (entrypoint passes `requirepass`/`masterauth`), and the Sentinels bake the same password into `sentinel.conf` on first boot |
 | `--from-env-file`, not `--from-literal` | a literal puts the value in the process argument list, where it can surface in an error message |
 | namespace must pre-exist | `k8s/base` deliberately does not own the namespace (it is shared), so creating it here would be the workflow making a policy decision it has no business making |
-| rollout waits only on Deployments | RabbitMQ and Dragonfly are StatefulSets with slow readiness; waiting on them would make a deploy look hung during a normal single-node reboot |
+| rollout waits only on Deployments | RabbitMQ and Valkey are StatefulSets with slow readiness; waiting on them would make a deploy look hung during a normal single-node reboot |
 | `Summary` runs `always()` | a failed deploy is exactly when you want the step summary, so it cannot be gated on success |
 
 ### 9.6 First-time setup per environment
@@ -406,7 +406,7 @@ kubectl create namespace fire-watch-lab        # for lab
 kubectl create namespace fire-watch           # for prod
 
 # 2. Generate the values
-openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32   # DRAGONFLY_PASSWORD, AMQP_PASS
+openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32   # VALKEY_PASSWORD, AMQP_PASS
 openssl rand -hex 32                                        # FW_INGEST_TOKEN
 
 # 3. Kubeconfig for the environment's cluster

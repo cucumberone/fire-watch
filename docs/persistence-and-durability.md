@@ -9,14 +9,16 @@ How R1 ("no data loss") is actually satisfied, and where the original spec canno
 | 1 | Producer → RabbitMQ | yes, if no publisher confirms | `confirm.select` + mandatory flag, see [rabbitmq.md](rabbitmq.md) §3 |
 | 2 | RabbitMQ in-memory → journal | no, quorum queues fsync to 2/3 members before confirm | quorum queue + `default_queue_type` |
 | 3 | RabbitMQ → worker in-flight | no, unacked messages are redelivered | manual ack after write |
-| 4 | Worker → Dragonfly master | no, write happens before ack | [workers.md](workers.md) §3 |
+| 4 | Worker → Valkey master | no, write happens before ack | [workers.md](workers.md) §3 |
 | 4b | **Redelivered message applied out of order** | yes, if closes are applied by arrival order | broker timestamp + per-key watermark fold ([event-lifecycle.md](event-lifecycle.md) §4–5) |
-| 5 | Dragonfly master → replicas | yes, async replication | quorum gate + Sentinel |
-| 6 | Dragonfly memory → disk | **yes**, snapshot-only persistence | RabbitMQ replay, §4 |
-| 7 | Dragonfly disk → restore | yes, if the snapshot is corrupt | 4-generation retention, [dragonfly.md](dragonfly.md) §6 |
-| 8 | Dragonfly → browser | yes, pub/sub is fire-and-forget | index backfill on reconnect |
+| 5 | Valkey master → replicas | yes, async replication | quorum gate + Sentinel |
+| 6 | Valkey memory → disk | **≤ 1 s** with AOF `everysec` | AOF + RabbitMQ replay, §3 |
+| 7 | Valkey disk → restore | yes, if the AOF is truncated | `aof-load-truncated yes`, plus RabbitMQ replay |
+| 8 | Valkey → browser | yes, pub/sub is fire-and-forget | index backfill on reconnect |
 
-Points 1–4 and 8 are closed by design. Points 5 and 6 are where the original spec assumed AOF.
+Points 1–4 and 8 are closed by design. Point 5 (async replication) is bounded by the
+write gate. Point 6 is now bounded by AOF instead of by the snapshot interval — the
+change Valley made worthwhile.
 
 ## 2. The three-layer durability model
 
@@ -25,13 +27,13 @@ flowchart TB
   subgraph L3["Layer 3 — browser cache"]
     FE[React UI]
   end
-  subgraph L2["Layer 2 — Dragonfly"]
+  subgraph L2["Layer 2 — Valkey"]
     M[(master)]
     R1[(replica)]
     R2[(replica)]
     M -->|async| R1
     M -->|async| R2
-    M -->|hourly .dfs| PV[(PVC)]
+    M -->|AOF everysec + hourly rewrite| PV[(PVC)]
   end
   subgraph L1["Layer 1 — RabbitMQ (source of truth)"]
     Q[(q.event.ingest<br/>quorum x3)]
@@ -41,35 +43,46 @@ flowchart TB
   FE -->|reconnect + backfill| M
 ```
 
+The third copy — the AOF on the PV — is what Dragonfly could not provide.
+
 Every accepted event exists in **at least two independent places** at all times:
 
 - after publish: RabbitMQ quorum (2/3 on disk)
-- after worker write: RabbitMQ (unacked) + Dragonfly memory, and after ack: Dragonfly memory + 2 replicas
+- after worker write: RabbitMQ (unacked) + Valkey memory, and after ack: Valkey memory + 2 replicas
 
-The only interval where an event exists solely in Dragonfly memory is the TTL window after ack ([sizing.md](sizing.md) §1). That interval is exactly what the hourly snapshot reduces from "everything since last restart" to "at most 60 minutes".
+The only interval where a record exists solely in Valkey memory is after the ack and
+before the next AOF fsync. With `appendfsync everysec` that is **at most one second**
+([valkey.md](valkey.md) §4.1) — not the up-to-60-minutes the snapshot design accepted.
 
-## 3. AOF is not available — explicit finding
+## 3. AOF is available again — what changed
 
-Upstream Dragonfly documentation, page *Append Only File (AOF)*:
+The Dragonfly-era audit recorded that the requirement
 
-> "Currently, Dragonfly does not support AOF. The primary reason is the lack of high-priority demand within the community. Implementing AOF in Dragonfly would require a different approach than in Redis and is more sophisticated, especially in terms of maintaining high performance."
+> "use the AOF feature, but every hour refresh that file with a new one from what's
+> left in the datastore"
 
-Consequences for this project:
+could **not** be met, because Dragonfly has no AOF implementation. Valkey does, so the
+requirement is now satisfied as written:
 
-| Spec text | Status |
+| Spec text | Dragonfly | Valkey |
+|---|---|---|
+| "use the AOF feature" | not implemented | `appendonly yes` |
+| "every hour refresh that file with a new one from what's left" | approximated by `snapshot_cron` | `BGREWRITEAOF` hourly, from the live keyspace |
+| "to make restart and reread fast" | met (fresh snapshot) | met (compact RDB-preamble base + ≤ 1 h tail) |
+| "No data loss" | only via RabbitMQ replay | AOF bounds it to ≤ 1 s, and RabbitMQ replay still covers a total PV loss |
+
+### 3.1 What the AOF does and does not promise
+
+| Claim | Holds |
 |---|---|
-| "Dragonfly shall use AOF feature" | **Impossible as written** |
-| "every hour refresh that file with a new one from what's left in Dragonfly" | Achievable in spirit via `snapshot_cron` (fresh complete snapshot hourly) |
-| "to make restart and reread fast" | Achievable — restart loads one recent complete snapshot, not a long log |
-| "No data loss" | Achievable only with §4, not with any Dragonfly persistence feature |
+| Every write is fsynced within 1 s | yes, `appendfsync everysec` |
+| A restart replays a small file | yes, because the hourly rewrite rebuilds a compact base |
+| A torn write at the end of the log is tolerated | yes, `aof-load-truncated yes` |
+| Total PV loss is survivable | **no** — that is what `q.audit.events` is for (§4) |
+| Deleted records stay deleted across a crash | **no** — the AOF still holds the write until the next rewrite ([acknowledge.md](acknowledge.md) §10.1) |
 
-Options, in order of preference:
-
-1. **RabbitMQ as WAL (recommended).** Keep an ack'd-event journal replayable from RabbitMQ for the full Dragonfly TTL window. No new component, no new failure mode.
-2. **Accept a bounded RPO** of up to 60 minutes and record it as a documented deviation from R1. Requires the owner's sign-off.
-3. **Change datastore** to Valkey/Redis with AOF — contradicts the spec's Dragonfly requirement, so out of scope unless the owner reopens it.
-
-This document assumes option 1.
+The last two are the ones worth remembering. AOF is not a backup, and it is not an
+immediate eraser.
 
 ## 4. RabbitMQ as write-ahead log
 
@@ -81,7 +94,7 @@ Events are acknowledged by the worker, so RabbitMQ would normally forget them. T
 worker:
   validate
   compress payload.msgc (payload-and-compression.md)
-  write fw:evt:{id} + ZADD index + alert-fold   (Dragonfly master, compressed)
+  EVAL event-fold.lua (record + 4 indexes + rollup)   (Valkey master, compressed)
   publish to fx.audit (stream-backed queue q.audit.events, quorum, PLAIN)
   ack the ingest message
 ```
@@ -93,17 +106,17 @@ The audit copy is deliberately **plain**, so the WAL never depends on the applic
 | Property | Value |
 |---|---|
 | type | quorum queue, durable |
-| `x-message-ttl` | **7 days** — matches Dragonfly retention exactly |
+| `x-message-ttl` | **7 days** — matches Valkey retention exactly |
 | `x-max-length-bytes` | 64GiB — hard backstop (~19.3 GiB of real data at 1 000/min × 2 048 B) |
 | `x-overflow` | `reject-publish` — never silently drop the newest events |
 | consumers | none in steady state |
 
-A dedicated **replay job** (a `Job`, not a Deployment) drains `q.audit.events` and re-writes records into Dragonfly:
+A dedicated **replay job** (a `Job`, not a Deployment) drains `q.audit.events` and re-writes records into Valkey:
 
 ```text
 replay --since <timestamp> --until <timestamp>
   -> consume non-destructively (basic.consume + nack requeue, or a shadow consumer group)
-  -> SET fw:evt:{id} ... + ZADD fw:idx:src:{source} ... + alert-fold
+  -> EVAL event-fold.lua (one atomic step: hash, indexes, rollup)
   -> copy timestamp_in_ms into x-original-ts on any republish
   -> stop, leaving the audit queue intact
 ```
@@ -114,8 +127,8 @@ replay --since <timestamp> --until <timestamp>
 
 | Situation | Action |
 |---|---|
-| Dragonfly restarted and loaded a snapshot | replay `now - 60min` (covers the snapshot gap) |
-| Dragonfly PVC lost / snapshot corrupt | replay the **full 7 days** from `q.audit.events` |
+| Valkey restarted from its AOF | replay nothing — `appendfsync everysec` bounds the gap to ≤ 1 s |
+| Valkey PVC lost / AOF unreadable | replay the **full 7 days** from `q.audit.events` |
 | Replica divergence discovered after failover | replay the failover window |
 | Deliberate rebuild | replay full window, then drain |
 
@@ -137,26 +150,29 @@ Because the sustained rate is 1 000/min, the audit queue can afford to keep hist
 
 | Promise | Held where | Window | Survives |
 |---|---|---|---|
-| **No accepted event is lost** (R1) | RabbitMQ audit queue | 7 days | master loss, replica loss, full cluster power loss, snapshot corruption, **total PVC loss** |
-| **7 days of history is queryable** (product) | Dragonfly RAM + hourly snapshot | 7 days | pod restart, master failover, and (via replay) PVC loss |
+| **No accepted event is lost** (R1) | RabbitMQ audit queue | 7 days | master loss, replica loss, full cluster power loss, AOF corruption, **total PVC loss** |
+| **7 days of history is queryable** (product) | Valkey RAM + AOF | 7 days | pod restart, master failover, and (via replay) PVC loss |
 
-This is a meaningful improvement over the higher-rate design: a complete wipe of all three Dragonfly PVCs is now fully recoverable, not partially. The cost is ≈19.3 GiB of RabbitMQ disk.
+This is a meaningful improvement over the higher-rate design: a complete wipe of all three Valkey PVCs is now fully recoverable, not partially. The cost is ≈19.3 GiB of RabbitMQ disk.
 
 Constraint to keep in mind: **if the sustained rate grows, this parity breaks.** At 5 000/min the WAL needs ≈96 GiB, at 10 000/min ≈193 GiB. Re-check [sizing.md](sizing.md) §3.6 whenever the rate assumption changes.
 
-## 5. Snapshot strategy summary
+## 5. Persistence strategy summary
 
 | Setting | Value |
 |---|---|
-| Format | `.dfs` (`--df_snapshot_format=true`) |
-| Schedule | `snapshot_cron=0 * * * *` |
-| Naming | `firewatch-{timestamp}` (lexicographically sortable) |
-| Retention | newest 4 sets, pruner sidecar every 10 min |
-| Save on shutdown | enabled (`--dbfilename` non-empty) |
-| Restore | automatic on start: Dragonfly loads the newest snapshot in `--dir` |
-| Verification | startup probe tolerates a multi-minute load |
+| Mechanism | AOF (`appendonly yes`) |
+| fsync policy | `appendfsync everysec` — ≤ 1 s RPO |
+| Base format | RDB preamble (`aof-use-rdb-preamble yes`) so replay starts from a compact image |
+| Rewrite schedule | `BGREWRITEAOF` hourly, from the `aof-rewriter` sidecar (`FW_AOF_REWRITE_INTERVAL`) |
+| Size-triggered rewrite | `auto-aof-rewrite-percentage 100`, `auto-aof-rewrite-min-size 256mb` as a backstop |
+| RDB snapshots | **disabled** (`save ""`) — redundant with AOF, and each fork is a memory spike |
+| Restore | automatic on start: Valkey loads `/data/appendonlydir` |
+| Torn tail | tolerated (`aof-load-truncated yes`), which is the correct trade at a 1 s fsync interval |
 
-RDB is not used: `.dfs` is forkless and sharded, so an hourly 6 GiB snapshot does not stall the event loop the way a `fork()`-based RDB save would.
+The hourly rewrite is what makes a restart fast, and it is exactly the mechanism the
+original requirement described. Without it the AOF would be the whole 7-day write
+history and a restart would replay all of it.
 
 ## 6. Restore procedure
 
@@ -164,25 +180,31 @@ RDB is not used: `.dfs` is forkless and sharded, so an hourly 6 GiB snapshot doe
 # 1. stop writers so the replay is the single writer
 kubectl -n fire-watch scale deploy/worker --replicas=0
 
-# 2. start Dragonfly: newest .dfs auto-loads
-kubectl -n fire-watch rollout restart statefulset/dragonfly
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 DBSIZE
+# 2. start Valkey: the AOF auto-loads
+kubectl -n fire-watch rollout restart statefulset/valkey
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 ZCARD idx:event:all
 
-# 3. replay the gap from the audit queue
+# 3. replay the gap from the audit queue — only needed if the AOF was lost
 kubectl -n fire-watch create job --from=cronjob/replay-gap replay-$(date +%s)
 
 # 4. verify counts against the audit queue's expected window, then resume writers
 kubectl -n fire-watch scale deploy/worker --replicas=3
 ```
 
-Verification metric: `DBSIZE` after replay must be >= the number of distinct event ids read from `q.audit.events` for the same window.
+Verification metric: `ZCARD idx:event:all` after replay must be >= the number of
+distinct conditions read from `q.audit.events` for the same window. Note that it can
+be **smaller** than the number of MESSAGES, because a repeat folds onto the same
+record ([valkey.md](valkey.md) §2).
 
 ## 7. Durability acceptance checklist
 
 - [ ] Publishers use confirms (verified by a deliberate broker kill during publish)
 - [ ] `q.event.ingest` is a quorum queue with 3 members (verified in [rabbitmq.md](rabbitmq.md) §9)
-- [ ] Worker acks only after the Dragonfly write returns OK (unit test + kill-during-write test)
+- [ ] Worker acks only after the Valkey write returns OK (unit test + kill-during-write test)
 - [ ] `q.audit.events` receives a copy before ack (verified by inspecting queue depth growth)
-- [ ] Hourly snapshots exist and are pruned to 4 ([dragonfly.md](dragonfly.md) §8)
-- [ ] A full Dragonfly PVC wipe can be recovered from `q.audit.events` ([validation.md](validation.md) §5)
+- [ ] AOF is enabled and healthy: `INFO persistence` shows `aof_enabled:1` and
+      `aof_last_write_status:ok` ([valkey.md](valkey.md) §8)
+- [ ] The hourly rewrite runs: `aof_last_bgrewrite_status:ok` and the
+      `aof-rewriter` sidecar's liveness probe stays green
+- [ ] A full Valkey PVC wipe can be recovered from `q.audit.events` ([validation.md](validation.md) §5)
 - [ ] RPO deviation (if option 2 is chosen instead) is recorded and signed off

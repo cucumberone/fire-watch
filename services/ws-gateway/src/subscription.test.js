@@ -24,37 +24,45 @@ test('empty filters match everything', () => {
   assert.equal(matchesSubscription(sub, { source: 'a', type: 't' }), true);
 });
 
-// ------------------------------------------------- alert-key matching (snapshot)
-// Snapshot rows arrive as bare `source:type` keys, not events, so they cannot be
-// matched by matchesSubscription. Getting this wrong silently hides every open
-// alert from a filtered client, which looks identical to "nothing is firing".
-test('an unfiltered subscription matches every alert key', () => {
+// --------------------------------------------- snapshot-row matching
+// Snapshot rows are record objects now (they carry `source` and `type` as real
+// fields). They used to be bare `source:type` strings, which is why this had to
+// split on a colon. Getting this wrong silently hides every open row from a
+// filtered client, which looks identical to "nothing is firing".
+const row = (source, type) => ({ source, type, key: 'a'.repeat(32) });
+
+test('an unfiltered subscription matches every snapshot row', () => {
   const sub = { sources: [], types: [] };
-  assert.equal(matchesAlertSubscription(sub, 'shop:check-001'), true);
+  assert.equal(matchesAlertSubscription(sub, row('shop', 'check-001')), true);
 });
 
-test('alert-key matching splits on the FIRST colon only', () => {
-  // A type may contain colons; a source may not. Splitting on the last colon
-  // would mangle `net:if:eth0` into type `eth0`.
-  const sub = { sources: ['net'], types: [] };
-  assert.equal(matchesAlertSubscription(sub, 'net:if:eth0'), true);
-
-  const typed = { sources: [], types: ['if:eth0'] };
-  assert.equal(matchesAlertSubscription(typed, 'net:if:eth0'), true);
+test('a type containing colons is matched whole, not split', () => {
+  // The old implementation split the KEY on the first colon, which mangled
+  // `net:if:eth0`. With real fields there is nothing to split.
+  assert.equal(matchesAlertSubscription({ sources: ['net'], types: [] }, row('net', 'if:eth0')), true);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['if:eth0'] }, row('net', 'if:eth0')), true);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['eth0'] }, row('net', 'if:eth0')), false);
 });
 
-test('alert-key matching filters by source and by type', () => {
-  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, 'shop:a'), true);
-  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, 'db:a'), false);
-  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, 'shop:a'), true);
-  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, 'shop:b'), false);
+test('snapshot matching filters by source and by type', () => {
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, row('shop', 'a')), true);
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, row('db', 'a')), false);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, row('shop', 'a')), true);
+  assert.equal(matchesAlertSubscription({ sources: [], types: ['a'] }, row('shop', 'b')), false);
 });
 
-test('alert-key matching ANDs source and type', () => {
+test('snapshot matching ANDs source and type', () => {
   const sub = { sources: ['shop'], types: ['a'] };
-  assert.equal(matchesAlertSubscription(sub, 'shop:a'), true);
-  assert.equal(matchesAlertSubscription(sub, 'shop:b'), false);
-  assert.equal(matchesAlertSubscription(sub, 'db:a'), false);
+  assert.equal(matchesAlertSubscription(sub, row('shop', 'a')), true);
+  assert.equal(matchesAlertSubscription(sub, row('shop', 'b')), false);
+  assert.equal(matchesAlertSubscription(sub, row('db', 'a')), false);
+});
+
+test('an opaque key or missing row matches nothing when a filter is set', () => {
+  // Safe direction: a row is hidden rather than shown to a client that asked for
+  // something else. This is what a caller passing `a.key` instead of `a` hits.
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, 'a'.repeat(32)), false);
+  assert.equal(matchesAlertSubscription({ sources: ['shop'], types: [] }, null), false);
 });
 
 test('source filter matches only that source', () => {

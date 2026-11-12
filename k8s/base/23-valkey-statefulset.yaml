@@ -1,0 +1,184 @@
+# Valkey StatefulSet — 1 master + 2 replicas, manifests only, no operator.
+# See docs/valkey.md. OrderedReady so replicas never attempt replication before
+# valkey-0 exists. Roles are applied at runtime by sentinel-bridge, never
+# hard-coded here: a restarted pod must not assume a master that may since have
+# been demoted (docs/redis-sentinel.md §4).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey
+  labels:
+    app.kubernetes.io/name: valkey
+spec:
+  serviceName: valkey-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: valkey
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: valkey
+      annotations:
+        # Bumped by hand whenever `valkey.conf` changes in a way that must be
+        # picked up by a restart (the file is read at boot only, unlike the
+        # event-fold script which the worker re-reads).
+        fire-watch/valkey-config-checksum: "1"
+    spec:
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: valkey
+              topologyKey: kubernetes.io/hostname
+      containers:
+        # ---------------------------------------------------------------- server
+        - name: valkey
+          # Valkey is the Linux Foundation fork of Redis 7.4, BSD-licensed, so
+          # this image is the drop-in replacement for `redis:7.4` with the newer
+          # server. Pin a digest before committing to production.
+          image: docker.io/valkey/valkey:8.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: client, containerPort: 6379 }
+          # Config file from the ConfigMap; credentials from the environment via
+          # the entrypoint, so the password is never in the pod spec.
+          command: ["/bin/sh", "/etc/valkey/entrypoint.sh"]
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-valkey, key: password }
+          resources:
+            # 52Gi, not 48Gi: the AOF rewrite forks, and the child's copy-on-write
+            # pages grow on top of the dataset. Derivation in docs/sizing.md §3.4.
+            requests: { cpu: 500m, memory: 8Gi }
+            limits: { cpu: "4", memory: 52Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: config, mountPath: /etc/valkey, readOnly: true }
+            - { name: data, mountPath: /data }
+          # Probes.
+          #
+          # Two defects found on the Dragonfly predecessor apply verbatim; neither
+          # is visible by reading the YAML:
+          #
+          # 1. `valkey-cli ping` EXITS 0 EVEN WHEN AUTH FAILS. It prints
+          #    "NOAUTH Authentication required." and still returns success, so a
+          #    probe of that form passes with the wrong password. The assertion
+          #    must be on the OUTPUT.
+          #
+          # 2. `$(VAR)` is NOT expanded inside a probe `exec.command`. The kubelet
+          #    only substitutes `$(VAR)` in `env[].value` and the container's own
+          #    command/args. A probe written as
+          #        ["valkey-cli", "-a", "$(VALKEY_PASSWORD)", "ping"]
+          #    passes the literal string and always fails AUTH — invisible,
+          #    because of (1). Probes must go through /bin/sh -c.
+          startupProbe:
+            # An AOF replay (RDB preamble + tail) is fast, but a full resync of a
+            # 29 GiB dataset is not: 60 * 5s = 5 minutes.
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" ping | grep -qx PONG
+            periodSeconds: 5
+            failureThreshold: 60
+            timeoutSeconds: 10
+          readinessProbe:
+            # A replica mid-full-sync must not count as healthy: it would receive
+            # traffic through the headless Service while its data is incomplete.
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" ping | grep -qx PONG || exit 1
+                  role=$(valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" --raw info replication | grep '^role:' | tr -d '\r' | cut -d: -f2)
+                  if [ "$role" = "slave" ]; then
+                    valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" --raw info replication \
+                      | grep -q 'master_link_status:up' || exit 1
+                  fi
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 10
+          livenessProbe:
+            # Never assert ROLE here: a legitimate failover would restart the pod.
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" ping | grep -qx PONG
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 6
+            timeoutSeconds: 10
+        # ------------------------------------------------------ AOF rewriter
+        # Hourly BGREWRITEAOF, so restart replays a small recent file rather than
+        # a 7-day history. This is the requirement as written; the Dragonfly
+        # version could only approximate it with snapshots because Dragonfly has
+        # no AOF at all (docs/valkey.md §4.4).
+        - name: aof-rewriter
+          image: docker.io/valkey/valkey:8.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/opt/rewrite/rewrite.sh"]
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fire-watch-valkey, key: password }
+            - { name: FW_AOF_REWRITE_INTERVAL, value: "3600" }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: rewrite, mountPath: /opt/rewrite, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          livenessProbe:
+            # rewrite.sh touches /tmp/alive on every pass (1 h apart); a hung
+            # rewriter would let the AOF grow until an OOM or a slow restart.
+            exec:
+              command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/alive) )) -lt 9000"]
+            periodSeconds: 60
+            failureThreshold: 3
+            timeoutSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: valkey-config
+        # rewrite.sh lives in the same ConfigMap but must be mounted separately:
+        # the server container mounts the whole ConfigMap at /etc/valkey, and a
+        # second mount of the same source is not allowed in one container, so the
+        # rewriter uses its own projected volume with only the script.
+        - name: rewrite
+          configMap:
+            name: valkey-config
+            items:
+              - { key: rewrite.sh, path: rewrite.sh }
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 64Gi

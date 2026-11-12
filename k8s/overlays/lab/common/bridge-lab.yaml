@@ -1,8 +1,10 @@
-# The write guard moved into sentinel-bridge: the bridge already reads every
-# pod's ROLE, so counting replicas there is the same information without a
-# sidecar. In the lab there is exactly one Dragonfly and no replica at all, so
-# the guard must be disabled or it would withhold its own endpoint forever
-# (docs/kustomize.md §3.6).
+# The write guard lives in sentinel-bridge: the bridge already reads every pod's
+# ROLE, so counting replicas there is the same information without a sidecar. In
+# the lab there is exactly one Valkey and no replica at all, so the guard must be
+# disabled or it would withhold its own endpoint forever (docs/kustomize.md §3.6).
+#
+# Valkey's own `min-replicas-to-write` is set to 0 for the same reason — see
+# valkey-lab.yaml. Both halves have to be off or the lab silently refuses writes.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,9 +16,9 @@ spec:
         - name: bridge
           env:
             - { name: FW_NAMESPACE,                     value: fire-watch-lab }
-            - { name: FW_DRAGONFLY_STATEFULSET,         value: dragonfly }
+            - { name: FW_VALKEY_STATEFULSET,            value: valkey }
             - { name: FW_WRITE_GUARD_MIN_REPLICAS,      value: "0" }
             - { name: FW_RECONCILE_INTERVAL,            value: "5s" }
-            - name: DRAGONFLY_PASSWORD
+            - name: VALKEY_PASSWORD
               valueFrom:
-                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }

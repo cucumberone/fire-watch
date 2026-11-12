@@ -36,14 +36,14 @@ spec:
         # Copy the template into /data ONLY if no config exists yet, so the
         # config epoch written by Sentinel itself survives a pod restart.
         - name: seed-config
-          image: docker.io/library/redis:7.4
+          image: docker.io/valkey/valkey:8.1
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               if [ ! -f /data/sentinel.conf ]; then
-                sed "s|__DRAGONFLY_PASSWORD__|$DRAGONFLY_PASSWORD|" \
+                sed "s|__VALKEY_PASSWORD__|$VALKEY_PASSWORD|" \
                   /etc/sentinel-src/sentinel.conf.template > /data/sentinel.conf
                 chmod 0640 /data/sentinel.conf
                 echo "seeded /data/sentinel.conf"
@@ -51,9 +51,9 @@ spec:
                 echo "keeping existing /data/sentinel.conf (epoch preserved)"
               fi
           env:
-            - name: DRAGONFLY_PASSWORD
+            - name: VALKEY_PASSWORD
               valueFrom:
-                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits:   { cpu: 100m, memory: 64Mi }
@@ -67,9 +67,9 @@ spec:
             - { name: data, mountPath: /data }
       containers:
         - name: sentinel
-          image: docker.io/library/redis:7.4
+          image: docker.io/valkey/valkey:8.1
           imagePullPolicy: IfNotPresent
-          command: ["redis-sentinel", "/data/sentinel.conf"]
+          command: ["valkey-sentinel", "/data/sentinel.conf"]
           ports:
             - { name: sentinel, containerPort: 26379 }
           resources:
@@ -83,19 +83,19 @@ spec:
             - { name: data, mountPath: /data }
           startupProbe:
             exec:
-              command: ["redis-cli", "-p", "26379", "ping"]
+              command: ["valkey-cli", "-p", "26379", "ping"]
             periodSeconds: 5
             failureThreshold: 30
             timeoutSeconds: 10
           readinessProbe:
             exec:
-              command: ["redis-cli", "-p", "26379", "ping"]
+              command: ["valkey-cli", "-p", "26379", "ping"]
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 10
           livenessProbe:
             exec:
-              command: ["redis-cli", "-p", "26379", "ping"]
+              command: ["valkey-cli", "-p", "26379", "ping"]
             initialDelaySeconds: 30
             periodSeconds: 30
             failureThreshold: 6

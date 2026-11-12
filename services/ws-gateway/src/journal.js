@@ -1,11 +1,14 @@
 /**
  * Operator journal — validation and wire format.
  *
- * An operator attaches a note to an incident. The journal is keyed by the ALERT
- * (`source:type`), not by an event id: the note is about the incident, and an
- * event record is pruned after the retention window while the incident is exactly
- * what an operator keeps coming back to. Keying on an event id would also mean the
- * note disappears with the record it was attached to.
+ * An operator attaches a note to an incident. The journal is keyed by the RECORD
+ * KEY (`32 hex`), the same key the ack and the close use: with one hash per
+ * condition there is no longer a separate "alert" object to attach to. See
+ * services/worker/src/keygen.js.
+ *
+ * The storage is a LIST beside the record (`journal:<key>`), never fields on the
+ * record hash. The worker's fold owns that hash and rewrites it atomically, so a
+ * second writer HSET-ing notes into it would race the fold.
  *
  * Entries are APPEND-ONLY. A single editable text column was rejected: two
  * operators annotating the same incident would silently clobber each other,
@@ -45,16 +48,17 @@ export function cleanNote(value, maxLen = MAX_JOURNAL_LEN) {
   return stripped.length > maxLen ? stripped.slice(0, maxLen) : stripped;
 }
 
-/** Same rule as `isValidAlertKey` in ack.js, kept local so this module is standalone. */
+/**
+ * Same rule as `isValidKey` in ack.js, kept local so this module stays standalone.
+ *
+ * STRICT: 32 lowercase hex characters. The legacy `source:type` shape is rejected
+ * on purpose — a stale client would otherwise write a note under a key nothing
+ * reads, and the note would vanish from the UI while sitting in the database.
+ */
 export function isValidJournalKey(key) {
   if (typeof key !== 'string') return false;
   const k = key.trim();
-  if (k.length === 0 || k.length > 256) return false;
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(k)) return false;
-  // The key is `source:type`; without the separator it cannot address an alert,
-  // and a journal entry under a bogus key would never be reachable from any row.
-  return k.includes(':');
+  return /^[0-9a-f]{32}$/.test(k);
 }
 
 /**
@@ -77,7 +81,7 @@ export function validateJournalAppend(frame, newId) {
     return {
       ok: false,
       code: 'bad_key',
-      message: 'key must be a non-empty "source:type" string of at most 256 chars',
+      message: 'key must be a 32-character lowercase hex record key',
     };
   }
   const text = cleanNote(frame.text);

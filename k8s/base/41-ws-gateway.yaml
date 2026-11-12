@@ -1,5 +1,5 @@
 # WebSocket gateway — stateless fan-out, read-only, compression-transparent.
-# See docs/websocket-server.md. No write access to Dragonfly, so it cannot
+# See docs/websocket-server.md. No write access to Valkey, so it cannot
 # violate the write-guard invariant even if misconfigured.
 apiVersion: apps/v1
 kind: Deployment
@@ -51,10 +51,10 @@ spec:
             - { name: http, containerPort: 8080 }
           env:
             - { name: SENTINELS,        value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
-            - { name: DFLY_MASTER_NAME, value: fire-watch-dragonfly }
-            - name: DRAGONFLY_PASSWORD
+            - { name: VALKEY_MASTER_NAME, value: fire-watch-valkey }
+            - name: VALKEY_PASSWORD
               valueFrom:
-                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }
             - { name: FW_CHANNEL_EVENTS,  value: fw:ch:events }
             - { name: FW_CHANNEL_ALERTS,  value: fw:ch:alerts }
             - { name: FW_DEDUPE_LRU,      value: "10000" }
@@ -62,7 +62,7 @@ spec:
             # Cap on the open-alert snapshot sent on connect (websocket-server.md §3.1).
             - { name: FW_ALERT_SNAPSHOT_MAX, value: "2000" }
 
-            # How often the gateway PINGs Dragonfly and reports its health, and how
+            # How often the gateway PINGs Valkey and reports its health, and how
             # many consecutive failures before telling clients it is down. Three
             # failures is ~30s: long enough that a demoted master or a blip does not
             # flicker the UI.
@@ -76,7 +76,7 @@ spec:
             - { name: FW_JOURNAL_TTL,     value: "604800" }
 
             # Journal notes are ALSO published to the audit exchange, because
-            # Dragonfly alone cannot make a note durable (docs/journal.md §3).
+            # Valkey alone cannot make a note durable (docs/journal.md §3).
             # Without these the gateway still starts and notes are still saved --
             # they are just not recoverable, which is why the gap is exported as
             # fw_journal_audit_enabled rather than only logged once.
@@ -112,7 +112,7 @@ spec:
             failureThreshold: 24
             timeoutSeconds: 10
           readinessProbe:
-            # False while the Dragonfly subscriber is disconnected: a pod that
+            # False while the Valkey subscriber is disconnected: a pod that
             # cannot subscribe should not receive new sockets.
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10

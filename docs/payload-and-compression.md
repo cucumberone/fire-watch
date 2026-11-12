@@ -9,7 +9,7 @@ Two plain-text payload fields, what each means, and whether they can be compress
 | `msg` | the short / current message text — a summary, a single line | ~64–256 B | changes on every occurrence |
 | `msgc` | the **c**omplete string — the full body, e.g. a stack trace, a multi-line log excerpt, a device-reported detail block | ~1–8 KiB, sometimes much more | usually the same for every occurrence of a condition |
 
-> **Naming:** these are wire names. The web UI labels them **Summary** and **MsgCompleteString**; the rename happens once at the frontend boundary and does not affect the wire, Dragonfly keys or the audit WAL ([frontend.md](frontend.md) §4.1).
+> **Naming:** these are wire names. The web UI labels them **Summary** and **MsgCompleteString**; the rename happens once at the frontend boundary and does not affect the wire, Valkey keys or the audit WAL ([frontend.md](frontend.md) §4.1).
 
 `msgc` is the long one. At 2 048 B minimum event size that is already the baseline, and it is the field that dominates memory, network and browser rendering cost.
 
@@ -48,7 +48,7 @@ So compressing `msgc` is a **~3x reduction in RAM, PV and snapshot size**, and i
 | Risk | Verdict |
 |---|---|
 | Loss of exact bytes | **No** — gzip is lossless. The original string is recovered byte-for-byte. |
-| Data loss if Dragonfly is rebuilt | **No** — the audit queue stores the *original* message, so the replay path does not depend on the compression scheme (§4). |
+| Data loss if Valkey is rebuilt | **No** — the audit queue stores the *original* message, so the replay path does not depend on the compression scheme (§4). |
 | Decompression failure in the browser | Handled explicitly — a corrupt/unknown blob must degrade to a visible marker, never to a blank alert (§5). |
 | Searchability | **Yes, genuinely lost** — see §6. This is the real trade-off. |
 
@@ -58,7 +58,7 @@ So compressing `msgc` is a **~3x reduction in RAM, PV and snapshot size**, and i
 flowchart LR
   P[Producer] -->|plain msg + msgc| RMQ[(RabbitMQ<br/>ingest + audit)]
   RMQ --> W[worker]
-  W -->|gzip msgc above threshold| DF[(Dragonfly<br/>stored value)]
+  W -->|gzip msgc above threshold| DF[(Valkey<br/>stored value)]
   DF --> G[gateway]
   G -->|pass through unchanged| FE[browser]
   FE -->|DecompressionStream| UI[rendered alert]
@@ -69,7 +69,7 @@ flowchart LR
 | Producer | sends **plain** text. Never compresses. |
 | RabbitMQ | stores **plain** — the queue is the WAL and must be readable/replayable without app code ([persistence-and-durability.md](persistence-and-durability.md) §4). |
 | Worker | compresses on write when the field exceeds `FW_COMPRESS_MIN`; **never modifies the audit copy** |
-| Dragonfly | stores the compressed bytes as the value |
+| Valkey | stores the compressed bytes as the value |
 | Gateway | does **not** decompress — it has no write access and no reason to pay the CPU; it forwards bytes |
 | Browser | decompresses with the native `DecompressionStream` API |
 
@@ -90,21 +90,29 @@ Storage cost of keeping it plain: ≈19.3 GiB for 7 days ([sizing.md](sizing.md)
 The value must be self-describing, because a rolling upgrade can mix compressed and plain rows in the same keyspace.
 
 ```text
-fw:evt:{id}  value (RESP bulk string):
+event:<key>  hash field `payload` (RESP bulk string, JSON):
 
-  plain:       <original UTF-8 bytes>                      (first byte is '{' for JSON)
-  compressed:  \x1f\x8b <gzip stream>                      (first byte 0x1f, second 0x8b)
+  plain:       {"msg":"…","msgc":"…","EVT_Agent":"…"}      (first byte is '{')
+  compressed:  {"msg":"…","msgc":{"__gz":"<base64>"}}      (the FIELD is a marker object)
 ```
+
+The record is a hash, so the compressed form is not a magic-byte prefix on the whole
+value — it is a per-field wrapper object `{"__gz": "<base64 gzip>"}`. That is what lets
+one record carry a compressed `msgc` and a plain `msg` in the same payload, which the
+Dragonfly-era design could not do as cleanly.
 
 Detection is by **magic bytes**, not by a separate flag key:
 
-- `0x1f 0x8b` = gzip → decompress
-- anything else = plain UTF-8 → use as-is
+- an object with a single `__gz` string key → base64-decode, then gunzip
+- any other string → use as-is
 
 Why magic bytes and not a metadata field:
 
-- it survives partial writes and mixed-version fleets with zero coordination;
-- it needs no extra Dragonfly key (each key already costs ~24 B of dash-table overhead, [architecture.md](architecture.md) §6.1);
+- it survives partial writes and mixed-version fields with zero coordination — the
+  marker is per FIELD, so a record written by an older worker reads correctly beside a
+  newer one;
+- it needs no extra Valkey key or metadata field (each key already costs ~90 B of
+  hashtable overhead, [architecture.md](architecture.md) §6.1);
 - it is the same rule every gzip reader on earth uses, so the browser needs no custom framing.
 
 The JSON envelope itself (`id`, `source`, `type`, `severity`, broker ts) is **never** compressed — only the `msg`/`msgc` strings inside `payload`. Keeping the envelope plain means the gateway can filter and the index can be built without decompressing anything.
@@ -115,7 +123,7 @@ Two options:
 
 | Option | Pros | Cons |
 |---|---|---|
-| **A. compress `msgc` only** (recommended) | `msg` stays greppable in `redis-cli`; smallest change; envelope intact | `msg` gains nothing (correctly — it is small) |
+| **A. compress `msgc` only** (recommended) | `msg` stays greppable in `valkey-cli`; smallest change; envelope intact | `msg` gains nothing (correctly — it is small) |
 | B. compress the whole `payload` object | one blob, slightly better ratio | the UI cannot filter on any payload field without decompressing; nothing stays inspectable |
 
 Option A. Compress exactly the field that is big, leave everything else alone.
@@ -174,13 +182,13 @@ This is the only genuine loss and it must be stated plainly:
 
 | Operation | Plain | Compressed |
 |---|---|---|
-| `redis-cli GET fw:evt:{id}` | readable | binary |
+| `valkey-cli HGETALL event:<key>` | readable | binary |
 | Search for a string across events | `SCAN` + substring test | impossible without decompressing every value |
 | Ad-hoc ops debugging | easy | needs a helper script |
 | UI render | direct | decompress (transparent) |
 | Replay correctness | exact | exact |
 
-Mitigation: the **audit queue stays plain** (§3.1), so any search across history is a RabbitMQ consume + grep, not a Dragonfly scan. A helper `fw-inspect` script (decompress one id or a range) covers the ops case. No search feature is lost that the design actually promised — Dragonfly was never a search engine here.
+Mitigation: the **audit queue stays plain** (§3.1), so any search across history is a RabbitMQ consume + grep, not a Valkey scan. A helper `fw-inspect` script (decompress one id or a range) covers the ops case. No search feature is lost that the design actually promised — Valkey was never a search engine here.
 
 If substring search over the payload is a requirement, it must be raised as a separate feature (an inverted index, or an external search store). Compressing `msgc` does not remove a capability the architecture had; it removes one that would have worked by accident on small data.
 
@@ -216,19 +224,20 @@ That is the practical value: **compression is what makes a large `msgc` affordab
 
 ```bash
 # 1. a compressed value is identifiable and reversible
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --no-raw GET fw:evt:<id> | head -c 4
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 --raw HGET event:<key> payload | head -c 40
 # expect \x1f\x8b for compressed, '{' for plain
 
 # 2. round-trip a known long msgc
-kubectl -n fire-watch exec dragonfly-0 -- sh -c \
-  'redis-cli -p 6379 --no-raw GET fw:evt:<id> | gunzip' | jq -r .payload.msgc | head -3
+kubectl -n fire-watch exec valkey-0 -- sh -c \
+  'valkey-cli -p 6379 --raw HGET event:<key> payload' \
+  | jq -r '.msgc.__gz' | base64 -d | gunzip | head -3
 
 # 3. the audit copy is still plain
 kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin get queue=q.audit.events count=1 \
   | grep -A2 msgc
 
 # 4. threshold behaves: a short msg stays plain, a long msgc is compressed
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 MEMORY USAGE fw:evt:<id>
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 MEMORY USAGE event:<key>
 ```
 
-Browser-side check is manual: open the UI with a known compressed event and confirm the full `msgc` renders, then corrupt one value in Dragonfly and confirm the alert renders `[undecodable payload]` instead of disappearing.
+Browser-side check is manual: open the UI with a known compressed event and confirm the full `msgc` renders, then corrupt one value in Valkey and confirm the alert renders `[undecodable payload]` instead of disappearing.

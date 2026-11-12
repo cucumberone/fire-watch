@@ -8,11 +8,11 @@ Implementation order, open decisions, and known deviations from the spec.
 
 | # | Decision | Owner action |
 |---|---|---|
-| 0.1 | Accept RabbitMQ-as-WAL instead of Dragonfly AOF (R1) | read [persistence-and-durability.md](persistence-and-durability.md) §3 and approve option 1 |
+| 0.1 | Accept RabbitMQ-as-WAL instead of Valkey AOF (R1) | read [persistence-and-durability.md](persistence-and-durability.md) §3 and approve option 1 |
 | 0.2 | Measure the real event size distribution | [sizing.md](sizing.md) §2.2 — baseline uses the 2 048 B **floor**, not an average; every doubling doubles the working set |
-| 0.3 | Choose node size | [sizing.md](sizing.md) §3.3 — a survivor must host two 48Gi Dragonfly pods, so **128 GiB nodes** are needed to keep 3-replica redundancy through a node loss |
+| 0.3 | Choose node size | [sizing.md](sizing.md) §3.3 — a survivor must host two 52Gi Valkey pods, so **128 GiB nodes** are needed to keep 3-replica redundancy through a node loss |
 | 0.4 | Confirm Sentinel is the role manager | [redis-sentinel.md](redis-sentinel.md) |
-| 0.5 | Confirm image tags/digests for RabbitMQ, Dragonfly, Redis | pin before any manifest is committed |
+| 0.5 | Confirm image tags/digests for RabbitMQ, Valkey, Redis | pin before any manifest is committed |
 
 ### Phase 1 — broker
 
@@ -25,9 +25,9 @@ Implementation order, open decisions, and known deviations from the spec.
 
 ### Phase 2 — datastore
 
-1. `dragonfly` Secret (password) + ConfigMap (flags)
-2. `dragonfly-headless` Service
-3. `dragonfly` StatefulSet with `snapshot_cron`, pruner sidecar, PDB
+1. `valkey` Secret (password) + ConfigMap (`valkey.conf`)
+2. `valkey-headless` Service
+3. `valkey` StatefulSet with AOF, the hourly-rewrite sidecar, PDB
 4. `sentinel` ConfigMap + StatefulSet + `sentinel-headless` Service
 5. `sentinel-bridge` Deployment + RBAC (patch Service, exec into pods) — **implemented**, source in [services/sentinel-bridge](../services/sentinel-bridge/)
 6. Verify: master + 2 stable_sync replicas, sentinels agree, Service points at the master
@@ -35,7 +35,7 @@ Implementation order, open decisions, and known deviations from the spec.
 ### Phase 3 — workloads
 
 1. Producer contract doc + `fx.events` / `fx.events.dlx` definitions + `severity` enum + `msg`/`msgc` fields
-2. `alert-fold.lua` — the watermark guard, reviewed line by line ([event-lifecycle.md](event-lifecycle.md) §5.2)
+2. `event-fold.lua` — the watermark guard, reviewed line by line ([event-lifecycle.md](event-lifecycle.md) §5.2)
 3. `worker` Deployment (`validate → compress msgc → write → audit (plain) → publish → ack`)
 4. `ws-gateway` Deployment + HPA + Route, forwarding `applied`, `op: alert` and compressed `msgc` untouched
 5. `frontend` Deployment + Route, with `DecompressionStream` decoding and an undecodable fallback
@@ -44,7 +44,7 @@ Implementation order, open decisions, and known deviations from the spec.
 ### Phase 4 — hardening
 
 1. NetworkPolicies ([networking.md](networking.md) §5)
-2. ServiceMonitor / alert rules ([rabbitmq.md](rabbitmq.md) §8, [dragonfly.md](dragonfly.md) §7, [redis-sentinel.md](redis-sentinel.md) §7)
+2. ServiceMonitor / alert rules ([rabbitmq.md](rabbitmq.md) §8, [valkey.md](valkey.md) §7, [redis-sentinel.md](redis-sentinel.md) §7)
 3. `replay-gap` Job/CronJob ([persistence-and-durability.md](persistence-and-durability.md) §4)
 4. Run every scenario in [validation.md](validation.md)
 
@@ -59,21 +59,21 @@ Implementation order, open decisions, and known deviations from the spec.
 | `base/11-rabbitmq-config.yaml` | `enabled_plugins`, `rabbitmq.conf`, `definitions.json` ConfigMaps |
 | `base/13-rabbitmq-services.yaml` | headless + client Services |
 | `base/14-rabbitmq-statefulset.yaml` | StatefulSet |
-| `base/20-dragonfly-config.yaml` | flags file + entrypoint + pruner script |
-| `base/20-alert-fold-config.yaml` | `alert-fold.lua` mounted into the worker |
-| `base/22-dragonfly-services.yaml` | headless + master-pointer Service |
-| `base/23-dragonfly-statefulset.yaml` | StatefulSet + snapshot-pruner sidecar |
+| `base/20-valkey-config.yaml` | `valkey.conf` + entrypoint + hourly AOF-rewrite script |
+| `base/20-event-fold-config.yaml` | `event-fold.lua` mounted into the worker |
+| `base/22-valkey-services.yaml` | headless + master-pointer Service |
+| `base/23-valkey-statefulset.yaml` | StatefulSet + `aof-rewriter` sidecar |
 | `base/30-sentinel-config.yaml` | `sentinel.conf` template |
 | `base/31-sentinel-statefulset.yaml` | StatefulSet + headless Service + **persistent 1Gi volume** for the config epoch |
 | `base/32-sentinel-bridge.yaml` | Deployment, RBAC, ServiceAccount |
-| `base/33-redis-exporter.yaml` | Deployment + Service — Sentinel has no HTTP endpoint |
+| `base/33-redis-exporter.yaml` | TWO Deployments + Services — one Sentinel-mode, one against the master. Neither Sentinel nor Valkey has an HTTP endpoint |
 | `base/34-http-ingress.yaml` | Deployment + NodePort 30900 — external nginx → AMQP ([http-ingress.md](http-ingress.md)) |
 | `base/40-workers.yaml` | Deployment |
 | `base/41-ws-gateway.yaml` | Deployment, Service, HPA, Route |
 | `base/42-frontend.yaml` | Deployment, ConfigMap, Service, Route |
 | `base/kustomization.yaml` | resource list + namespace + common labels |
-| `base/60-monitoring.yaml` | 3 ServiceMonitors + 4 PrometheusRules (21 alerts) |
-| `overlays/lab/common/` | **lab base**: 1 replica each, tiny pods, no PDBs, no HPA, 512mb Dragonfly — shared by both flavours ([kustomize.md](kustomize.md) §3) |
+| `base/60-monitoring.yaml` | 3 ServiceMonitors + 4 PrometheusRules |
+| `overlays/lab/common/` | **lab base**: 1 replica each, tiny pods, no PDBs, no HPA, 512mb Valkey — shared by both flavours ([kustomize.md](kustomize.md) §3) |
 | `overlays/lab/openshift/` | Route-based lab (27 objects) |
 | `overlays/lab/kubernetes/` | NodePort lab, Routes deleted (25 objects) |
 | `overlays/prod/` | (later) digest pinning, Route hostnames, quota bumps |
@@ -95,16 +95,16 @@ Overlay rule: **overlays change replicas, resources, storage, schedules and host
 
 | # | Question | Current proposal | Blocking |
 |---|---|---|---|
-| 3.1 | Dragonfly durability without AOF | RabbitMQ audit stream + replay job | yes |
-| 3.2 | Storm headroom | Baseline assumes one 1-hour 500/s storm per week (+4.7 GiB). Daily storms need ≈57 GiB per pod or value compression ([sizing.md](sizing.md) §2.3–2.4) | no |
+| 3.1 | ~~Valkey durability without AOF~~ | **closed by Valkey**: AOF with `appendfsync everysec` gives a ≤1 s RPO, and the RabbitMQ audit stream still covers a total PV loss | no |
+| 3.2 | Storm headroom | Baseline assumes one 1-hour 500/s storm per week (+5.4 GiB). Daily storms need ≈66 GiB per pod or value compression ([sizing.md](sizing.md) §2.3–2.4) | no |
 | 3.3 | Role management | Sentinel + `sentinel-bridge` | yes |
 | 3.4 | Producer authentication | per-producer AMQP users, vhost `/`, permissions limited to `fx.events` | no |
 | 3.5 | In-cluster TLS for AMQP/RESP | deferred to a second phase | no |
 | 3.6 | Multi-tenant isolation (sources per customer) | not modelled; all sources share one keyspace | no |
 | 3.7 | Backfill reads from replicas | deferred until replica lag is monitored | no |
-| 3.8 | Alert key definition | default `{source}:{type}`; a per-source key would collapse unrelated alarms ([event-lifecycle.md](event-lifecycle.md) §5.1) | no |
+| 3.8 | Record key definition | **decided:** `event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>` ([valkey.md](valkey.md) §2). Two identically-worded faults collapse into one row — accepted | no |
 | 3.9 | Storm events aging out of alerts | alert state TTL is 7d, so an unclosed alert silently disappears with its last event; consider a longer TTL once retention is validated | no |
-| 3.10 | `FW_ALERT_DEDUP_WINDOW` value | default 5 min. Defines what counts as a new occurrence; a value below the sensor's reporting interval makes `count` equal the raw event count ([event-lifecycle.md](event-lifecycle.md) §5.4) | no |
+| 3.10 | `EVT_Summary` is part of the record key | Two reworded reports of one fault are two rows, and two identically-worded faults are one. Producers must therefore keep summaries stable — an operator-visible consequence of content identity ([valkey.md](valkey.md) §2) | no |
 | 3.11 | Lab H/A overlay (`overlays/lab-ha`) | cheap 3-replica rehearsal of quorum and failover, small resources ([kustomize.md](kustomize.md) §4) | no |
 | 3.12 | NetworkPolicies | **removed from scope** while the namespace is shared. Re-add once we own the namespace ([networking.md](networking.md) §5.4) | no |
 | 3.13 | Kubernetes flavour | **decided:** production OpenShift only; the **lab** has two flavours (`lab/openshift` and `lab/kubernetes`) sharing `lab/common` ([kustomize.md](kustomize.md) §3.0) | no |
@@ -113,16 +113,16 @@ Overlay rule: **overlays change replicas, resources, storage, schedules and host
 
 | Spec statement | Reality | Resolution |
 |---|---|---|
-| "Dragonfly shall use AOF feature" | AOF is not implemented in Dragonfly | RabbitMQ audit stream now covers the full 7-day retention ([persistence-and-durability.md](persistence-and-durability.md) §4.4); hourly snapshot for restart speed |
-| "always find 2 replicas to receive writes" | no such server flag exists in Dragonfly | replica-count check inside `sentinel-bridge` + empty `Endpoints` + Sentinel quorum. [dragonfly.md](dragonfly.md) §3 |
+| "Valkey shall use AOF feature" | **now met** — Valkey implements AOF, unlike the Dragonfly it replaced | `appendonly yes` + `appendfsync everysec`, with an hourly `BGREWRITEAOF` sidecar for restart speed ([valkey.md](valkey.md) §4) |
+| "always find 2 replicas to receive writes" | **now met in the engine** — `min-replicas-to-write 2` | the flag refuses writes on the master itself; `sentinel-bridge` still empties `Endpoints/valkey` so stale READS are blocked too ([valkey.md](valkey.md) §5) |
 | "Redis Sentinels are needed for the workers, I think" | confirmed: needed, and also needed for the gateway and Service selector | [redis-sentinel.md](redis-sentinel.md) |
-| "Dragonfly operator is off the table" | honoured — everything is raw manifests plus a small bridge controller | this document |
-| "No data loss" | achievable only via the audit-stream design | §3.1 |
+| "Valkey operator is off the table" | honoured — everything is raw manifests plus a small bridge controller | this document |
+| "No data loss" | AOF bounds the window to ≤1 s; a total PV loss is still recovered from the audit stream | [persistence-and-durability.md](persistence-and-durability.md) §3 |
 
 ## 5. Explicitly out of scope (this iteration)
 
 - Multi-region / multi-cluster replication
 - Kafka or any additional WAL component
-- Dragonfly multi-shard cluster mode
+- Valkey multi-shard cluster mode
 - Authentication/authorisation of browser clients (assumed handled at the Route or a future OIDC layer)
-- Long-term archival beyond the Dragonfly TTL and the audit queue window
+- Long-term archival beyond the Valkey TTL and the audit queue window

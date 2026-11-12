@@ -7,8 +7,8 @@
 #   2. Even where the CRDs exist, a lab has no Prometheus to scrape, so they
 #      would be inert.
 #
-# redis-exporter goes too: it exists only to feed the Sentinel ServiceMonitor,
-# and it costs a pod for no benefit in a lab.
+# Both exporters go too: they exist only to feed the ServiceMonitors, and they
+# cost three pods for no benefit in a lab.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -18,7 +18,7 @@ $patch: delete
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: dragonfly
+  name: valkey-exporter
 $patch: delete
 ---
 apiVersion: monitoring.coreos.com/v1
@@ -36,7 +36,7 @@ $patch: delete
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: fire-watch-dragonfly
+  name: fire-watch-valkey
 $patch: delete
 ---
 apiVersion: monitoring.coreos.com/v1
@@ -61,4 +61,16 @@ apiVersion: v1
 kind: Service
 metadata:
   name: redis-exporter
+$patch: delete
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey-exporter
+$patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-exporter
 $patch: delete

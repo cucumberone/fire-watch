@@ -53,14 +53,14 @@ export function loadConfig() {
         if (!host || !port) throw new Error(`malformed SENTINELS entry: ${s}`);
         return { host, port: Number(port) };
       }),
-    masterName: required('FW_DRAGONFLY_MASTER'),
+    masterName: required('FW_VALKEY_MASTER'),
 
-    // Dragonfly / Kubernetes topology
-    dragonflyService: required('FW_DRAGONFLY_SERVICE'),
-    dragonflyHeadless: optional('FW_DRAGONFLY_HEADLESS', 'dragonfly-headless'),
-    dragonflyPort: integer('FW_DRAGONFLY_PORT', 6379),
-    dragonflyPassword: required('DRAGONFLY_PASSWORD'),
-    statefulSetName: optional('FW_DRAGONFLY_STATEFULSET', 'dragonfly'),
+    // Valkey / Kubernetes topology
+    valkeyService: required('FW_VALKEY_SERVICE'),
+    valkeyHeadless: optional('FW_VALKEY_HEADLESS', 'valkey-headless'),
+    valkeyPort: integer('FW_VALKEY_PORT', 6379),
+    valkeyPassword: required('VALKEY_PASSWORD'),
+    statefulSetName: optional('FW_VALKEY_STATEFULSET', 'valkey'),
 
     // Write guard
     minReplicas: integer('FW_WRITE_GUARD_MIN_REPLICAS', 2),

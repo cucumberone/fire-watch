@@ -11,19 +11,22 @@ means for a field a human typed.
 
 ## 1. The two decisions that shape everything
 
-### 1.1 Keyed on the ALERT, not the event
+### 1.1 Keyed on the RECORD, and stored beside it
 
-The journal key is `source:type` — the same key ack and close use — **not** an event
-id.
+The journal key is the bare record key — the same one ack and close use — **not** a
+per-delivery id.
 
-| Keyed on event id | Keyed on alert |
+| Keyed on a delivery | Keyed on the record |
 |---|---|
-| Note vanishes when the record is pruned after retention | Note lives as long as the incident |
-| Unreachable from the alert row an operator works in | Reachable from Open alerts, Live events and All events |
-| Two notes about "the same outage" are unrelated rows | One thread per incident, which is what an operator means |
+| Note vanishes when that delivery is pruned or deleted | Note lives as long as the condition |
+| Unreachable from the row an operator works in | Reachable from Open alerts and All events |
+| Two notes about "the same outage" are unrelated rows | One thread per condition, which is what an operator means |
 
-An event row still opens the journal: it derives `source:type` from the event, so
-whichever row you right-click you land on the same thread.
+Every row for a condition resolves to the same thread, so whichever row you right-click
+you land on the same place. With one record per condition there is no longer any
+difference between "the alert key" and "the record key": both are the same 32-hex
+string ([valkey.md](valkey.md) §2).
+
 
 ### 1.2 Append-only, never a single editable field
 
@@ -43,10 +46,10 @@ follow-up note.
 ## 2. Storage
 
 ```
-fw:journal:{source:type}   LIST   [ {id,by,at,text}, … ]   oldest first
+journal:<32-hex>        LIST   [ {id,by,at,text}, … ]   oldest first
 ```
 
-Its own key, deliberately **not** fields on `fw:alert:{key}`. The worker's fold owns
+Its own key, deliberately **not** fields on `event:<key>`. The worker's fold owns
 that hash and rewrites it atomically; a second writer HSET-ing notes into it would
 race the fold and leave state that disagrees with itself. Same reasoning that keeps
 `count` out of reach — see [event-lifecycle.md](event-lifecycle.md) §5.
@@ -66,17 +69,16 @@ Three key spaces, and they are scoped differently on purpose:
 
 | Key | Scoped to | Removed by |
 |---|---|---|
-| `fw:evt:{id}` | one **event record** | Delete event (3 keys, all keyed by id) |
-| `fw:alert:{source:type}` | one **incident** | Close, or the 7-day TTL |
-| `fw:journal:{source:type}` | one **incident** | the 7-day TTL only |
+| `event:<key>` | one **record** (a condition) | Delete (the hash and 3 index members) |
+| `journal:<key>` | notes about that condition | the 7-day TTL only |
 
-`deleteEvent` removes `fw:evt:{id}`, its per-source index member and its global index
-member — nothing else. A journal is keyed by the ALERT, so an event deletion shares no
-key with it and cannot touch it.
+`deleteEvent` removes `event:<key>`, its per-device index member and its two state index
+members — nothing else. The journal is a separate LIST, so a record delete cannot touch
+it.
 
-**That is the intended behaviour, and it is the reason the journal is alert-keyed.**
-If notes were attached to an event id, a note would disappear whenever that record was
-deleted or pruned — the opposite of what a journal is for. Deleting one record also
+**That is the intended behaviour, and it is the reason the journal is a separate key.**
+If notes were hash FIELDS on the record, a note would disappear whenever the record was
+deleted or expired — the opposite of what a journal is for. Deleting one record also
 never implies "forget what operators wrote about this incident": the incident is still
 there and may still be firing.
 
@@ -96,7 +98,7 @@ alternatives:
 
 **A note is NOT as durable as an event.** Events pass through RabbitMQ and are copied
 to `q.audit.events` before the ack, so the event log is recoverable from the broker if
-Dragonfly is lost. Dragonfly has no AOF. A note written only to Dragonfly would go
+Valkey is lost. Valkey has no AOF. A note written only to Valkey would go
 with it.
 
 So each entry is **also published to `fx.audit` / `event.audit`**, the same exchange
@@ -130,7 +132,7 @@ startup log line.
   every operator note. It is not a private channel.
 - A note deleted from `q.audit.events` is gone. There is no operator delete for
   journal entries at all, by design.
-- The note does **not** survive a Dragonfly restore *in the UI* until replayed from
+- The note does **not** survive a Valkey restore *in the UI* until replayed from
   the audit log. There is no replay tooling; the audit copy is what makes writing one
   possible.
 
@@ -272,11 +274,11 @@ ws.on("message", (m) => { const f = JSON.parse(m);
   if (f.op === "journal" || f.op === "error") { console.log(JSON.stringify(f)); process.exit(0); } });'
 
 # the list, and its TTL
-PW=$(kubectl -n fire-watch-lab get secret fire-watch-dragonfly -o jsonpath='{.data.password}' | base64 -d)
-kubectl -n fire-watch-lab exec dragonfly-0 -c dragonfly -- \
-  redis-cli -a "$PW" --no-auth-warning LRANGE fw:journal:probe:test 0 -1
-kubectl -n fire-watch-lab exec dragonfly-0 -c dragonfly -- \
-  redis-cli -a "$PW" --no-auth-warning TTL fw:journal:probe:test     # > 0
+PW=$(kubectl -n fire-watch-lab get secret fire-watch-valkey -o jsonpath='{.data.password}' | base64 -d)
+kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \
+  valkey-cli -a "$PW" --no-auth-warning LRANGE journal:<32-hex> 0 -1
+kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \
+  valkey-cli -a "$PW" --no-auth-warning TTL journal:<32-hex>       # > 0
 
 # durability: the audit copy
 kubectl -n fire-watch-lab exec rabbitmq-0 -- rabbitmqctl list_queues name messages | grep audit

@@ -26,7 +26,7 @@ the mapped internal severity.
 Two consequences worth stating explicitly:
 
 - `HARMLESS` and `CLOSE` are *not* severities in the same sense as the others — they are **retirement events**. They never create alert state of their own.
-- All five still get stored as events in `fw:evt:{id}` for history. Only the alert-state fold treats them differently.
+- All five still update the record at `event:<key>`; only a retirement changes its `state`.
 
 ## 2. The ordering requirement
 
@@ -76,7 +76,7 @@ sequenceDiagram
   participant P as Producer
   participant RMQ as RabbitMQ
   participant W as Worker
-  participant DF as Dragonfly
+  participant DF as Valkey
 
   P->>RMQ: CRITICAL (t=1000)
   RMQ->>W: deliver CRITICAL (t=1000)
@@ -109,143 +109,129 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 
 | Key | Type | Contents | TTL |
 |---|---|---|---|
-| `fw:alert:{key}` | hash | current state + occurrence rollup + watermark | 7d (rolling) |
-| `fw:alert:open:{key}` | string | `"1"` while an alert is open | 7d |
-| `fw:idx:alert:open` | zset | member = alert key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN fw:alert:open:*` ([websocket-server.md](websocket-server.md) §3.1) | none (entries removed by the fold on retirement) |
-| `fw:idx:evt:all` | zset | member = event id, score = **broker** timestamp ms. The global event timeline, written in the same step as the per-source index so it can never be missing an event that index has. Backs the All Events tab, which cannot be answered from `fw:idx:src:*` without a SCAN. Removed on an operator delete, and pruned on the same 7-day cutoff | 7d, via the worker's index prune |
-| `fw:idx:alert:closed` | zset | member = alert key, score = `closed_at` ms. The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two. Removed again when an alert re-opens, and pruned on the same 7-day cutoff as the event index ([frontend.md](frontend.md) §5.6) | 7d, via the worker's index prune |
-| `fw:fp:{fingerprint}` | string | id of the event record that owns this content fingerprint. The content-dedup gate (§5.4.2): while present, an identical arrival is absorbed by that record instead of being stored | 7d, matching event retention |
+| `event:<32 hex>` | hash | the WHOLE record: payload fields, `state`, `severity`, `count`, `firstSeen`, `lastSeen`, `lastId`, ack/closure fields, `watermark` | 7d (rolling) |
+| `idx:event:open` | zset | member = bare key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN event:*` ([websocket-server.md](websocket-server.md) §3.1) | members removed by the fold on retirement |
+| `idx:event:all` | zset | member = bare key, score = **broker** timestamp ms. The global timeline, written in the same step as the per-device index so it can never be missing a record that index has. Backs the All Events tab, which cannot be answered from `idx:source:*` without a SCAN | 7d, via the worker's index prune |
+| `idx:event:closed` | zset | member = bare key, score = `closedAt` ms. The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two. Removed again when a condition re-opens ([frontend.md](frontend.md) §5.6) | 7d, via the worker's index prune |
+| `idx:source:{device}` | zset | member = bare key, score = broker ts ms. Per-device timeline for the filtered tail | 7d, via the worker's index prune |
 
-`fw:alert:{key}` fields:
+**There is no fingerprint key and no second record key.** The record used to be two
+objects — `fw:evt:<id>` per delivery and `fw:alert:<source>:<type>` for the rollup —
+plus `fw:fp:<fingerprint>` to detect content duplicates. One hash per CONDITION
+replaces all three: the key is
+`sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]`, so a repeat of the same condition
+hashes to the same address and there is nothing to detect ([valkey.md](valkey.md) §2).
+
+`event:<key>` fields:
 
 | Field | Meaning |
 |---|---|
 | `state` | `open` or `closed` |
 | `severity` | severity of the last applied event |
-| `first_seen` | broker ts of the first event in the **current open episode** |
-| `last_seen` | broker ts of the **most recent** applied event — this is the "last occurrence" |
-| `count` | events applied in the current episode — every applied event counts; duplicates never get here (they are dropped by the watermark, §5.4) |
-| `acked_by` | operator label who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
-| `last_id` | event id of the most recent applied event |
-| `closed_by`, `closed_at` | the CLOSE/HARMLESS that retired the episode |
-| `watermark`, `watermark_id` | ordering guard (§5.2) |
+| `displaySeverity` | the PRODUCER's original label (`MINOR`, `CLEAR`, …), preserved by the ingress |
+| `source`, `type` | `EVT_Device` and `EVT_EventKey`, as fields — the key itself is opaque |
+| `msg` | `EVT_Summary`, normalised. Half of the key derivation, so it never varies within a record |
+| `payload` | JSON string of the compressed payload object |
+| `firstSeen` | broker ts of the first event in the **current open episode** |
+| `lastSeen` | broker ts of the **most recent** applied event — the "last occurrence" |
+| `count` | events applied in the current episode. Every applied event counts; a redelivery never gets here (the watermark drops it, §5.4.1) |
+| `ackedBy`, `ackedAt` | operator who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
+| `lastId` | event id of the most recent applied arrival |
+| `closedBy`, `closedAt` | the CLOSE/HARMLESS that retired the episode |
+| `watermark`, `watermarkId` | ordering guard (§5.2) |
 
-`{key}` is the alert identity: by default `{source}:{type}`. Two events only interact if they share a key — a CLOSE for `sensor-a:temp` never affects `sensor-b:temp`.
+A CLOSE and the CRITICAL it retires share one key when they share device **and**
+summary, which is exactly the intent: retiring is a state change on the record, not a
+new record.
 
 ### 5.2 The fold, as an atomic Lua script
 
-Three workers can process different events for the same key concurrently, so the compare-and-set must be atomic. A `WATCH`/`MULTI` dance is not needed; a single `EVAL` is:
+Three workers can process different events for the same key concurrently, so the
+compare-and-set must be atomic. A `WATCH`/`MULTI` dance is not needed; a single `EVAL`
+is. The real script is in
+[`k8s/base/20-event-fold-config.yaml`](../k8s/base/20-event-fold-config.yaml); this is
+its shape.
 
 ```lua
--- KEYS[1] = fw:alert:{key}          KEYS[2] = fw:alert:open:{key}
--- KEYS[3] = fw:idx:alert:open      (optional: the open-alert index)
--- ARGV[1] = broker_ts_ms  ARGV[2] = event id  ARGV[3] = severity  ARGV[4] = dedup window ms
--- ARGV[5] = bare alert key, the index member
---
--- KEYS[3]/ARGV[5] are optional on purpose: the worker and this ConfigMap are
--- separate objects and do not roll out in lockstep, so a newer script must still
--- work when invoked with the old 2-key form.
-local has_index = (KEYS[3] ~= nil) and (ARGV[5] ~= nil)
-local wm_ts  = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
-local wm_id  = redis.call('HGET', KEYS[1], 'watermark_id') or ''
+-- KEYS[1] = event:<key>         the record
+-- KEYS[2] = idx:event:all       KEYS[3] = idx:event:open
+-- KEYS[4] = idx:event:closed    KEYS[5] = idx:source:<device>
+-- ARGV[1] = broker_ts_ms   ARGV[2] = arrival id   ARGV[3] = severity
+-- ARGV[4] = bare key (index member)   ARGV[5] = device   ARGV[6] = ttl ms
+-- ARGV[7..] = field, value, field, value …  the record's own fields
+
 local ts     = tonumber(ARGV[1])
 local id     = ARGV[2]
 local sev    = ARGV[3]
-local window = tonumber(ARGV[4])
+local member = ARGV[4]
 
 -- 1. ordering guard: (timestamp, id) lexicographic, see 5.3
+local wm_ts = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
+local wm_id = redis.call('HGET', KEYS[1], 'watermarkId') or ''
 if ts < wm_ts or (ts == wm_ts and id <= wm_id) then
-  return 0                                        -- STALE
+  return 0                                        -- STALE / REDELIVERY
 end
 
-local is_open = redis.call('EXISTS', KEYS[2])
+local existed = redis.call('EXISTS', KEYS[1])
+local state   = redis.call('HGET', KEYS[1], 'state') or ''
+
+-- 1b. the record's own fields, applied to BOTH branches — a CLEAR can arrive for a
+--     condition with no stored record yet, and must not leave a blank row
+local sets = {}
+for i = 7, #ARGV, 2 do
+  sets[#sets + 1] = ARGV[i]
+  sets[#sets + 1] = ARGV[i + 1]
+end
+if #sets > 0 then redis.call('HSET', KEYS[1], unpack(sets)) end
 
 -- 2. retirement events
 if sev == 'CLOSE' or sev == 'HARMLESS' then
-  redis.call('DEL', KEYS[2])
-  redis.call('HSET', KEYS[1], 'state','closed','closed_by',id,'closed_at',ts,
-                              'watermark',ts,'watermark_id',id)
-  redis.call('PEXPIRE', KEYS[1], 604800000)
-  return 3                                        -- CLOSED
+  redis.call('HSET', KEYS[1], 'state','closed','severity',sev,
+                              'closedBy',id,'closedAt',ts,'lastSeen',ts,
+                              'watermark',ts,'watermarkId',id)
+  redis.call('HDEL', KEYS[1], 'ackedBy', 'ackedAt')      -- the ack dies with the episode
+  redis.call('ZREM', KEYS[3], member)                    -- out of "open"
+  redis.call('ZADD', KEYS[4], ts, member)                -- into "closed"
+  redis.call('ZADD', KEYS[2], ts, member)                -- still an event
+  redis.call('ZADD', KEYS[5], ts, member)
+  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[6]))
+  return 3                                               -- CLOSED
 end
 
--- 3. occurrence rollup, see 5.4
-local last  = tonumber(redis.call('HGET', KEYS[1], 'last_seen') or '0')
+-- 3. occurrence rollup: THE DEDUP. A repeat updates the SAME hash.
 local count = tonumber(redis.call('HGET', KEYS[1], 'count') or '0')
-local first = redis.call('HGET', KEYS[1], 'first_seen') or tostring(ts)
-local fresh = 0
+local episode_started = (existed == 0 or state == 'closed' or state == '')
 
-if is_open == 0 or last == 0 then
-  count, first, fresh = 1, ts, 1                   -- new episode
-elseif ts - last > window then
-  count, fresh = count + 1, 1                      -- new occurrence, outside the window
-end                                                -- else: coalesced, count unchanged
+if episode_started then
+  count = 1                       -- new condition, or a re-fire: fresh episode
+  redis.call('HSET', KEYS[1], 'firstSeen', ts)
+  redis.call('HDEL', KEYS[1], 'ackedBy', 'ackedAt', 'closedBy', 'closedAt')
+else
+  count = count + 1               -- firstSeen deliberately NOT touched
+end
 
-redis.call('SET', KEYS[2], '1', 'EX', 604800)
-redis.call('HSET', KEYS[1],
-  'state','open','severity',sev,'last_id',id,
-  'first_seen',first,'last_seen',ts,'count',count,
-  'watermark',ts,'watermark_id',id)
-redis.call('PEXPIRE', KEYS[1], 604800000)
-return fresh == 1 and 1 or 2                       -- 1 = new occurrence, 2 = coalesced
+redis.call('HSET', KEYS[1], 'state','open','severity',sev,'count',count,
+                            'lastSeen',ts,'lastId',id,
+                            'watermark',ts,'watermarkId',id)
+redis.call('ZADD', KEYS[3], ts, member)   -- open
+redis.call('ZREM', KEYS[4], member)       -- no longer closed
+redis.call('ZADD', KEYS[2], ts, member)   -- global timeline
+redis.call('ZADD', KEYS[5], ts, member)   -- per-device timeline
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[6]))
+return 1
 ```
 
 Return values — these become the `applied` field on the wire:
 
 | Code | Meaning | UI action |
 |---|---|---|
-| `0` | **duplicate or stale — dropped** | change nothing |
-| `1` | applied | bump `count`, set `last_seen` |
-| `3` | applied, alert **closed** | remove the alert |
-| ~~`2`~~ | *retired*: was "coalesced". Clients still accept it as an alias for `1` during a rolling update | treat as `1` |
+| `0` | **stale or redelivered — dropped** | change nothing |
+| `1` | applied | bump `count`, move `lastSeen` |
+| `3` | applied, record **closed** | remove the row from the open board |
 
-Because the script is atomic, two workers racing on the same key converge on the higher `(timestamp, id)` pair regardless of which one arrives first. **That is what makes the design safe under redelivery, failover and multi-consumer reordering simultaneously.**
-
-#### Duplicates are dropped by event id; everything else is counted
-
-There is exactly one dedup rule: **an event is identified by its `id`**. The
-worker gates on the event record with `SET fw:evt:{id} ... NX`, so the second
-delivery of an id is dropped before it can touch the fold, the index, the stored
-record or the live stream:
-
-```
-first delivery  -> applied=1   count 1
-same id again   -> duplicate   count 1  (dropped, Last unchanged)
-new id, same key-> applied=1   count 2  (Last moves)
-```
-
-Everything that gets past that gate is a distinct event, so:
-
-- **`count` increments** — it is an event counter, and it matches what arrives.
-- **`last_seen` always moves**, so *Last occurrence* is literally "when the most
-  recent event arrived".
-- **The duplicate is dropped entirely** — no fold, no audit copy (the first
-  delivery already wrote one), no live frame. It is still ACKed: requeueing a
-  message that can never succeed would loop forever.
-
-#### Why the timestamp watermark alone was not enough
-
-The fold's `(timestamp, id)` watermark compares against `last_seen`, which is the
-**broker** arrival time. It catches a RabbitMQ redelivery, because the redelivered
-message is the same message and keeps its original timestamp. It does **not**
-catch a producer that re-sends an id, or two POSTs of the same id: each delivery
-is a new message with a new timestamp, so the repeat always looks newer and was
-counted every time. That is why a duplicate storm inflated `count` instead of
-being suppressed, and why the gate had to move to the event record.
-
-The watermark still matters for ordering — it is what stops an old `CLOSE` from
-retiring a newer `CRITICAL` — but identity comes from `id`.
-
-**Two rejected designs, and why.**
-
-1. *Coalesce repeats inside a 5-minute window* — `count` stayed at 1 during a
-   storm, indistinguishable from a broken counter.
-2. *Count everything but label repeats with a `+N` badge* — once `count` counts
-   every event and *Last occurrence* moves, the badge told the operator nothing
-   and implied a suppression that did not exist.
-
-Both were attempts to model "same condition still firing" from arrival times. That
-question needs a source-side occurrence id, not a clock.
+The old code `2` ("coalesced") is gone. There is no coalescing window any more: a
+repeat either lands in the same millionth of a key (and is counted) or it is a
+redelivery of the same message (and is dropped). See §5.4.3.
 
 ### 5.3 Tie-break within the same millisecond
 
@@ -255,118 +241,126 @@ Without the tie-break, a CRITICAL and a CLOSE stamped in the same millisecond co
 
 Alternative considered and rejected: random UUIDv4 ids cannot provide a meaningful tie-break *order*, but they do provide a deterministic one, which is all that is required — the requirement is convergence, not semantic priority. If a same-millisecond CRITICAL and CLOSE must resolve in favour of the CRITICAL, add an explicit severity rank as the second sort key instead of the id.
 
-### 5.4 Two different kinds of duplicate — and they are NOT the same
+### 5.4 Two different kinds of duplicate — one rule now
 
-Conflating these is the usual source of "why does this alert have count 4 000" and,
-more recently, of "why did the board fill with 200 rows for one condition".
+Both cases still exist. What changed is that the SECOND one no longer needs any
+machinery, because the record is keyed by the condition.
 
 | | **Transport duplicate** | **Content duplicate** |
 |---|---|---|
 | Question | "is this the same *message* again?" | "is this the same *condition*, reported again?" |
 | Cause | at-least-once delivery, worker crash before ack, replay | a producer re-reporting the same alarm with a fresh id |
-| Identity | event `id` | content **fingerprint** (§5.4.2) |
-| Detection | `SET fw:evt:{id} NX` | `SET fw:fp:{fingerprint} NX` |
-| Result | **nothing at all happens** | the ORIGINAL record absorbs it: `count` +1, `last_seen` moves, and the new copy is **discarded** |
+| Identity | `(brokerTs, id)` | the record KEY (§5.4.2) |
+| Detection | the fold's ordering guard returns `0` | the arrival hashes to an EXISTING key, so there is no second record to write |
+| Result | **nothing at all happens** | `count` +1 and `lastSeen` moves **on the same hash** |
 
 #### 5.4.1 Transport duplicate — same message id twice
 
-A RabbitMQ redelivery is the same message, keeping its original id and its
-original broker timestamp. It must be a no-op:
+A RabbitMQ redelivery is the same message, keeping its original id and its original
+broker timestamp. It must be a no-op:
 
-- `SET fw:evt:{id} ... NX` rejects the second write, so the record is unchanged.
-- `ZADD fw:idx:src:{s}` only moves a score for a repeated member.
-- The fold's `(ts, id)` watermark returns `0` for anything not newer.
+- The fold's `(ts, id)` watermark returns `0` for anything not newer, so no field
+  changes.
+- `ZADD` on an existing member only sets its score, so the indexes cannot gain a
+  duplicate member.
 - The gateway's LRU drops a repeated `PUBLISH` before it reaches a browser.
 
 Nothing is counted and nothing is shown. This is correct: the operator already saw
 the original.
 
+**The watermark is now the ONLY gate**, and that is sufficient because the key is the
+content. A re-sent id whose content matches cannot create a record, and one whose
+content differs *should* be recorded — which is what the old `SET … NX` blocked.
+
 #### 5.4.2 Content duplicate — same condition, different id
 
-**This is the case that matters for the board.** An upstream alarm system
-re-reports a standing condition every interval, with a new event id each time.
-Counting those would mean one row per delivery, and 7-day retention turns a single
-fault into hundreds of thousands of records.
+**This is the case that matters for the board.** An upstream alarm system re-reports a
+standing condition every interval, with a new event id each time. Counting those would
+mean one row per delivery, and 7-day retention turns a single fault into hundreds of
+thousands of records.
 
-Identity is therefore **content**, not id. The fingerprint
-(`contentFingerprint()` in `services/worker/src/event.js`) is
-`sha256(canonical(source, type, severity, payload))`, truncated to 32 hex chars.
+Identity is the **record key**:
 
-What is excluded, and why each would break it:
+```text
+event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>
+```
+
+computed in [`services/worker/src/keygen.js`](../services/worker/src/keygen.js).
+
+What is included, and why:
+
+| Field | Why included |
+|---|---|
+| `EVT_Device` | the device is half of "what is broken" |
+| `EVT_Summary` | the summary is what an operator reads. Two different faults with identical wording are indistinguishable on the board, so grouping them is the honest choice |
+
+What is **excluded**:
 
 | Field | Why excluded |
 |---|---|
 | `id` | differs on every delivery — that is the whole problem |
 | `ts` | the producer's clock, also differs per delivery |
-| `brokerTs` | set on arrival by the ingress, differs every time |
+| `brokerTs` | set on arrival, differs every time |
+| `EVT_EventKey` / `type` | the producer's internal key is not what an operator triages on. Two different event keys with the same words on screen are one row |
+| `severity` | escalation updates the standing row instead of opening a second one beside it |
 
-Object keys are sorted at every depth before hashing, so payload key order cannot
-make two identical payloads look different.
+Whitespace in device and summary is collapsed before hashing, so a producer that pads
+or re-wraps its summary does not mint a new key per report.
 
-The flow, and where the copy is dropped:
+The flow is now trivial, which is the point:
 
 ```text
-SET fw:fp:{fingerprint} {id} NX
-  -> OK    : new condition. Store the record, index it, fold it.
-  -> null  : a record already owns this condition. Read the owner id, then:
-               fold(brokerTs, this id)   -> count +1, last_seen moves
-               and STOP. No record, no index member, no audit copy.
-
-record SET fw:evt:{id} NX
-  -> null  : the record exists but the fingerprint was absent. This is NOT a
-             transport duplicate — it means the fingerprint expired, was never
-             written (the record predates content dedup), or a partial reset
-             cleared it. The existing record owns this condition, so it absorbs
-             the arrival exactly like a content duplicate, AND the fingerprint is
-             re-established so the next arrival takes the cheap path.
+key := sha256(device + 0x1f + summary)[0:32]
+EVAL event-fold.lua 5 event:<key> idx:event:all idx:event:open idx:event:closed idx:source:<device> …
+  -> 1 : the fold counted this arrival on the existing (or new) record
 ```
 
-That last branch used to return "duplicate, drop it", which was a **silent data
-sink**: the fingerprint got claimed, the record NX failed, and the event was
-discarded with no fold — so `count` and `last_seen` never moved and the alert
-could not recover. A single stale record (from before the feature, or left by a
-partial reset) made every future delivery for that content vanish.
+There is no claim/verify pair, no owner lookup and no "the copy is discarded" step.
+A repeat **cannot** create a second record, because there is no second key to create.
 
-The new copy is **never written anywhere**. Its arrival is recorded only as the
-rollup movement on the original record — which is exactly "the original event
-stays, Last occurrence and Count move, the new event is deleted".
-
-The fold's `count` therefore means **deliveries of this condition**, and
-`last_seen` is the newest arrival. `first_seen` still marks when the episode began.
+The old design needed `fw:fp:<fingerprint>` because the record key was the message id.
+That set could expire independently of the record, and when it did every later
+delivery looked new — a bug that took a branch of its own to patch. One content-derived
+key removes the possibility.
 
 #### 5.4.3 Why there is no time window any more
 
-An earlier design coalesced only repeats inside `FW_ALERT_DEDUP_WINDOW` (300 s).
-Two things were wrong with it:
+An earlier design coalesced only repeats inside `FW_ALERT_DEDUP_WINDOW` (300 s). Three
+things were wrong with it:
 
-1. A storm inside the window left `count` frozen at 1 — indistinguishable from a
-   broken counter, and reported as one.
-2. A repeat *outside* the window created a second row for the same condition,
-   which is precisely what the board must not do.
+1. A storm inside the window left `count` frozen at 1 — indistinguishable from a broken
+   counter, and reported as one.
+2. A repeat *outside* the window created a second row for the same condition, which is
+   precisely what the board must not do.
+3. It modelled "same condition still firing" from arrival times. That question needs a
+   content identity, not a clock.
 
-Content identity has neither problem: the same payload is always the same
-condition, no matter how far apart the deliveries are. `FW_ALERT_DEDUP_WINDOW` is
-retained in the environment for wire compatibility but no longer gates anything.
+`FW_ALERT_DEDUP_WINDOW` has been removed from the manifests entirely — keeping a
+setting that changes nothing is how a reader ends up believing it does something.
 
 #### 5.4.4 What this means operationally
 
 | Situation | Behaviour |
 |---|---|
-| Same payload at t and t+10s | one record; `count` 2, `last_seen` = t+10s |
-| Same payload a week later | still one record, unless the fingerprint TTL expired (it is 7 days, matching retention) |
-| Same payload, severity escalated WARNING → CRITICAL | **different** fingerprint → a second record. Severity is part of the identity because an escalation is a different fact about the world |
-| Payload differs in one field | different fingerprint → a second record |
-| `CLOSE` for a condition | different fingerprint from the severity it retires → never collapses into the occurrence it ends |
+| Same device+summary at t and t+10s | one record; `count` 2, `lastSeen` = t+10s |
+| Same device+summary a week later | still one record (the TTL refreshed on every occurrence) |
+| Same device+summary, severity escalated WARNING → CRITICAL | **same** record, `severity` updated. An escalation is a new fact about the same condition, not a second condition |
+| Same device, different summary | different key → a second record |
+| Same summary, different device | different key → a second record |
+| `CLOSE` for a condition | same key (device and summary unchanged) → the record's `state` flips to `closed` |
 
-**Trade-off, stated plainly:** two genuinely distinct faults that happen to be
-byte-identical within the TTL are indistinguishable and will be counted as one
-condition. That is the cost of content identity, and it is the correct cost here —
-an alarm system that wants them distinguished must vary the payload (an occurrence
-counter, a device serial), which is what a real alarm system does anyway.
+**Trade-off, stated plainly:** two genuinely distinct faults with the same device and
+identical wording are indistinguishable and will be counted as one condition. That is
+the cost of content identity, and it is the requested behaviour — an alarm system that
+wants them distinguished must vary the summary, which is what a real one does.
 
 ### 5.5 What is *not* guarded
 
-The event itself is always written, always indexed, always published to `fw:ch:events`, regardless of staleness. Only the **alert state fold** is watermark-guarded. History is complete and immutable; the derived state is order-independent.
+There is no separate "event" and "alert" object to guard differently. The record is
+the condition, so the fold IS the write: an event that the watermark rejects changes
+nothing, and an event it accepts is counted and indexed in one atomic step
+([valkey.md](valkey.md) §6). The per-delivery history that is no longer queryable from
+Valkey lives in `q.audit.events`.
 
 ## 6. Why redelivery is safe
 
@@ -402,27 +396,36 @@ The same watermark protects replay from the audit queue:
 
 | Data | Authority | Recovery |
 |---|---|---|
-| Events (`fw:evt:*`, `fw:idx:*`) | RabbitMQ audit queue | replay |
-| Alert state (`fw:alert:*`) | the fold | recompute by replaying the window |
+| Records (`event:*`, `idx:*`) | RabbitMQ audit queue | replay |
+| Alert state (`event:*`) | the fold | recompute by replaying the window |
 
-Alert state can be deleted at any time and rebuilt from the event history without loss. This is why no extra durability machinery is needed for it — and why retuning `FW_ALERT_DEDUP_WINDOW` is safe: replaying with a new window produces the new rollup, not a corrupted one.
+The whole record can be deleted at any time and rebuilt from the audit WAL without
+loss. This is why no extra durability machinery is needed for the datastore — it is a
+cache over `q.audit.events` ([persistence-and-durability.md](persistence-and-durability.md)
+§4).
+
+One caveat that comes from the content key: replay reconstructs state, but it cannot
+reconstruct **per-delivery history in Valkey**, because that no longer exists there.
+`count` comes back correctly (it is recomputed from the arrivals), but the individual
+deliveries are read from the WAL.
 
 ## 8.1 Transport vs semantic dedup — where each lives
 
 | Concern | Mechanism | Owner | Effect if missing |
 |---|---|---|---|
-| Same *message* redelivered | idempotent `SET`/`ZADD` keyed by `id` | worker (§5.4) | duplicate history rows |
-| Same *message* re-published to the browser | gateway LRU on `id` | gateway ([websocket-server.md](websocket-server.md) §5) | duplicate UI rows |
+| Same *message* redelivered | `(ts, id)` watermark returns `0` | worker (§5.2) | a repeat is counted twice |
+| Same *message* re-published to the browser | gateway LRU on `id@brokerTs` | gateway ([websocket-server.md](websocket-server.md) §5) | duplicate UI rows |
 | Same *message* arriving out of order | watermark fold | worker (§5.2) | an old CLOSE retires a newer CRITICAL |
-| Same *condition* reporting repeatedly | occurrence window rollup | worker (§5.4) | 600k alert rows per fault, UI unusable |
+| Same *condition* reporting repeatedly | the CONTENT KEY: a repeat hashes to the same record | worker ([valkey.md](valkey.md) §2) | it cannot happen — there is no second key |
 | Same *condition* re-shown after a UI reconnect | backfill + client dedup on `id` | gateway + frontend | duplicated rows after every reconnect |
 
-All five are implemented. The first two are "dedup" in the usual sense; the last two are what prevent a healthy 1 000 evt/min stream from looking like an outage.
+All five are implemented. The third and fourth are what prevent a healthy 1 000 evt/min
+stream from looking like an outage.
 
 ## 9. UI implications
 
 - The gateway forwards events as they arrive; it does not compute alert state. Rendering "this alert just closed" comes from the `severity` field of the event that closed it.
-- Because the gateway can receive a stale CLOSE (it is published to `fw:ch:events` immediately, before the fold), the gateway must annotate each frame with the fold's return code:
+- Because a browser can be handed a stale CLOSE from a fan-out frame, every alert frame carries the fold's return code (`applied`) so the client knows whether to move the row:
 
 ```json
 { "op": "event", "event": { "id": "...", "severity": "CLOSE", ... }, "applied": 3 }
@@ -431,7 +434,7 @@ All five are implemented. The first two are "dedup" in the usual sense; the last
 | `applied` | UI behaviour |
 |---|---|
 | `0` | history only — do **not** touch alert state or counts |
-| `1` | new occurrence — update the alert row, increment `count`, refresh `last_seen` |
+| `1` | new occurrence — update the row, take the server's `count`, move `lastSeen` |
 | `2` | retired — was "coalesced". Clients treat it as `1` so a gateway on the previous build cannot freeze a row mid-rollout |e an entry |
 | `3` | closed — remove the alert row |
 
@@ -445,14 +448,14 @@ kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin get queue=q.event.ingest 
   | grep -E 'timestamp_in_ms|severity'
 
 # 2. watermark guard: a stale CLOSE must not retire a newer alert
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 HGETALL fw:alert:probe:test
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 HGETALL event:probe:test
 
 # 3. occurrence coalescing: publish the same CRITICAL 5x inside the 5-min window,
 #    then once outside it. Expect count = 2, not 6.
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 HMGET fw:alert:probe:test count first_seen last_seen
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 HMGET event:probe:test count firstSeen lastSeen
 
 # 4. replay invariance: wipe alert keys, replay, compare
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 --scan --pattern 'fw:alert:*'
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 --scan --pattern 'event:*'
 kubectl -n fire-watch create job --from=cronjob/replay-gap replay-verify
 ```
 

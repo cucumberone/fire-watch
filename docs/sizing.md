@@ -14,7 +14,7 @@ Capacity model for the baseline: **1 000 events/minute sustained, 7-day retentio
 | Retention TTL | **7 days** = 604 800 s | given |
 | Sources | 500 | assumption |
 | Concurrent browser clients | 1 000 | assumption |
-| Snapshot generations retained | 2 | §3.5 |
+| AOF base + incremental tail | rewritten hourly | §3.5 |
 
 Derived:
 
@@ -24,27 +24,45 @@ storm throughput     = 500/s     × 2 048 B   = 1 MiB/s
 events retained      = 1 000/min × 1 440 min/day × 7 = 10 080 000
 ```
 
-**The number that matters is the 7-day total, not the instantaneous rate.** With a 7-day TTL, Dragonfly holds everything written in the last rolling week. Peak/s only matters for storm headroom (§2.3); the sustained/min figure determines the baseline working set.
+**The number that matters is the 7-day total, not the instantaneous rate.** With a 7-day TTL, Valkey holds everything written in the last rolling week. Peak/s only matters for storm headroom (§2.3); the sustained/min figure determines the baseline working set.
 
-### 1.1 Duplicate factor — the multiplier these numbers assume is 1.0
+### 1.1 What grows: CONDITIONS, not deliveries
 
-Every figure below assumes **one stored record per delivered event**. That is only true for a feed that never repeats itself.
+Every figure below is per **stored record**, and a record is a **condition** — one
+`(EVT_Device, EVT_Summary)` pair — not a delivery
+([valkey.md](valkey.md) §2).
 
-The worker keeps the **alert rollup** deduplicated — one alert, `count` per arrival, `last_id` pointing at the owner — but it stores **every arrival** under its own id ([workers.md](workers.md) §3.1). That was a deliberate reversal: the All events tab reads the global event index, so discarding arrivals made it show one row for three delivered events while the live tail showed three.
+That changes the input completely, and it is the main capacity argument for the Valkey
+redesign:
 
 ```text
-records = events delivered × duplicate factor
+records = distinct conditions in the 7-day window
+        ≠ messages delivered
 ```
 
-| Feed | Factor | Effect on §2 |
-|---|---|---|
-| Each condition reported once | 1.0 | the numbers below apply as written |
-| Same condition repeated 3× | 3.0 | triple the working set |
-| Producer retry storms (5×) | 5.0 | 24.5 → 122 GiB per pod |
+| Feed | Delivered | Distinct conditions | Records |
+|---|---|---|---|
+| Each condition reported once | 10.08 M | 10.08 M | 10.08 M |
+| Standing fault re-reported every 30 s | 10.08 M | ~20 k | **~20 k** |
+| Producer retry storm (same message 5×) | 50.4 M | 10.08 M | 10.08 M |
 
-**Measure it; do not assume it.** The ratio is `ZCARD fw:evt:*` divided by distinct `(source, type, fingerprint)` conditions — or more practically, compare delivery count against `count` in the alert table for a representative hour. `scripts/chaos-events.mjs --copies N` reproduces a known factor exactly.
+The previous design stored **every arrival** under its own key, so a re-reporting
+producer multiplied the working set by its repeat rate: the old notes here carried a
+"duplicate factor" warning and told you to multiply §2 by it. That warning is gone
+because the multiplication can no longer happen — the repeat has no key of its own.
 
-If the factor is above ~2, shortening `FW_EVENT_TTL` is usually cheaper than buying RAM: cost is linear in retention, and the index prune already handles a shorter window.
+**The conservative planning assumption is therefore still "one record per delivered
+event"** (§2.1 uses it), because a non-repeating feed really does produce that many
+conditions. Any repetition makes the real number SMALLER, which is a safe direction to
+be wrong in.
+
+Measure it:
+
+```bash
+ZCARD idx:event:all     # records in the window
+# and compare with the delivery rate from RabbitMQ
+rabbitmqctl list_queues name message_stats.publish_details.rate
+```
 
 ## 2. Working set
 
@@ -54,33 +72,41 @@ A stored event costs more than its value:
 
 | Component | Bytes | Note |
 |---|---|---|
-| value (`fw:evt:{id}` string) | **2 048** | the event JSON itself |
-| key string `fw:evt:<36-char uuid>` | 44 | 7 + 36 + null, rounded |
-| dash-table slot (key metadata) | 24 | per-key overhead, amortised |
-| zset member (UUID) | ~150 | [architecture.md](architecture.md) §6.1 — stored twice (hash + skiplist) |
-| **Total per event** | **≈ 2 266 B** | |
+| hash fields (`event:<key>`) | **2 048** | the payload JSON plus the ~10 bookkeeping fields (count, timestamps, state) |
+| hash key overhead | ~90 | hashtable entry + key string (32 hex) + expiry metadata |
+| zset member, in TWO indexes | ~300 | `idx:event:all` and `idx:source:<device>` — see [architecture.md](architecture.md) §6.1; each member is stored twice (hash table + skiplist) |
+| zset member, state index | ~150 | exactly one of `idx:event:open` / `idx:event:closed` |
+| **Total per record** | **≈ 2 590 B** | |
+
+The bookkeeping fields are counted inside the 2 048 B because a hash stores its field
+names and values together, and `count`, `firstSeen`, `lastSeen`, `state`, `severity`,
+`lastId`, `watermark`, `watermarkId`, `source`, `type` and `msg` add roughly 150 B on
+top of the payload.
 
 ```text
-raw        = 10 080 000 × 2 266 B = 22.8 GB ≈ 21.3 GiB
-+ 1.15 allocator/fragmentation     ≈ 24.5 GiB
+raw        = 10 080 000 × 2 590 B = 26.1 GB ≈ 24.3 GiB
++ 1.15 allocator/fragmentation     ≈ 28.0 GiB
 ```
 
-**Each Dragonfly pod must hold ≈ 24.5 GiB** (replication is full-copy, so all three hold the same data).
+**Each Valkey pod must hold ≈ 28 GiB** for a non-repeating feed (replication is
+full-copy, so all three hold the same data).
 
-Aggregate: `3 × 24.5 ≈ 73.5 GiB` of RAM.
+Aggregate: `3 × 28 ≈ 84 GiB` of RAM. The number went up from 24.5 GiB in the Dragonfly-era model because the
+record now carries its rollup, its state, its ack fields and THREE index members
+instead of one. It is the pessimistic case: any repetition brings it back down (§1.1).
 
 ### 2.2 Why 2 048 B is the right planning number
 
 The event size varies. Do **not** plan with the average:
 
-- Dragonfly's memory is determined by total bytes actually stored, so a distribution with a long tail costs more than `count × mean`.
+- Valkey's memory is determined by total bytes actually stored, so a distribution with a long tail costs more than `count × mean`.
 - Sizing to the floor is the only choice that never evicts. Sizing to an average guarantees eviction on a busy week, which silently breaks the 7-day retention promise.
 
 | Planning size | Working set / pod | Aggregate RAM |
 |---|---|---|
-| **2 048 B (floor)** | **≈ 24.5 GiB** | **≈ 73.5 GiB** |
-| 4 KiB | ≈ 47 GiB | ≈ 141 GiB |
-| 8 KiB | ≈ 92 GiB | ≈ 276 GiB |
+| **2 048 B (floor)** | **≈ 28.0 GiB** | **≈ 84 GiB** |
+| 4 KiB | ≈ 54 GiB | ≈ 162 GiB |
+| 8 KiB | ≈ 105 GiB | ≈ 315 GiB |
 
 `message_bytes / messages` from `rabbitmqctl list_queues` gives the true mean; use a histogram if the tail matters.
 
@@ -90,20 +116,20 @@ A storm at 500/s for one hour adds:
 
 ```text
 500/s × 3 600 s = 1 800 000 events
-1 800 000 × 2 266 B × 1.15 = 4.7 GiB per hour of storm
+1 800 000 × 2 590 B × 1.15 = 5.4 GiB per hour of storm
 ```
 
 Because the TTL is 7 days, storm events do **not** disappear afterwards — they stay for a week. Storms therefore accumulate until they age out:
 
 | Storm load | Extra working set | Total per pod |
 |---|---|---|
-| none (baseline 1 000/min) | — | 24.5 GiB |
-| 1h storm, once per week | +4.7 GiB | **29.2 GiB** |
-| 1h storm, daily | +33 GiB | 57 GiB |
-| 3h storm, once per week | +14 GiB | 38.5 GiB |
-| 500/s for 8 hours, once per week | +38 GiB | 62 GiB |
+| none (baseline 1 000/min) | — | 28.0 GiB |
+| 1h storm, once per week | +5.4 GiB | **33.4 GiB** |
+| 1h storm, daily | +38 GiB | 66 GiB |
+| 3h storm, once per week | +16 GiB | 44 GiB |
+| 500/s for 8 hours, once per week | +43 GiB | 71 GiB |
 
-**This is the real sizing input.** Plan `maxmemory` for the worst 7-day rolling volume you expect, not for 1 000/min. The baseline config below assumes **one 1-hour storm per week** (≈29.2 GiB peak) and sets `maxmemory=36gb`.
+**This is the real sizing input.** Plan `maxmemory` for the worst 7-day rolling volume you expect, not for 1 000/min. The baseline config below assumes **one 1-hour storm per week** (≈33.4 GiB peak) and sets `maxmemory=40gb`.
 
 If storms are daily, raise `maxmemory` + pod limit + node RAM to ~64 GiB per pod, shorten the TTL, or compress values (§2.4).
 
@@ -113,9 +139,9 @@ At 2 048 B the value dominates the footprint, so compressing it scales everythin
 
 | Stored value size | Working set / pod (baseline) | With weekly 1h storm |
 |---|---|---|
-| 2 048 B (uncompressed) | 24.5 GiB | 29.2 GiB |
-| ≈ 700 B (3x) | 9.6 GiB | 11.4 GiB |
-| ≈ 400 B (5x) | 6.1 GiB | 7.3 GiB |
+| 2 048 B (uncompressed) | 28.0 GiB | 33.4 GiB |
+| ≈ 700 B (3x) | 11.0 GiB | 13.1 GiB |
+| ≈ 400 B (5x) | 7.0 GiB | 8.4 GiB |
 
 ```text
 worker:  gzip payload.msgc before SET (only if >= FW_COMPRESS_MIN)
@@ -123,7 +149,7 @@ gateway: pass the bytes through — never decompress
 browser: DecompressionStream -> plain text
 ```
 
-Trade-off: the stored `msgc` is no longer readable in `redis-cli`, and it is no longer substring-searchable in Dragonfly. The audit queue stays plain, so history searches go through RabbitMQ instead ([payload-and-compression.md](payload-and-compression.md) §6). **Compression is the right move if storm headroom or node RAM gets expensive** — it is roughly a 3x hardware reduction.
+Trade-off: the stored `msgc` is no longer readable in `valkey-cli`, and it is no longer substring-searchable in Valkey. The audit queue stays plain, so history searches go through RabbitMQ instead ([payload-and-compression.md](payload-and-compression.md) §6). **Compression is the right move if storm headroom or node RAM gets expensive** — it is roughly a 3x hardware reduction.
 
 ## 3. Per-component resources
 
@@ -132,7 +158,7 @@ Trade-off: the stored `msgc` is no longer readable in `redis-cli`, and it is no 
 | Component | Reps | CPU req | CPU lim | Mem req | Mem lim | PV |
 |---|---|---|---|---|---|---|
 | RabbitMQ | 3 | 250m | 1 | 512Mi | 1Gi | 96Gi |
-| Dragonfly | 3 | 500m | 4 | 8Gi | **48Gi** | 64Gi |
+| Valkey | 3 | 500m | 4 | 8Gi | **52Gi** | 64Gi |
 | Sentinel | 3 | 20m | 200m | 64Mi | 128Mi | — |
 | sentinel-bridge | 2 | 20m | 200m | 64Mi | 192Mi | — |
 | redis-exporter | 1 | 10m | 100m | 32Mi | 96Mi | — |
@@ -143,63 +169,85 @@ Trade-off: the stored `msgc` is no longer readable in `redis-cli`, and it is no 
 | Prometheus (optional) | 1 | 200m | 1 | 512Mi | 1Gi | 50Gi |
 | **Sum** | **25 pods** | **≈ 3.8 CPU** | **≈ 23.7 CPU** | **≈ 28.4 GiB** | **≈ 154 GiB** | **530Gi** |
 
-Dragonfly dominates both columns: `3 × 8Gi` of requests and `3 × 48Gi` of limits, i.e. 24 of the 28 GiB requested and 144 of the 154 GiB of limits. Everything else is noise by comparison, which is why the node-size decision in §3.3 is the only one that really matters.
+Valkey dominates both columns: `3 × 8Gi` of requests and `3 × 52Gi` of limits, i.e. 24 of the 28 GiB requested and 156 of the 166 GiB of limits. Everything else is noise by comparison, which is why the node-size decision in §3.3 is the only one that really matters.
 
-PV total: `3 × 96 (RabbitMQ) + 3 × 64 (Dragonfly) + 50 (Prometheus) = 530 GiB`.
+PV total: `3 × 96 (RabbitMQ) + 3 × 64 (Valkey) + 50 (Prometheus) = 530 GiB`.
 
 ### 3.2 Cluster recommendation
 
 **3 worker nodes, each 8 vCPU / 128 GiB RAM / ~200 GiB storage.**
 
-Per node: one Dragonfly (500m req / 4 CPU lim, 8Gi req / 48Gi lim), one RabbitMQ (250m / 1 CPU, 512Mi / 1Gi), one Sentinel, one worker, one gateway, one frontend. **Requests** ≈ 1.1 CPU / 9.1 GiB per node; **limits** ≈ 6.9 CPU / 50.5 GiB per node. Two Dragonfly pods (98.5 GiB of limits) fit on a 128 GiB node, which is what §3.3 requires.
+Per node: one Valkey (500m req / 4 CPU lim, 8Gi req / 52Gi lim), one RabbitMQ
+(250m / 1 CPU, 512Mi / 1Gi), one Sentinel, one worker, one gateway, one frontend.
+**Requests** ≈ 1.1 CPU / 9.1 GiB per node; **limits** ≈ 6.9 CPU / 54.5 GiB per node.
+Two Valkey pods (104 GiB of limits) fit on a 128 GiB node, which is what §3.3
+requires.
 
 ### 3.3 The node-loss rule (get this right)
 
-To **reschedule** an evicted Dragonfly pod, a surviving node must host **two** Dragonfly pods, because it already runs one:
+To **reschedule** an evicted Valkey pod, a surviving node must host **two** Valkey pods, because it already runs one:
 
 ```text
-node RAM >= 2 × Dragonfly mem limit + other pods
-         >= 2 × 48Gi + ~7Gi
-         >= 103 GiB   ->  128 GiB nodes
+node RAM >= 2 × Valkey mem limit + other pods
+         >= 2 × 52Gi + ~7Gi
+         >= 111 GiB   ->  128 GiB nodes
 ```
 
 This general rule is the single most consequential hardware decision at this scale:
 
 | Node RAM | Node loss | Redundancy after reschedule |
 |---|---|---|
-| 64 GiB | evicted Dragonfly pod stays **Pending** | 3 → 2, permanently, until the node returns |
+| 64 GiB | evicted Valkey pod stays **Pending** | 3 → 2, permanently, until the node returns |
 | **128 GiB** | pod reschedules onto a survivor | **3 → 3**, full redundancy restored |
 
 Data safety holds in both cases (master + replica + audit WAL), but only 128 GiB nodes keep the R3 promise of 3 replicas on 3 nodes through a node loss. Any smaller node size is a deliberate trade of redundancy for cost, and must be recorded in [roadmap.md](roadmap.md) §3.2.
 
-### 3.4 Dragonfly memory detail
+### 3.4 Valkey memory detail
 
 ```text
-baseline working set          ≈ 24.5 GiB
-+ one weekly 1h storm         ≈ 4.7 GiB
-+ snapshot serialization      ≈ 1.5 GiB (4 proactor threads)
-+ runtime headroom            ≈ 7.3 GiB
-= pod limit                   48Gi
+baseline working set          ≈ 28.0 GiB
++ one weekly 1h storm         ≈ 5.4 GiB
++ AOF rewrite copy-on-write   ≈ 4.0 GiB (forked rewrite of a 33 GiB image)
++ runtime headroom            ≈ 9.6 GiB
+= pod limit                   52Gi
 
---maxmemory=36gb
+--maxmemory=40gb
 ```
 
-Request is 8 GiB so the scheduler places it realistically; the limit is 48 GiB and is what must fit on a node.
+Request is 8 GiB so the scheduler places it realistically; the limit is 52 GiB and is
+what must fit on a node.
 
-`maxmemory` must sit **above** the expected 7-day working set, or Dragonfly evicts live events and silently breaks the retention promise. This is the opposite of the usual "leave 20% free for eviction" advice, and it is only tolerable because the audit WAL can refill any accidental eviction ([persistence-and-durability.md](persistence-and-durability.md) §4).
+`maxmemory` must sit **above** the expected 7-day working set or writes start being
+REFUSED with an OOM error (`noeviction`, [valkey.md](valkey.md) §4.1). This is the
+opposite of the usual "leave 20 % free for eviction" advice, and it is only tolerable
+because the audit WAL can refill anything the datastore loses
+([persistence-and-durability.md](persistence-and-durability.md) §4).
 
-### 3.5 Snapshot I/O and storage
+The extra headroom over the Dragonfly figure is for the **AOF rewrite**: `BGREWRITEAOF`
+forks, and the child's copy-on-write pages grow with write volume during the rewrite
+([valkey.md](valkey.md) §4.2).
+
+### 3.5 AOF I/O and storage
 
 ```text
-snapshot size ≈ working set with storm ≈ 29 GiB per generation
-retain 2      → ~58 GiB logical
-PV            = 64Gi   (~6 GiB headroom)
-hourly write  = 29 GiB / 3 600 s ≈ 8.2 MiB/s sustained
+AOF base (RDB preamble) ≈ working set with storm ≈ 33 GiB after a rewrite
+grows between rewrites with every write, ≈ 2 KiB per event
+rewritten hourly        -> the replayed file is a fresh compact image, not a week of history
+PV                      = 64Gi  (~2x the compact size, so a rewrite can complete
+                                while the previous file still exists)
+rewrite write rate      ≈ 33 GiB / 3 600 s ≈ 9.4 MiB/s sustained while rewriting
 ```
 
-- 8.2 MiB/s is comfortable for a network PV. Snapshots are not a performance concern at this scale, though local NVMe is still preferable.
-- Retain 2 generations only. More buys nothing because `q.audit.events` covers the full 7-day window (§3.6).
-- Hourly snapshots mean a restart never replays a long history, satisfying the "make restart and reread fast" requirement.
+- 9.4 MiB/s for one hour in every one is comfortable for a network PV and trivial for
+  local NVMe.
+- The PV must hold **two** copies during a rewrite: `BGREWRITEAOF` writes a new
+  `appendonly` manifest and file set, then switches atomically and removes the old
+  one. 64 GiB gives that headroom with room to spare.
+- `aof-use-rdb-preamble yes` is what keeps the replayed file small: without it the
+  base would be the full command history since the last rewrite
+  ([valkey.md](valkey.md) §4.1).
+- The hourly rewrite is what satisfies "make restart and reread fast": a restart
+  replays at most one hour of incremental commands on top of a compact base.
 
 ### 3.6 RabbitMQ detail
 
@@ -228,14 +276,14 @@ Throughput: 16.7 msg/s sustained, 500 msg/s peak. RabbitMQ is far from its limit
 | Queue backlog rising | add workers on queue depth | consumer-bound |
 | WebSocket connections | add gateways on connection count | linear, stateless |
 | Retention window | TTL is the only lever; RAM scales linearly | §2.2 |
-| Write throughput | none needed — 500/s peak uses a fraction of 4 proactor threads | n/a |
+| Write throughput | none needed — 500/s peak is a small fraction of one Valkey main thread | n/a |
 
 ## 5. What NOT to scale
 
 | Component | Why fixed at 3 |
 |---|---|
 | RabbitMQ | quorum queues with 3 members |
-| Dragonfly | 1 master + 2 replicas; more pods do not add redundancy value and complicate Sentinel ranking |
+| Valkey | 1 master + 2 replicas; more pods do not add redundancy value and complicate Sentinel ranking |
 | Sentinel | 3 is the canonical odd quorum |
 | Frontend | static; 3 exists purely for node-loss tolerance |
 
@@ -246,24 +294,36 @@ Throughput: 16.7 msg/s sustained, 500 msg/s peak. RabbitMQ is far from its limit
 kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqctl list_queues name messages message_bytes \
   message_stats.publish_details.rate
 
-# actual per-event cost in Dragonfly — compare with the 2 266 B model
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 MEMORY USAGE fw:evt:<known-id>
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 MEMORY USAGE fw:idx:src:<source>
+# actual per-record cost in Valkey — compare with the 2 590 B model
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 MEMORY USAGE event:<32-hex-key>
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 MEMORY USAGE idx:source:<device>
 
 # working set vs maxmemory, and eviction count
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 INFO memory \
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 INFO memory \
   | grep -E 'used_memory_human|maxmemory_human|evicted_keys'
 
-# retained key count vs the model: 1 000/min x 10 080 min = 10 080 000
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 DBSIZE
+# retained record count vs the model: at most 1 000/min x 10 080 min = 10 080 000,
+# and lower in practice because a record is a CONDITION, not a delivery (§1.1)
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 ZCARD idx:event:all
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 DBSIZE
 
-# snapshot size
-kubectl -n fire-watch exec dragonfly-0 -- ls -lh /data
+# AOF size and the last rewrite
+kubectl -n fire-watch exec valkey-0 -- ls -lh /data/appendonlydir
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 INFO persistence \
+  | grep -E 'aof_last_bgrewrite_status|aof_base_size|aof_current_size'
 ```
 
 Rules:
 
-- `evicted_keys > 0` in steady state is an **incident**: the retention promise is already broken. Raise storm headroom.
-- `DBSIZE` materially above 10 080 000 means either a storm's events are still inside their 7-day window (normal) or the index is not being pruned ([architecture.md](architecture.md) §6.2).
-- If `MEMORY USAGE fw:evt:<id>` is far above the value size, compression is the answer, not more RAM.
-- If a node loss leaves a Dragonfly pod `Pending`, node RAM is below the §3.3 threshold.
+- `evicted_keys > 0` in steady state is an **incident**: the retention promise is
+  already broken, which `noeviction` makes impossible unless the flag was overridden.
+  More likely is an OOM error in the worker log — raise `maxmemory` and the pod limit
+  together.
+- `ZCARD idx:event:all` above the delivery-model ceiling means a storm's records are
+  still inside their 7-day window (normal) — or the index is not being pruned
+  ([architecture.md](architecture.md) §6.2). It can never exceed the number of
+  *conditions*, so a value near the delivery count means the feed does not repeat
+  itself.
+- If `MEMORY USAGE event:<32-hex-key>` is far above the payload size, compression is
+  the answer, not more RAM ([payload-and-compression.md](payload-and-compression.md)).
+- If a node loss leaves a Valkey pod `Pending`, node RAM is below the §3.3 threshold.

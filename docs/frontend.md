@@ -139,7 +139,7 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 
 ### 4.1 Wire names vs. UI names
 
-The message contract, Dragonfly and the audit WAL all use `payload.msg` and `payload.msgc` ([payload-and-compression.md](payload-and-compression.md) §1). Those names do not belong on a screen: `msgc` decodes to nothing useful to an operator, and calling the field "Message" collides with the event as a whole.
+The message contract, Valkey and the audit WAL all use `payload.msg` and `payload.msgc` ([payload-and-compression.md](payload-and-compression.md) §1). Those names do not belong on a screen: `msgc` decodes to nothing useful to an operator, and calling the field "Message" collides with the event as a whole.
 
 | Wire | UI | Where |
 |---|---|---|
@@ -176,7 +176,7 @@ are three of them and they must stay in step — live frames, `op: allEvents`, a
 
 ### 4.2 Occurrence fields and worker enrichment
 
-The UI shows four fields that the workers add to `payload` before the event reaches Dragonfly. All are optional — an unenriched event must still render.
+The UI shows four fields that the workers add to `payload` before the event reaches Valkey. All are optional — an unenriched event must still render.
 
 | Wire key(s) | UI column | Notes |
 |---|---|---|
@@ -423,7 +423,7 @@ nothing about the retirement behaviour changes.
 
 Deliberately **not** renamed in the data: `severity` on the wire, in the fold and
 in the alert hash stays internal. Only the label an operator reads is translated —
-renaming the stored value would break every comparison in `alert-fold.lua` and
+renaming the stored value would break every comparison in `event-fold.lua` and
 `SEVERITY_RANK`.
 
 ### 5.2 Whole-row colouring
@@ -539,7 +539,7 @@ is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
 **The State column answers "is this incident open now".** An event record is immutable
 — it carries no state of its own. Open/closed is a property of the **alert**
-(`source:type`), which the fold maintains on `fw:alert:{key}`, and the gateway joins it
+(the 32-hex record key), which the fold maintains on `event:<key>`, and every frame carries it
 onto each row as `alertState` / `alertClosedAt` using one pipelined `HMGET` over the
 **distinct** alerts in the page (400 events from 4 incidents costs 4 lookups, not 400).
 
@@ -598,7 +598,7 @@ The asymmetry is the whole point, and it follows from the two questions:
 | Live events | what *arrived* | a distinct arrival — include it |
 | All events | what is *stored* | never written — exclude it |
 
-Storage is one record per id in `fw:evt:{id}`, so a second row for the same id would
+Storage is one record per CONDITION at `event:<key>`, so a second row for the same key would
 be a row the tab's own query could never return. Frames with `applied: 0` are
 therefore skipped outright; their ids are new, so no de-duplication rule could have
 caught them.
@@ -689,7 +689,7 @@ It was `open` until recently, which read as the **Open alerts** tab directly
 underneath it; the value was renamed rather than relabelled, so no comparison is left
 referring to a state name that no longer exists.
 
-The chip reports the SOCKET, not the cluster: it can read `connected` while Dragonfly
+The chip reports the SOCKET, not the cluster: it can read `connected` while Valkey
 is down and the board is stale.
 
 The tab bar is a real `role=tablist` with `aria-selected` and Arrow key
@@ -766,7 +766,7 @@ same shape production does.
 **The tail is NOT seeded from the alert snapshot.** It used to be: on connect the
 gateway sends a `snapshot` of open alerts carrying each one's newest record, and the
 client pushed those into the tail so the pane was not empty. The result was exactly
-one row of unexplained age after every refresh — the alert's `last_id` record, which
+one row of unexplained age after every refresh — the alert's `lastId` record, which
 can be hours old, sitting in a feed that otherwise means "arrivals since you
 connected". An operator cannot tell whether that row just arrived or was left over,
 and there was no way to distinguish it because it carried no marker.
@@ -775,7 +775,7 @@ So the tail shows **arrivals only**, and history on connect comes from the real
 backfill instead: `subscribe` replays the events in the window since `since`
 (15 minutes by default) from the global index. A refresh therefore shows a genuine
 time range, and the newest row is a real arrival rather than whatever the fold
-happened to leave as `last_id`.
+happened to leave as `lastId`.
 
 ### 5.7 Closed tab
 
@@ -896,7 +896,7 @@ Right-clicking a row in **Open alerts** or **All events** opens a **two-level me
 ```text
 level 1                          level 2
 ┌──────────────────────┐         ┌──────────────────────┐
-│ Acknowledge          │  ──────▶│ ← source:type        │
+│ Acknowledge          │  ──────▶│ ← record key         │
 │ Information          │         │ every field, flat    │
 └──────────────────────┘         └──────────────────────┘
 ```
@@ -936,7 +936,11 @@ The `Ack` column shows *state*; the *action* lives in the right-click menu. Rati
 - the menu already opens on every row and already shows the record, so the action sits next to the evidence for it
 - it keeps the alert table 7 columns wide instead of 8, which matters at 1 000 events/min
 
-It is available on **both** tables. A live-event row acknowledges `source:type` — the same key the alert table uses — so the two entry points are the same action and cannot diverge.
+It is available on **both** tables. Every row carries the record key, so a live-event
+row and the alert table acknowledge the same object and the two entry points cannot
+diverge. The key arrives on the frame rather than being derived in the browser: it is
+a hash of device + summary, and a second implementation of that hash is exactly how the
+two views would drift ([valkey.md](valkey.md) §2).
 
 When the alert is already acked the menu item is present but disabled and reads `Acked by <name>`, with the timestamp in its tooltip. A disabled item is used rather than removing it, so the menu does not change shape between rows.
 

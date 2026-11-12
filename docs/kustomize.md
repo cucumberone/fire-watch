@@ -13,10 +13,10 @@ k8s/
 │   ├── 11-rabbitmq-config.yaml
 │   ├── 13-rabbitmq-services.yaml
 │   ├── 14-rabbitmq-statefulset.yaml
-│   ├── 20-dragonfly-config.yaml
-│   ├── 20-alert-fold-config.yaml
-│   ├── 22-dragonfly-services.yaml
-│   ├── 23-dragonfly-statefulset.yaml
+│   ├── 20-valkey-config.yaml
+│   ├── 20-event-fold-config.yaml
+│   ├── 22-valkey-services.yaml
+│   ├── 23-valkey-statefulset.yaml
 │   ├── 30-sentinel-config.yaml
 │   ├── 31-sentinel-statefulset.yaml
 │   ├── 32-sentinel-bridge.yaml
@@ -33,7 +33,7 @@ k8s/
     │   │   ├── delete-pdb.yaml
     │   │   ├── delete-anti-affinity.yaml
     │   │   ├── delete-hpa.yaml
-    │   │   ├── dragonfly-lab.yaml
+    │   │   ├── valkey-lab.yaml
     │   │   ├── sentinel-lab.yaml
     │   │   └── bridge-lab.yaml
     │   ├── openshift/             # Routes, lab hostnames
@@ -62,7 +62,7 @@ The deployment has exactly two environments and a fixed component list. Kustomiz
 
 ## 2. Base
 
-The base is **the plan in this repo, unchanged**: 3 replicas per component, required anti-affinity, PDBs, 48Gi Dragonfly limits, 128 GiB nodes assumed. It is the artifact the fault-tolerance audit ([fault-tolerance.md](fault-tolerance.md)) is written against.
+The base is **the plan in this repo, unchanged**: 3 replicas per component, required anti-affinity, PDBs, 52Gi Valkey limits, 128 GiB nodes assumed. It is the artifact the fault-tolerance audit ([fault-tolerance.md](fault-tolerance.md)) is written against.
 
 ```yaml
 # k8s/base/kustomization.yaml
@@ -76,10 +76,10 @@ resources:
   - 11-rabbitmq-config.yaml
   - 13-rabbitmq-services.yaml
   - 14-rabbitmq-statefulset.yaml
-  - 20-dragonfly-config.yaml
-  - 20-alert-fold-config.yaml
-  - 22-dragonfly-services.yaml
-  - 23-dragonfly-statefulset.yaml
+  - 20-valkey-config.yaml
+  - 20-event-fold-config.yaml
+  - 22-valkey-services.yaml
+  - 23-valkey-statefulset.yaml
   - 30-sentinel-config.yaml
   - 31-sentinel-statefulset.yaml
   - 32-sentinel-bridge.yaml
@@ -117,7 +117,7 @@ overlays/
     │   ├── kustomization.yaml   (this IS the lab base, not an overlay)
     │   ├── replicas.yaml, resources.yaml, storage.yaml
     │   ├── delete-pdb.yaml, delete-anti-affinity.yaml, delete-hpa.yaml
-    │   └── dragonfly-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml
+    │   └── valkey-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml
     ├── openshift/         # Route-based, like production
     │   ├── kustomization.yaml
     │   ├── routes.yaml           (lab hostnames)
@@ -150,7 +150,7 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 
 **Deleting a CRD object works.** `kubernetes/delete-routes.yaml` uses `$patch: delete` on `route.openshift.io/v1` objects that the *local* kustomize has no schema for. Verified with kustomize 5.x shipped in `kubectl`: the objects are removed at render time and never reach the API server. Without this, a plain cluster fails with `no matches for kind "Route"`.
 
-**NodePorts are fixed** (30300/30800) rather than auto-assigned, so the frontend config can be a constant and you do not have to look up a port after every apply. Nothing but these two Services is exposed: RabbitMQ, Dragonfly and Sentinel stay ClusterIP-only on both flavours, exactly as in production.
+**NodePorts are fixed** (30300/30800) rather than auto-assigned, so the frontend config can be a constant and you do not have to look up a port after every apply. Nothing but these two Services is exposed: RabbitMQ, Valkey and Sentinel stay ClusterIP-only on both flavours, exactly as in production.
 
 **The plain-Kubernetes frontend config sets `resolveWsHostFromPage: true`.** A NodePort is reachable on any node's IP, so hard-coding one would be wrong on a second machine and stale after a DHCP change. The frontend substitutes `location.hostname` and keeps the port. This is a small requirement on the frontend code — it is written down here because it is the one behavioural difference the overlay imposes on application code.
 
@@ -161,9 +161,9 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 | Replicas | 3 each (bridge 2) | **1 each** |
 | Anti-affinity | required | **removed** (1 replica, no spread to enforce; required would still schedule but blocks nothing) |
 | PDBs | all 8 workloads | **deleted** — a PDB with 1 replica and `minAvailable: 2` makes the pod impossible to evict |
-| Dragonfly `maxmemory` | 36gb | **512mb** |
-| Dragonfly mem limit/request | 48Gi / 8Gi | **1Gi / 256Mi** |
-| Dragonfly PV | 64Gi | **2Gi** |
+| Valkey `maxmemory` | 40gb | **512mb** |
+| Valkey mem limit/request | 52Gi / 8Gi | **1Gi / 256Mi** |
+| Valkey PV | 64Gi | **2Gi** |
 | RabbitMQ PV | 96Gi | **2Gi** |
 | Sentinel PV | 1Gi | **256Mi** |
 | Snapshot schedule | hourly | **every 15 min** (`*/15 * * * *`), so the restart path is exercised quickly |
@@ -177,7 +177,7 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 
 | Change | Consequence |
 |---|---|
-| 1 replica | No quorum. RabbitMQ has 1 member of a quorum queue, so a restart means brief publish refusal; Dragonfly has no replica, so no failover; Sentinel has quorum 1. **All three degrade to "a single pod that can only restart", which is exactly what a lab wants.** |
+| 1 replica | No quorum. RabbitMQ has 1 member of a quorum queue, so a restart means brief publish refusal; Valkey has no replica, so no failover; Sentinel has quorum 1. **All three degrade to "a single pod that can only restart", which is exactly what a lab wants.** |
 | Sentinel quorum 1 | Failover logic cannot fire (there is nothing to promote). The `sentinel-bridge` still applies the initial `REPLICAOF`-less state and keeps the Service selector correct. |
 | Removing PDBs | Otherwise `kubectl drain` and even some rollouts hang forever on a 1-replica deployment with `minAvailable: 2`. |
 | Removing anti-affinity | With 1 replica there is nothing to spread. Keeping `required` would be harmless but misleading. |
@@ -200,8 +200,8 @@ Fits any single-node cluster or a 2 vCPU / 4 GiB VM.
 | Component | Req CPU | Lim CPU | Req Mem | Lim Mem | PV |
 |---|---|---|---|---|---|
 | RabbitMQ | 50m | 300m | 128Mi | 384Mi | 2Gi |
-| Dragonfly (server) | 100m | 500m | 256Mi | 1Gi | 2Gi |
-| Dragonfly (pruner) | 5m | 50m | 8Mi | 32Mi | — |
+| Valkey (server) | 100m | 500m | 256Mi | 1Gi | 2Gi |
+| Valkey (pruner) | 5m | 50m | 8Mi | 32Mi | — |
 | Sentinel (server) | 10m | 50m | 32Mi | 64Mi | 256Mi |
 | Sentinel (init) | 5m | 50m | 8Mi | 32Mi | — |
 | Workers | 50m | 200m | 64Mi | 192Mi | — |
@@ -227,7 +227,7 @@ patches:
   - path: delete-pdb.yaml
   - path: delete-anti-affinity.yaml
   - path: delete-hpa.yaml
-  - path: dragonfly-lab.yaml
+  - path: valkey-lab.yaml
   - path: sentinel-lab.yaml
   - path: bridge-lab.yaml
 ```
@@ -278,7 +278,7 @@ spec: { replicas: 1 }
 ---
 apiVersion: apps/v1
 kind: StatefulSet
-metadata: { name: dragonfly }
+metadata: { name: valkey }
 spec: { replicas: 1 }
 ---
 apiVersion: apps/v1
@@ -298,37 +298,40 @@ metadata: { name: rabbitmq }
 $patch: delete
 apiVersion: policy/v1
 kind: PodDisruptionBudget
-metadata: { name: dragonfly }
+metadata: { name: valkey }
 # ... one entry per PDB in the base
 ```
 
-`dragonfly-lab.yaml` patches the Dragonfly **ConfigMap**, not an args list:
+`valkey-lab.yaml` patches the Valkey **ConfigMap**, not an args list — the file is
+replaced wholesale, which is the Kustomize behaviour for a ConfigMap key:
 
 ```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata: { name: dragonfly }
-spec:
-  template:
-    spec:
-      containers:
-        - name: dragonfly
-          args:
-            - --logtostderr
-            - --dir=/data
-            - --dbfilename=firewatch-{timestamp}
-            - --df_snapshot_format=true
-            - "--snapshot_cron=*/15 * * * *"
-            - --maxmemory=512mb
-            - --maxmemory-policy=noeviction
-            - --proactor_threads=1
-            - --replica_delete_expired=false
-            - $(DRAGONFLY_AUTH_ARGS)
-            - --port=6379
-            - --admin_port=9222
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: valkey-config }
+data:
+  valkey.conf: |
+    …
+    maxmemory 512mb
+    maxmemory-policy noeviction
+    min-replicas-to-write 0     # one pod, no replica
+    …
 ```
 
-Note the list is replaced wholesale — Kustomize replaces `args` rather than merging lists. That is why the lab patch repeats every argument. **A dropped `--maxmemory-policy=noeviction` here would silently reintroduce defect D9** ([fault-tolerance.md](fault-tolerance.md) §3.9), so the overlay is reviewed against the base list.
+Two settings have to change together in the lab and both are easy to forget:
+
+| Setting | Base | Lab | Why |
+|---|---|---|---|
+| `min-replicas-to-write` | `2` | `0` | with one pod no replica exists, so `2` would refuse EVERY write |
+| `FW_WRITE_GUARD_MIN_REPLICAS` (bridge) | `2` | `0` | the bridge would otherwise empty the Service endpoint forever |
+
+They are two halves of the same guard ([valkey.md](valkey.md) §5) and turning off only
+one leaves the lab permanently broken in a way that looks like a credential problem.
+The `bridge-lab.yaml` patch handles the second; `valkey-lab.yaml` handles the first.
+
+`maxmemory-policy noeviction` is **not** a lab relaxation: it is repeated unchanged
+because dropping it would silently reintroduce defect D9
+([fault-tolerance.md](fault-tolerance.md) §3.9).
 
 ### 3.5 Applying it
 
@@ -348,7 +351,7 @@ is deliberate, so a re-apply reuses the data:
 ```bash
 kubectl delete -k k8s/overlays/lab/openshift      # or .../kubernetes
 kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=rabbitmq
-kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=dragonfly
+kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=valkey
 kubectl -n fire-watch-lab delete pvc -l app.kubernetes.io/name=sentinel
 ```
 
@@ -366,15 +369,15 @@ State this before anyone trusts a lab result:
 | Not testable in lab | Why |
 |---|---|
 | Quorum queue behaviour | 1 member — no quorum to lose |
-| Dragonfly failover / promotion | no replica |
+| Valkey failover / promotion | no replica |
 | Sentinel failover | quorum 1, nothing to promote |
 | Write guard tripping | it needs `connected_slaves < 2` with 2 expected; with 1 replica the guard must be configured to expect 0 replicas or disabled |
 | Split-brain scenarios | no peers to partition from |
 | Node loss | single node |
-| Memory/snapshot sizing | 512mb vs 36gb |
+| Memory/snapshot sizing | 512mb vs 40gb |
 | Eviction pressure | working set is far below `maxmemory` |
 
-**Consequence:** the bridge needs a lab-specific setting, `FW_WRITE_GUARD_MIN_REPLICAS=0`, or it will withhold the endpoint permanently in the lab. A single Dragonfly has no replica, so its replica count is always 0, which is below the base's expectation of 2 — the Service would have zero endpoints forever. This is the single most likely "why is everything read-only in my lab" trap, so the overlay sets it explicitly in `bridge-lab.yaml`:
+**Consequence:** the bridge needs a lab-specific setting, `FW_WRITE_GUARD_MIN_REPLICAS=0`, or it will withhold the endpoint permanently in the lab. A single Valkey has no replica, so its replica count is always 0, which is below the base's expectation of 2 — the Service would have zero endpoints forever. This is the single most likely "why is everything read-only in my lab" trap, so the overlay sets it explicitly in `bridge-lab.yaml`:
 
 ```yaml
 - name: FW_WRITE_GUARD_MIN_REPLICAS

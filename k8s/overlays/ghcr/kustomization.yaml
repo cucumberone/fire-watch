@@ -51,7 +51,7 @@ images:
     newTag: latest
 
 # Attach the pull secret to every pod that runs one of our images. RabbitMQ,
-# Dragonfly and Redis come from docker.io and need no credential.
+# Valkey and Sentinel come from docker.io and need no credential.
 patches:
   - target:
       kind: Deployment

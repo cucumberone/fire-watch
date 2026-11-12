@@ -13,7 +13,9 @@
  * Dedup happens at TWO levels, and they are worth separating because they answer
  * different questions and fail differently.
  *
- * 1. TRANSPORT dedup — keyed on the event id (`SET fw:evt:{id} NX`). The same
+ * 1. TRANSPORT dedup — keyed on the (broker ts, event id) watermark, and on the
+ *    content key itself: a repeat of the same device+summary lands on the same
+ *    `event:<key>` hash, so it cannot create a second record.
  *    MESSAGE delivered twice is idempotent: nothing changes.
  *
  * 2. CONTENT dedup — keyed on a fingerprint of
@@ -650,7 +652,7 @@ async function main() {
     `  Open alerts           ${alertsOpened}\n` +
     `  Count on every row    ${cfg.sameId ? 1 : cfg.copies + cfg.mutate}` +
       (cfg.sameId ? '   (copies were dropped, not counted)\n' : '\n') +
-    `  fw:evt:* records      ${expectedRecords}` +
+    `  event:* records       ${expectedRecords}` +
       `   <- identical copies must NOT add records\n` +
     `  All events rows       ${expectedRecords}   <- same set, read from the global index\n`,
   );
@@ -685,13 +687,13 @@ async function main() {
     `\nrepeated CLOSE events (idempotency check):\n` +
     (repeats.length ? repeats.map((r) => `  ${r.id} x${r.times}`).join('\n') : '  (none)') +
     `\n\nverify — counts first, they are the actual assertions:\n` +
-    `  PW=$(kubectl -n fire-watch-lab get secret fire-watch-dragonfly -o jsonpath='{.data.password}' | base64 -d)\n` +
-    `  R() { kubectl -n fire-watch-lab exec dragonfly-0 -c dragonfly -- \\\n` +
+    `  PW=$(kubectl -n fire-watch-lab get secret fire-watch-valkey -o jsonpath='{.data.password}' | base64 -d)\n` +
+    `  R() { kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \\\n` +
     `         redis-cli -a "$PW" --no-auth-warning "$@"; }\n` +
     `\n  # 1. every alert retired\n` +
-    `  R ZCARD fw:idx:alert:open                  # 0\n` +
+    `  R ZCARD idx:event:open                     # 0\n` +
     `\n  # 2. dedup: one record per DISTINCT content, NOT one per delivery\n` +
-    `  R --scan --pattern 'fw:evt:chaos-open-*' | wc -l   # ${expectedRecords}\n` +
+    `  R --scan --pattern 'event:*' | wc -l       # ${expectedRecords}\n` +
     `  #    with --copies 5 and no --mutate this stays ${alertsOpened}, not ${alertsOpened * 5}:\n` +
     `  #    the extra four are absorbed by the first record of each alert.\n` +
     `\n  # 3. the live Count reached ${expectedCountMax}, so the copies were COUNTED even though\n` +

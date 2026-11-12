@@ -13,10 +13,10 @@ name: Deploy
 #
 # Per environment:
 #   Variables:  NAMESPACE  AMQP_USER
-#   Secrets:    AMQP_PASS  DRAGONFLY_PASSWORD  FW_INGEST_TOKEN  KUBECONFIG_B64
+#   Secrets:    AMQP_PASS  VALKEY_PASSWORD  FW_INGEST_TOKEN  KUBECONFIG_B64
 #
 # Only these six are required. Hostnames and ports (AMQP_HOST, AMQP_PORT,
-# DFLY_MASTER_NAME) are NOT configuration here — they are literals in the
+# VALKEY_MASTER_NAME) are NOT configuration here — they are literals in the
 # manifests, because they are in-cluster DNS names that never vary by
 # environment. Validating them here would make a deploy fail for a value no step
 # reads.
@@ -97,7 +97,7 @@ jobs:
     # Every value the run ACTUALLY consumes, declared once. Anything listed here
     # is validated in the first step, so adding an entry that no step reads would
     # turn into a hard requirement for no reason — which is exactly the bug this
-    # replaced: AMQP_HOST, AMQP_PORT and DFLY_MASTER_NAME were validated but
+    # replaced: AMQP_HOST, AMQP_PORT and VALKEY_MASTER_NAME were validated but
     # never used, because those values live in the manifests (`k8s/base/40-workers.yaml`
     # sets AMQP_HOST=rabbitmq directly), not in CI.
     env:
@@ -106,7 +106,7 @@ jobs:
       AMQP_USER: ${{ vars.AMQP_USER }}
       # ---- environment secrets
       AMQP_PASS: ${{ secrets.AMQP_PASS }}
-      DRAGONFLY_PASSWORD: ${{ secrets.DRAGONFLY_PASSWORD }}
+      VALKEY_PASSWORD: ${{ secrets.VALKEY_PASSWORD }}
       FW_INGEST_TOKEN: ${{ secrets.FW_INGEST_TOKEN }}
       KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
       # ---- inputs
@@ -117,7 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fail before touching a cluster. An empty DRAGONFLY_PASSWORD would create
+      # Fail before touching a cluster. An empty VALKEY_PASSWORD would create
       # a Secret with an empty key and come up as a cluster where every Sentinel
       # reports the master as down — a confusing failure far from its cause.
       # Printing only the variable NAME is safe: GitHub masks secret values.
@@ -131,7 +131,7 @@ jobs:
               missing=1
             fi
           done
-          for v in AMQP_PASS DRAGONFLY_PASSWORD FW_INGEST_TOKEN KUBECONFIG_B64; do
+          for v in AMQP_PASS VALKEY_PASSWORD FW_INGEST_TOKEN KUBECONFIG_B64; do
             if [ -z "${!v:-}" ]; then
               echo "::error::missing SECRET for environment '$TARGET_ENV': $v"
               missing=1
@@ -235,9 +235,9 @@ jobs:
           fi
           echo "AMQP_USER agrees with the ConfigMap: $cm_user"
 
-      # Secrets before workloads. Order matters on a FIRST install: Dragonfly
+      # Secrets before workloads. Order matters on a FIRST install: Valkey
       # reads --requirepass from its Secret at start, and the Sentinels bake
-      # DRAGONFLY_PASSWORD into sentinel.conf on first boot. Applying the
+      # VALKEY_PASSWORD into sentinel.conf on first boot. Applying the
       # workloads first would start them against missing credentials.
       #
       # --from-env-file instead of --from-literal: a literal puts the value in
@@ -260,14 +260,14 @@ jobs:
           }
 
           printf 'password=%s\n' "$AMQP_PASS" > "$tmp/rabbitmq.env"
-          printf 'password=%s\n' "$DRAGONFLY_PASSWORD" > "$tmp/dragonfly.env"
+          printf 'password=%s\n' "$VALKEY_PASSWORD" > "$tmp/valkey.env"
           printf 'token=%s\n' "$FW_INGEST_TOKEN" > "$tmp/ingress.env"
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "dry run: Secrets NOT applied"
           else
             apply_secret fire-watch-rabbitmq "$tmp/rabbitmq.env"
-            apply_secret fire-watch-dragonfly "$tmp/dragonfly.env"
+            apply_secret fire-watch-valkey "$tmp/valkey.env"
             apply_secret fire-watch-ingress "$tmp/ingress.env"
           fi
 
@@ -286,7 +286,7 @@ jobs:
         if: ${{ inputs.dry_run == false }}
         run: |
           set -eu
-          # Only the workloads this workflow owns. RabbitMQ and Dragonfly are
+          # Only the workloads this workflow owns. RabbitMQ and Valkey are
           # StatefulSets with their own (slow) readiness semantics; waiting on
           # them here would make a deploy job look hung during a normal
           # single-node reboot.

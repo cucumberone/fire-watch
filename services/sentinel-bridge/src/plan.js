@@ -2,14 +2,14 @@
  * Pure reconcile logic. No I/O — everything here is a function of its inputs,
  * which is what makes it testable without a cluster.
  *
- * Specified by docs/redis-sentinel.md §4 and docs/dragonfly.md §3.
+ * Specified by docs/redis-sentinel.md §4 and docs/valkey.md §3.
  */
 
 /**
  * Map whatever identity we were given to a pod name.
  *
  * Two different things arrive here and they do NOT look the same:
- *   - Sentinel reports the master as a DNS name  -> "dragonfly-0.dragonfly-headless.ns.svc"
+ *   - Sentinel reports the master as a DNS name  -> "valkey-0.valkey-headless.ns.svc"
  *   - a replica's ROLE reports its master by IP  -> "10.1.2.3"
  *
  * So we resolve against both the pod names and a pod-name-by-IP map. Getting

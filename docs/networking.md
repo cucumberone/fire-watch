@@ -8,14 +8,14 @@ Services, Routes, DNS, and every port used by `fire-watch`.
 |---|---|---|---|---|
 | `rabbitmq-headless` | ClusterIP None | `app.kubernetes.io/name=rabbitmq` | 5672, 15672, 4369, 25672 | StatefulSet identity + peer discovery |
 | `rabbitmq` | ClusterIP | same | 5672, 15672 | client + management |
-| `dragonfly-headless` | ClusterIP None | `app.kubernetes.io/name=dragonfly` | 6379, 9222 | per-pod DNS for `REPLICAOF` |
-| `dragonfly` | ClusterIP, **no selector** | Endpoints object maintained by `sentinel-bridge` | 6379 | the only address applications use |
+| `valkey-headless` | ClusterIP None | `app.kubernetes.io/name=valkey` | 6379 | per-pod DNS for `REPLICAOF` |
+| `valkey` | ClusterIP, **no selector** | Endpoints object maintained by `sentinel-bridge` | 6379 | the only address applications use |
 | `sentinel-headless` | ClusterIP None | `app.kubernetes.io/name=sentinel` | 26379 | Sentinel inter-node gossip |
 | `ws-gateway` | ClusterIP | `app.kubernetes.io/name=ws-gateway` | 8080 | HTTP + WebSocket |
 | `frontend` | ClusterIP | `app.kubernetes.io/name=frontend` | 8080 | static assets |
 | `http-ingress` | **NodePort 30900** | `app.kubernetes.io/name=http-ingress` | 8080 | HTTP from an external nginx ([http-ingress.md](http-ingress.md) §4) |
 
-**Never** create a Service that load-balances across all Dragonfly pods. Writes must reach the master only.
+**Never** create a Service that load-balances across all Valkey pods. Writes must reach the master only.
 
 ## 2. Routes (OpenShift)
 
@@ -32,11 +32,11 @@ No Ingress objects anywhere (R2). No `hostNetwork`, no `hostPort`: the router re
 |---|---|---|
 | `rabbitmq.fire-watch.svc.cluster.local` | ClusterIP → 3 pods | workers, producers |
 | `rabbitmq-0.rabbitmq-headless.fire-watch.svc.cluster.local` | pod IP | RabbitMQ nodes (peer discovery) |
-| `dragonfly.fire-watch.svc.cluster.local` | ClusterIP → current master only | fallback for non-Sentinel-aware clients |
-| `dragonfly-N.dragonfly-headless.fire-watch.svc.cluster.local` | pod IP | Sentinel, `sentinel-bridge` |
+| `valkey.fire-watch.svc.cluster.local` | ClusterIP → current master only | fallback for non-Sentinel-aware clients |
+| `valkey-N.valkey-headless.fire-watch.svc.cluster.local` | pod IP | Sentinel, `sentinel-bridge` |
 | `sentinel-N.sentinel-headless.fire-watch.svc.cluster.local` | pod IP | `sentinel-bridge`, Sentinel-aware clients |
 
-Rule: application code may reference `rabbitmq`, `dragonfly`, and the sentinel headless names. It must never reference `dragonfly-N.*` — that is control-plane territory.
+Rule: application code may reference `rabbitmq`, `valkey`, and the sentinel headless names. It must never reference `valkey-N.*` — that is control-plane territory.
 
 ## 4. Ports
 
@@ -46,8 +46,9 @@ Rule: application code may reference `rabbitmq`, `dragonfly`, and the sentinel h
 | 15672 | RabbitMQ management + Prometheus metrics | in-cluster; optional Route for ops, off by default |
 | 4369 | epmd | in-cluster |
 | 25672 | Erlang distribution | in-cluster |
-| 6379 | Dragonfly client + replication | in-cluster |
-| 9222 | Dragonfly admin + Prometheus metrics | in-cluster |
+| 6379 | Valkey client + replication | in-cluster |
+
+There is **no metrics port**. Valkey has no HTTP endpoint at all; metrics are read over RESP by `valkey-exporter` ([monitoring.md](monitoring.md) §2).
 | 26379 | Redis Sentinel | in-cluster |
 | 8080 | gateway / frontend HTTP | via Route |
 
@@ -76,10 +77,16 @@ Two things the policies were doing must be stated plainly, because their absence
 
 | Was enforced by NetworkPolicy | Now |
 |---|---|
-| Only the master is reachable on 6379 from our own pods | **Applies by convention only.** Workers and gateway use the `dragonfly` Service; nothing prevents a direct pod-IP connection |
-| The residual direct-pod-IP write gap ([fault-tolerance.md](fault-tolerance.md) §4) | **Widened.** The only remaining control is application configuration and code review |
+| Only the master is reachable on 6379 from our own pods | **Applies by convention only.** Workers and gateway use the `valkey` Service; nothing prevents a direct pod-IP connection |
+| The residual direct-pod-IP WRITE gap ([fault-tolerance.md](fault-tolerance.md) §4) | **Narrowed by the engine:** `min-replicas-to-write 2` refuses the write even over a pod IP. Direct-pod-IP READS of a stale master remain possible |
 
-The Dragonfly split-brain protection is therefore **routing-based, not network-enforced**. It was already partly so; it is now entirely so. [fault-tolerance.md](fault-tolerance.md) §4 and §6 are updated to reflect that, rather than continuing to credit a control that is not deployed.
+The Valkey split-brain protection is therefore **routing-based plus engine-based, not
+network-enforced**: the Service endpoint gate lives in `sentinel-bridge`, and
+`min-replicas-to-write 2` refuses writes in the datastore itself
+([valkey.md](valkey.md) §5). That engine flag is the part that closes the direct
+pod-IP gap for WRITES — a client that bypasses the Service still cannot write to a
+minority master. Reads from a pod IP remain possible and remain a convention
+([fault-tolerance.md](fault-tolerance.md) §4).
 
 What still holds without any policy: Sentinel quorum, the write guard, the drain of a degraded master out of the Service, and ack-last durability. Those are application-layer and unaffected.
 
@@ -90,7 +97,7 @@ What still holds without any policy: Sentinel quorum, the write guard, the drain
 | Services are `ClusterIP` only | nothing is reachable from outside the cluster except the two Routes |
 | Two Routes only (`ws-gateway`, `frontend`) | no broker or datastore port is exposed |
 | No NodePort, no LoadBalancer service, no `hostNetwork` | no per-node port leaks |
-| Applications use `dragonfly` Service / Sentinel, never pod IPs | enforced by review ([redis-sentinel.md](redis-sentinel.md) §5) |
+| Applications use `valkey` Service / Sentinel, never pod IPs | enforced by review ([redis-sentinel.md](redis-sentinel.md) §5) |
 
 ### 5.4 If a dedicated namespace becomes available
 
@@ -101,9 +108,9 @@ The policies are a small, well-understood addition **once we own the namespace**
 | `default-deny-ingress` | `podSelector: {}` | nothing | — |
 | `allow-rmq-peers` | `rabbitmq` | `rabbitmq` | 4369, 25672, 5672 |
 | `allow-rmq-clients` | `rabbitmq` | `worker`, producers | 5672 |
-| `allow-dragonfly-peers` | `dragonfly` | `dragonfly`, `sentinel` | 6379 |
-| `allow-dragonfly-clients` | `dragonfly` | `worker`, `ws-gateway`, `sentinel-bridge` | 6379 |
-| `allow-dragonfly-metrics` | `dragonfly` | monitoring namespace | 9222 |
+| `allow-valkey-peers` | `valkey` | `valkey`, `sentinel` | 6379 |
+| `allow-valkey-clients` | `valkey` | `worker`, `ws-gateway`, `sentinel-bridge` | 6379 |
+| `allow-valkey-metrics` | `valkey` | `valkey-exporter` | 6379 |
 | `allow-sentinel` | `sentinel` | `sentinel`, `sentinel-bridge`, `worker`, `ws-gateway` | 26379 |
 | `allow-gateway-ingress` | `ws-gateway` | `openshift-ingress` | 8080 |
 | `allow-frontend-ingress` | `frontend` | `openshift-ingress` | 8080 |
@@ -140,7 +147,7 @@ Kept because the question comes up every time this is revisited. **It selects po
 | Route → gateway | round-robin, no stickiness (cookies disabled) | each WebSocket is pinned to one pod for its lifetime by TCP, which is all that is needed |
 | Route → frontend | round-robin | stateless assets, no problem |
 | Service `rabbitmq` | ClusterIP, TCP | AMQP connection sticks to one node; a reconnect may land elsewhere, which is fine for quorum queues |
-| Service `dragonfly` | ClusterIP over a single Endpoint | effectively a stable pointer to the master |
+| Service `valkey` | ClusterIP over a single Endpoint | effectively a stable pointer to the master |
 | Headless services | DNS A records per pod | used only by control-plane components |
 
 ## 7. TLS
@@ -152,13 +159,13 @@ Kept because the question comes up every time this is revisited. **It selects po
 | pod → pod (AMQP, RESP) | plaintext inside the cluster network policy boundary |
 | pod → pod (management) | plaintext |
 
-If in-cluster TLS is required later, RabbitMQ supports AMQP over TLS and Dragonfly supports `--tls` with `--tls_replication`; add it as a second phase and update this file.
+If in-cluster TLS is required later, RabbitMQ supports AMQP over TLS and Valkey supports `--tls` with `--tls_replication`; add it as a second phase and update this file.
 
 ## 8. Verification checklist
 
 ```bash
 kubectl -n fire-watch get svc,endpoints,route
-kubectl -n fire-watch get endpoints dragonfly -o wide         # exactly 1 address (the master)
+kubectl -n fire-watch get endpoints valkey -o wide         # exactly 1 address (the master)
 kubectl -n fire-watch get endpoints ws-gateway -o wide        # 3 addresses
 kubectl -n fire-watch get networkpolicy                       # expect: No resources found
 

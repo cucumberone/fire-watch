@@ -1,0 +1,190 @@
+# event-fold.lua — the ordering + dedup guard for event records.
+#
+# Specified in docs/event-lifecycle.md §5 and docs/valkey.md §6. Loaded by the
+# worker and invoked with EVAL/EVALSHA, so the compare-and-set is atomic across
+# the three workers racing on the same event key.
+#
+# ---------------------------------------------------------------------------
+# WHY THE KEY IS NOT BUILT IN LUA
+#
+# The event key is `event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>`,
+# computed in `services/worker/src/keygen.js`. Three reasons it stays in code:
+#
+#   1. Cluster safety. Valkey (like Redis Cluster) rejects a script that touches a
+#      key it was not given in KEYS — "Script attempted to access a non local
+#      key". A key minted inside Lua cannot be declared up front, so the script
+#      could only ever access keys the CALLER already computed.
+#   2. Reproducibility. The frontend, the verification scripts and any replay job
+#      must derive the same key from the same event. A key that exists only inside
+#      a server-side script cannot be reproduced outside the server.
+#   3. It is pure. Key generation is a hash of two input fields: no reads, no
+#      server state, nothing to make atomic. There is nothing for Lua to add.
+#
+# What DOES belong in Lua is the read-modify-write across several keys: "does this
+# condition exist -> move lastSeen -> bump count -> flip the indexes -> keep or
+# clear the ack". Three workers doing that client-side is the race this script
+# removes.
+#
+# ---------------------------------------------------------------------------
+# ONE HASH PER CONDITION — the duplicate is dropped, not stored
+#
+# `event:<key>` IS the record. There is no per-delivery key. A repeat of the same
+# (device, summary) does not create a second key: it bumps `count`, moves
+# `lastSeen`, and the arrival id is kept only as `lastId` for audit correlation.
+# That is the requested behaviour — "update LastOccurrence and drop the duplicate
+# event" — and it makes storage grow with CONDITIONS, not deliveries
+# (docs/sizing.md §1.1).
+#
+# Per-delivery history is NOT lost: it is in `q.audit.events`
+# (docs/persistence-and-durability.md §4).
+#
+# KEYS[1] = event:<key>          (hash: the record)
+# KEYS[2] = idx:event:all        (zset: key -> last broker ts)
+# KEYS[3] = idx:event:open       (zset: key -> last activity ts)
+# KEYS[4] = idx:event:closed     (zset: key -> closed_at ts)
+# KEYS[5] = idx:source:<source>  (zset: key -> last broker ts)
+#
+# KEYS[3..5] are what make the board survive a reload without a SCAN: an
+# unbounded `SCAN event:*` is refused everywhere in this design
+# (docs/websocket-server.md §3). They live inside this script so an index can
+# never drift from the state it indexes — a crash between an HSET and a separate
+# ZADD would otherwise leave a phantom row on every operator's screen forever.
+#
+# ARGV[1] = broker_ts_ms
+# ARGV[2] = arrival event id (identity of THIS delivery; becomes lastId/closedBy)
+# ARGV[3] = severity
+# ARGV[4] = bare event key (the index member)
+# ARGV[5] = source (device)
+# ARGV[6] = ttl in ms
+# ARGV[7..] = field, value, field, value ... applied on BOTH paths, because a
+#             retirement can arrive for a condition with no stored record yet
+#
+# Returns: 0 stale/redelivery | 1 applied | 3 closed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-fold
+  labels:
+    app.kubernetes.io/name: worker
+data:
+  event-fold.lua: |
+    local ts         = tonumber(ARGV[1])
+    local arrival_id = ARGV[2]
+    local sev        = ARGV[3]
+    local member     = ARGV[4]
+    local ttl        = tonumber(ARGV[6])
+
+    -- 1. ORDERING GUARD: (timestamp, id), lexicographic.
+    --
+    --    Two jobs at once:
+    --      a) stop a redelivered old CLOSE from retiring a newer CRITICAL;
+    --      b) stop a genuine redelivery (same ts, same id) from being counted.
+    --
+    --    Note what is NOT here: a fingerprint lookup. With one hash per condition
+    --    the "is this the same condition" question was answered by the KEY itself,
+    --    so this guard is now about ORDER only, not identity.
+    local wm_ts = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
+    local wm_id = redis.call('HGET', KEYS[1], 'watermarkId') or ''
+    if ts < wm_ts or (ts == wm_ts and arrival_id <= wm_id) then
+      return 0
+    end
+
+    local existed = redis.call('EXISTS', KEYS[1])
+    local state   = redis.call('HGET', KEYS[1], 'state') or ''
+
+    -- 1b. The record's own fields, applied to BOTH branches.
+    --
+    --    They are applied here rather than only on the occurrence path because a
+    --    retirement can arrive for a condition this worker has never seen: an
+    --    occurrence and its CLEAR are two messages, and a redelivery, a replay or a
+    --    restart can deliver them out of order. Without this the first thing stored
+    --    is a `state=closed` hash with no `msg`, `source` or `payload` — a row that
+    --    renders as blanks in every column, and the Closed tab has nothing to show.
+    --
+    --    Field/value pairs instead of a JSON blob because Lua cannot cheaply decode
+    --    JSON, and doing it here keeps the whole update in ONE atomic step instead of
+    --    an HSET followed by a round trip another worker could interleave with.
+    local n = #ARGV
+    local i = 7
+    local sets = {}
+    while i + 1 <= n do
+      sets[#sets + 1] = ARGV[i]
+      sets[#sets + 1] = ARGV[i + 1]
+      i = i + 2
+    end
+    if #sets > 0 then
+      redis.call('HSET', KEYS[1], unpack(sets))
+    end
+
+    -- 2. RETIREMENT ends the episode.
+    if sev == 'CLOSE' or sev == 'HARMLESS' then
+      redis.call('HSET', KEYS[1],
+        'state', 'closed',
+        'severity', sev,
+        'closedBy', arrival_id,
+        'closedAt', ts,
+        'lastSeen', ts,
+        'watermark', ts,
+        'watermarkId', arrival_id)
+      -- An ack belongs to ONE episode. Clearing it here is what stops a re-fire
+      -- from looking already-handled; without the HDEL an operator would ack a
+      -- resolved alert, the condition would return, and the row would come back
+      -- still marked "acked by alice" with nobody looking at it
+      -- (docs/acknowledge.md §6).
+      redis.call('HDEL', KEYS[1], 'ackedBy', 'ackedAt')
+      redis.call('PEXPIRE', KEYS[1], ttl)
+
+      -- Retirement MUST move the key between the two indexes, with no graceful
+      -- fallback. An earlier version made the closed index optional so a newer
+      -- worker against an older script would not error during a rollout — that
+      -- turned a deployment-ordering mistake into SILENT data loss: alerts
+      -- retired, the Closed tab read "nothing has closed", and no error was
+      -- logged anywhere.
+      redis.call('ZREM', KEYS[3], member)
+      redis.call('ZADD', KEYS[4], ts, member)
+      -- It stays in both timeline indexes: a closure is an event.
+      redis.call('ZADD', KEYS[2], ts, member)
+      redis.call('ZADD', KEYS[5], ts, member)
+      return 3
+    end
+
+    -- 3. OCCURRENCE — this is the dedup. A repeat updates the SAME hash.
+    --    (The payload fields were already written in step 1b.)
+    local count = tonumber(redis.call('HGET', KEYS[1], 'count') or '0')
+    local episode_started = (existed == 0 or state == 'closed' or state == '')
+
+    if episode_started then
+      -- New condition, or a re-fire after retirement: fresh episode, so the count
+      -- restarts at 1 and the ack is cleared below.
+      count = 1
+    else
+      count = count + 1
+      -- firstSeen is deliberately NOT touched: it marks when this episode began,
+      -- and a "first occurrence" that moves on every delivery is not a first
+      -- occurrence.
+    end
+
+    if episode_started then
+      redis.call('HSET', KEYS[1], 'firstSeen', ts)
+      redis.call('HDEL', KEYS[1], 'ackedBy', 'ackedAt')
+      redis.call('HDEL', KEYS[1], 'closedBy', 'closedAt')
+    end
+
+    redis.call('HSET', KEYS[1],
+      'state', 'open',
+      'severity', sev,
+      'count', count,
+      'lastSeen', ts,
+      'lastId', arrival_id,
+      'watermark', ts,
+      'watermarkId', arrival_id)
+
+    redis.call('PEXPIRE', KEYS[1], ttl)
+
+    -- 4. Indexes, in the same atomic step.
+    redis.call('ZADD', KEYS[3], ts, member)   -- open
+    redis.call('ZREM', KEYS[4], member)       -- no longer closed
+    redis.call('ZADD', KEYS[2], ts, member)   -- global timeline
+    redis.call('ZADD', KEYS[5], ts, member)   -- per-source timeline
+
+    return 1

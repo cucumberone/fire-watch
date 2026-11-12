@@ -1,20 +1,20 @@
 /**
- * sentinel-bridge — the control plane DragonflyDB does not have.
+ * sentinel-bridge — the control plane Valkey does not have.
  *
  * Loop every FW_RECONCILE_INTERVAL:
  *   1. acquire/renew the leader Lease; if not leader, sleep.
  *   2. ask Sentinel who the master is.
- *   3. read every Dragonfly pod's actual ROLE.
+ *   3. read every Valkey pod's actual ROLE.
  *   4. compute a plan (pure function, see plan.js).
  *   5. apply it: REPLICAOF on stragglers, Endpoints for the master Service.
  *
- * Specified by docs/redis-sentinel.md §4 and docs/dragonfly.md §3.
+ * Specified by docs/redis-sentinel.md §4 and docs/valkey.md §3.
  *
  * Design rules enforced here:
  *   - Sentinel decides WHO the master is. Pods decide what they currently are.
  *     Disagreements are resolved in Sentinel's favour.
  *   - Write access is published through the Service Endpoints, never by asking
- *     Dragonfly about its own health. A degraded database cannot be trusted to
+ *     Valkey about its own health. A degraded database cannot be trusted to
  *     report its own degradation.
  *   - When the master is not safely writable, the Endpoints are EMPTIED, so
  *     workers fail loudly instead of writing to a minority master.
@@ -137,7 +137,7 @@ async function reconcile() {
   // ---- 2. Pods' view -----------------------------------------------------
   const pods = await listPods(kube.core, cfg.namespace, labelSelector);
   if (pods.length === 0) {
-    log.warn('no dragonfly pods found', { selector: labelSelector });
+    log.warn('no valkey pods found', { selector: labelSelector });
     return;
   }
   const podByName = new Map(pods.map((p) => [p.metadata.name, p]));
@@ -165,7 +165,7 @@ async function reconcile() {
   await patchEndpoints(
     kube.core,
     cfg.namespace,
-    cfg.dragonflyService,
+    cfg.valkeyService,
     plan.endpoints,
     podByName,
     cfg,
@@ -194,7 +194,7 @@ async function probeMaster(master) {
   const c = new Redis({
     host: master.host,
     port: master.port,
-    password: cfg.dragonflyPassword,
+    password: cfg.valkeyPassword,
     lazyConnect: true,
     connectTimeout: 2000,
     maxRetriesPerRequest: 1,
@@ -266,7 +266,7 @@ log.info('sentinel-bridge starting', {
   identity,
   namespace: cfg.namespace,
   masterName: cfg.masterName,
-  service: cfg.dragonflyService,
+  service: cfg.valkeyService,
   minReplicas: cfg.minReplicas,
   intervalMs: cfg.reconcileIntervalMs,
   failoverRequestEnabled: cfg.enableFailoverRequest,

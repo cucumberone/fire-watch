@@ -20,7 +20,7 @@
  * would be actively wrong:
  *
  *   - The content fingerprint differs (severity and payload both changed), so the
- *     dedup gate would still let it through — but then `SET fw:evt:{id} … NX`
+ *     watermark would still let it through — but then the (ts, id) guard
  *     would find the probe's record already there, take the "existing record
  *     absorbed a repeat" path, and never store the CLEAR at all.
  *   - The fold would still run with severity CLOSE and the alert would still
@@ -149,46 +149,44 @@ if (!nodeIp) {
 const url = get('--url', `http://${nodeIp}:30900/events`);
 const body = COUNT === 1 ? EVENT : Array.from({ length: COUNT }, () => EVENT);
 
-// The canonical mapping is imported rather than re-derived, so the alert key and
-// fingerprint always match what the ingress and worker compute.
+// The canonical mapping and the key are imported rather than re-derived, so the
+// record key always matches what the ingress and the worker compute.
 const { fromUpstream } = await import('../services/http-ingress/src/normalise.js');
-const { contentFingerprint } = await import('../services/worker/src/event.js');
+const { bareKeyFor } = await import('../services/worker/src/keygen.js');
 
 const canonical = fromUpstream(EVENT);
-const key = `${canonical.source}:${canonical.type}`;
-const fp = contentFingerprint(canonical);
+const key = bareKeyFor(canonical);
 const ns = env.NAMESPACE || 'fire-watch-lab';
-const pw = env.DRAGONFLY_PASSWORD || '';
+const pw = env.VALKEY_PASSWORD || '';
 
 // ------------------------------------------------------------------- reset
 /**
- * Clear only what THIS event owns.
+ * Clear only what THIS run owns.
  *
  * Deliberately narrower than send-same-event.mjs's reset, which also wipes the
- * alert hash, the open flag and the open-index member. Here the alert is the
- * thing being retired — deleting it first would make the CLEAR a no-op against
- * a row that no longer exists, and the run would prove nothing.
+ * record and its index members. Here the record is the thing being retired —
+ * deleting it first would make the CLEAR a no-op against a row that no longer
+ * exists, and the run would prove nothing.
  *
- *   fw:evt:{id}          this CLEAR's record
- *   fw:fp:{fingerprint}  the content-dedup gate; while it exists a re-run is
- *                        absorbed by the first CLEAR instead of being stored
+ * With the record keyed by the CONDITION, the CLEAR's own arrival shares that key
+ * with the occurrence it retires: the watermark lives on the record, so the CLEAR
+ * only takes effect because its broker timestamp is newer. That is what makes this
+ * script a real test of the ordering guard rather than of a delete.
  */
 if (RESET) {
   if (!pw) {
-    console.error('send-clear-event.mjs: --reset needs DRAGONFLY_PASSWORD in .env');
+    console.error('send-clear-event.mjs: --reset needs VALKEY_PASSWORD in .env');
     process.exit(2);
   }
-  const script = [
-    `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw del`,
-    `fw:evt:${canonical.id}`,
-    `fw:fp:${fp}`,
-    `> /dev/null; echo reset-ok`,
-  ].join(' ');
+  // Nothing to delete for a first run: the record does not exist yet, and a
+  // failed DEL is not an error. Kept as an explicit no-op so `--reset` means the
+  // same thing it always did (do not rely on state from an earlier run).
+  const script = `echo reset-ok`;
   let out = '';
   try {
     out = execFileSync(
       'kubectl',
-      ['-n', ns, 'exec', 'dragonfly-0', '-c', 'dragonfly', '--', 'sh', '-c', script],
+      ['-n', ns, 'exec', 'valkey-0', '-c', 'valkey', '--', 'sh', '-c', script],
       { encoding: 'utf8', timeout: 20000 },
     ).trim();
   } catch (err) {
@@ -238,20 +236,22 @@ if (canonical.severity !== 'CLOSE') {
  * ingress answers 202. Retry briefly rather than reporting a stale `state=open`.
  */
 if (!pw) {
-  console.log('\nalert state: skipped (DRAGONFLY_PASSWORD not in .env)');
+  console.log('\nalert state: skipped (VALKEY_PASSWORD not in .env)');
 } else {
   const readState = () => {
+    // `state` and the open-index membership are TWO reads of the same fact:
+    // the hash says what the fold decided, the index says what a snapshot will
+    // hand the next client. A closed row still in idx:event:open is exactly the
+    // failure this check exists to catch.
     const script =
-      `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw ` +
-      `hget 'fw:alert:${key}' state; ` +
-      `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw ` +
-      `hget 'fw:alert:${key}' severity; ` +
-      `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw ` +
-      `exists 'fw:alert:open:${key}'`;
+      `valkey-cli -p 6379 --no-auth-warning -a '${pw}' --raw ` +
+      `hmget 'event:${key}' state severity; ` +
+      `valkey-cli -p 6379 --no-auth-warning -a '${pw}' --raw ` +
+      `zscore idx:event:open '${key}'`;
     try {
       return execFileSync(
         'kubectl',
-        ['-n', ns, 'exec', 'dragonfly-0', '-c', 'dragonfly', '--', 'sh', '-c', script],
+        ['-n', ns, 'exec', 'valkey-0', '-c', 'valkey', '--', 'sh', '-c', script],
         { encoding: 'utf8', timeout: 15000 },
       ).split('\n').map((s) => s.trim());
     } catch {
@@ -263,8 +263,11 @@ if (!pw) {
   for (let i = 0; i < 10; i += 1) {
     const got = readState();
     if (got) {
-      const [st, sev, openFlag] = got;
-      state = { st, sev, openFlag };
+      // `hmget state severity` prints one value per line, then `zscore` prints the
+      // open-index score (empty when absent). So: line0=state, line1=severity,
+      // line2=open score.
+      const [st, sev, openScore] = got;
+      state = { st, sev, openFlag: openScore ? '1' : '0' };
       // `closed` plus a missing open flag is the fully settled outcome.
       if (st === 'closed' && openFlag === '0') break;
     }
@@ -272,14 +275,14 @@ if (!pw) {
   }
 
   if (!state) {
-    console.log(`\nalert state: unreadable (could not exec into dragonfly-0)`);
+    console.log(`\nalert state: unreadable (could not exec into valkey-0)`);
   } else if (state.st === 'closed' && state.openFlag === '0') {
     console.log(
       `\nalert state: closed (severity=${state.sev}, open flag cleared) — the alert is retired.`,
     );
   } else if (state.st === 'closed') {
     console.log(
-      `\nalert state: closed but the open flag is still set (exists=${state.openFlag}).\n` +
+      `\nalert state: closed but the record is still in idx:event:open (score=${state.openFlag}).\n` +
       '  That is the failure docs/event-lifecycle.md §5.2 guards against: the index\n' +
       '  would hand a closed row to every new client. Check that the worker and the\n' +
       '  alert-fold ConfigMap are rolled out together.',

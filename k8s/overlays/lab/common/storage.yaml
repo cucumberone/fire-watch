@@ -2,7 +2,7 @@
 # merge patch cannot reach (it is a list), so these use JSON6902 ops on the
 # index of the template list.
 #
-# Base sizes: rabbitmq 96Gi, dragonfly 64Gi, sentinel 1Gi.
+# Base sizes: rabbitmq 96Gi, valkey 64Gi, sentinel 1Gi.
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -22,7 +22,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: dragonfly
+  name: valkey
 spec:
   volumeClaimTemplates:
     - metadata:

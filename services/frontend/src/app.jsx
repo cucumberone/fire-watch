@@ -634,7 +634,7 @@ function useSocket(config) {
   // rows are derived from the fold verdicts, while acks are an operator fact
   // that arrives on its own frames (docs/acknowledge.md §5).
   const [acks, setAcks] = useState(new Map());
-  // Operator journal, keyed by ALERT key (`source:type`), newest entry first.
+  // Operator journal, keyed by record key, newest entry first.
   //
   // Keyed by the alert rather than an event id because the note is about the
   // incident: an event record is pruned after retention, and a note attached to
@@ -753,7 +753,17 @@ function useSocket(config) {
         };
       });
       if (frame.applied !== null && frame.applied !== undefined) {
-        const alertKey = `${evt.source}:${evt.type}`;
+        // The record key travels on the frame. It is a hash of device + summary, so
+        // it CANNOT be re-derived here — and a second implementation of the hash is
+        // exactly how the tail and the board would drift apart.
+        const alertKey = evt.key ?? null;
+        if (!alertKey) {
+          // A frame from an older worker. Nothing to join on, so the tail row is
+          // still rendered but the alert map is left alone; the next `resync`
+          // repairs it. Loud only at debug: this is a rolling-update case.
+          if (evt.brokerTs) lastTsRef.current = evt.brokerTs;
+          return;
+        }
         // Re-opening forgets the "already counted" marker, so the NEXT retirement
         // of this key is counted as a genuinely new closure. Without this, an alert
         // that closed and re-fired would never raise the badge again.
@@ -785,13 +795,14 @@ function useSocket(config) {
       // `applied === 3` is a retirement, `1`/`2` an occurrence, which means an alert
       // that was closed has re-fired. Only rows for THIS key are touched.
       if (typeof frame.key === 'string' && (frame.applied === 1 || frame.applied === 2 || frame.applied === 3)) {
-        const [src, ...rest] = frame.key.split(':');
-        const typ = rest.join(':');
+        // Match on the RECORD KEY. Splitting `source:type` out of the key was only
+        // possible while the key WAS `source:type`; it is a 32-hex hash now, so the
+        // comparison has to be on the key itself.
         const nowState = frame.applied === 3 ? 'closed' : 'open';
         setAllEvents((prev) => {
           let changed = false;
           const events = prev.events.map((e) => {
-            if (e.source !== src || e.type !== typ) return e;
+            if (e.key !== frame.key) return e;
             if (e.alertState === nowState) return e;
             changed = true;
             return {
@@ -851,7 +862,7 @@ function useSocket(config) {
         return;
       }
       // `applied === 1` means the fold counted a NEW OCCURRENCE, and the fold
-      // clears the ack at exactly that point (alert-fold.lua). Mirror it here
+      // clears the ack at exactly that point (event-fold.lua). Mirror it here
       // so the row stops showing "acked" the instant it re-fires, instead of up
       // to one debounce later. Without this an operator would see a stale
       // "acked by alice" on an alert nobody is handling
@@ -2022,7 +2033,7 @@ function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false })
  * Open / closed chip for an EVENT row.
  *
  * An event record is immutable — it has no state of its own. "Open or closed" is a
- * property of the ALERT it belongs to (`source:type`), which the fold maintains on
+ * property of the RECORD it belongs to (the 32-hex key), which the fold maintains on
  * `fw:alert:{key}`, and the gateway joins it onto each row as `alertState`.
  *
  * Three distinct meanings, and they must not look alike:
@@ -2563,7 +2574,7 @@ function App() {
                   // fold and would hold the row if it were open. `unknown` stays reserved
                   // for "we have never heard of this alert", i.e. a gap in this client's
                   // own knowledge rather than a state it can vouch for.
-                  const alertKey = e.source && e.type ? `${e.source}:${e.type}` : null;
+                  const alertKey = e.key ?? null;
                   const liveState = e.alertState
                     ?? (alertKey && alerts.has(alertKey) ? 'open' : null);
                   return (
@@ -2750,7 +2761,7 @@ function App() {
                     .filter(Boolean);
                   // Events selected -> the distinct alerts they belong to.
                   //
-                  // An ALERT is `source:type`; several events can share one, which is
+                  // One RECORD per condition; several rows can share one, which is
                   // exactly what content dedup records. So a selection of 6 events can
                   // legitimately touch 4 alerts, and the two menu items then quote
                   // different numbers. That is correct and it looked like a bug, so the
@@ -2761,8 +2772,8 @@ function App() {
                     .filter(Boolean);
                   const alertKeys = [...new Set(
                     selectedEvents
-                      .filter((x) => x.source && x.type)
-                      .map((x) => `${x.source}:${x.type}`),
+                      .map((x) => x.key)
+                      .filter(Boolean),
                   )];
                   const collapsing = targets.length > alertKeys.length;
                   // Fill the alert-derived columns from the client's OWN alert map
@@ -2777,7 +2788,7 @@ function App() {
                   // The client already holds this: `alerts` is maintained from the
                   // fold's own frames. Server-supplied values win where present, so a
                   // query reply is still authoritative.
-                  const alertKeyForRow = e.source && e.type ? `${e.source}:${e.type}` : null;
+                  const alertKeyForRow = e.key ?? null;
                   const mapRow = alertKeyForRow ? alerts.get(alertKeyForRow) : null;
                   const enriched = e.alertCount == null && mapRow
                     ? {
@@ -2812,7 +2823,7 @@ function App() {
                             // Close the ALERT this event belongs to. Offered here because
                             // the operator is looking at an arrival and may be concluding
                             // the incident from it — forcing a tab switch to Open alerts to
-                            // act on the same `source:type` is friction for no reason.
+                            // act on the same record is friction for no reason.
                             //
                             // The key is the PAIR, so a multi-row selection collapses to the
                             // distinct alerts it touches: closing the same alert twice is one
@@ -2845,8 +2856,8 @@ function App() {
                         // One journal per incident, so a multi-row selection has no
                         // single key to open. Silently picking the first would hide
                         // the others.
-                        targets.length === 1 && e.source && e.type
-                          ? `${e.source}:${e.type}`
+                        targets.length === 1 && e.key
+                          ? e.key
                           : null,
                       )}
                     />

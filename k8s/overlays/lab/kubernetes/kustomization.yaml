@@ -11,7 +11,7 @@
 #   * the two Services become NodePort, so they are reachable from the host
 #   * the frontend's wsUrl points at the NodePort, not a Route host
 #
-# Everything else — replicas, resources, storage, Dragonfly flags, Sentinel
+# Everything else — replicas, resources, storage, Valkey config, Sentinel
 # quorum, bridge settings — is identical, because it comes from ../common.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

@@ -246,7 +246,7 @@ test('insertEvent trims to the limit, keeping the newest', () => {
 // ------------------------------------------------------------- all-events list
 test('insertAllEvent de-duplicates on id alone', () => {
   // The All Events tab is "what is stored", and storage is ONE record per id in
-  // fw:evt:{id}. A second arrival of the same id is an absorbed repeat that was
+  // event:<key>. A second arrival of the same id is a folded repeat that was
   // never stored, so it must not appear — even though its brokerTs differs, which
   // is exactly what makes insertEvent accept it.
   let list = insertAllEvent([], { id: 'p1', brokerTs: 1000 }, 10);
@@ -699,7 +699,7 @@ test('row-supplied event fills the Summary when the frame has none', () => {
 // ------------------------ the fold's count is authoritative, never added to
 test('a re-fire after a CLEAR shows Count 1, not 2', () => {
   // Reported bug: probe -> CLEAR -> probe again showed Count 2. The fold resets
-  // count to 1 at the start of a new episode (alert-fold.lua), and the row the
+  // count to 1 at the start of a new episode (event-fold.lua), and the row the
   // gateway attaches already reflects that, so adding one on the client made it 2.
   const KEY = 'probe-device:static.probe';
   let map = new Map();

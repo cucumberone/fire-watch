@@ -1,0 +1,127 @@
+# Valkey configuration + the AOF rewriter sidecar.
+#
+# Specified in docs/valkey.md §4. Unlike Dragonfly, Valkey DOES implement AOF, so
+# the original AGENTS.md requirement ("use the AOF feature, refresh it hourly")
+# is finally satisfiable as written: `appendonly yes` + `appendfsync everysec`
+# gives a <=1 s RPO, and the rewriter sidecar issues BGREWRITEAOF hourly so a
+# restart replays a small, recent file instead of a growing history.
+#
+# Two settings are correctness requirements, not tuning:
+#   --requirepass / --masterauth  -> Sentinel auth-pass and every client
+#                                    authenticate; replicas authenticate upward
+#                                    (fault-tolerance.md §3.6)
+#   maxmemory-policy noeviction   -> any other policy silently deletes live
+#                                    events at maxmemory, breaking 7-day
+#                                    retention with no signal (fault-tolerance.md §3.9)
+#
+# Split-brain protection is enforced by the ENGINE here, not only by routing:
+# `min-replicas-to-write 2` makes the master refuse writes when it cannot see two
+# replicas. That is the AGENTS.md "always find 2 replicas before accepting
+# writes" rule, and it is the piece Dragonfly could not provide. The lab overlay
+# sets it to 0 (there is one pod and no replica).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: valkey-config
+  labels:
+    app.kubernetes.io/name: valkey
+data:
+  valkey.conf: |
+    # ---- network ------------------------------------------------------------
+    bind 0.0.0.0
+    port 6379
+    protected-mode no
+    tcp-keepalive 60
+    timeout 0
+
+    # ---- persistence --------------------------------------------------------
+    # AOF is the durability mechanism. everysec is the only sane choice: `always`
+    # costs a sync per write (16.7/s sustained is fine, 500/s is not), `no` gives
+    # the OS up to 30 s to lose the tail.
+    dir /data
+    appendonly yes
+    appendfsync everysec
+    appenddirname appendonlydir
+    # RDB preamble: the AOF base is a compact RDB image instead of a long history
+    # of individual commands, which is what keeps an AOF-only restart fast.
+    aof-use-rdb-preamble yes
+    # Automatic rewrite on size growth is a safety net; the sidecar's hourly
+    # BGREWRITEAOF is the mechanism the requirement asks for.
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 256mb
+    aof-load-truncated yes
+    aof-timestamp-enabled yes
+
+    # RDB snapshots are DISABLED. With AOF+RDB-preamble there is nothing they add,
+    # and each background save forks a ~29 GiB process — a memory spike for no
+    # durability gain.
+    save ""
+
+    # ---- memory -------------------------------------------------------------
+    # maxmemory sits ABOVE the 7-day working set on purpose. The usual "leave 20%
+    # free for eviction" advice is inverted here: eviction would delete live
+    # events, so writes must fail loudly instead (worker requeues, backlog
+    # becomes visible). Derivation in docs/sizing.md §3.4.
+    maxmemory 40gb
+    maxmemory-policy noeviction
+
+    # ---- replication / split brain ------------------------------------------
+    # Refuse writes unless 2 replicas are connected and have acknowledged within
+    # 10 s. This is the engine-level half; sentinel-bridge additionally empties
+    # the Service endpoint so clients cannot reach a minority master at all.
+    min-replicas-to-write 2
+    min-replicas-max-lag 10
+    replica-read-only yes
+    # Replicas must not expire keys on their own read path: the master drives
+    # expiry, and a replica deleting independently diverges from it.
+    replica-ignore-maxmemory yes
+    replica-serve-stale-data no
+    repl-backlog-size 256mb
+    repl-diskless-sync yes
+    repl-diskless-sync-delay 2
+
+    # ---- keyspace notifications --------------------------------------------
+    # Not used by the application (clients use PUBLISH on our own channels), but
+    # left off explicitly so nobody mistakes this for an integration point.
+    notify-keyspace-events ""
+
+  # Reads the flag file, appends the credentials from the environment, and execs
+  # the server. A script rather than bare args because the password must never be
+  # inlined in a manifest (`args` is visible to anyone who can read the pod spec).
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    : "${VALKEY_PASSWORD:?VALKEY_PASSWORD is required}"
+    exec valkey-server /etc/valkey/valkey.conf \
+      --requirepass "$VALKEY_PASSWORD" \
+      --masterauth  "$VALKEY_PASSWORD"
+
+  # Hourly AOF rewrite.
+  #
+  # WHY. The requirement is "every hour refresh the file with a new one from
+  # what's left in memory, to make restart and reread fast". That is exactly
+  # BGREWRITEAOF: a fresh, minimal AOF built from the live keyspace. Left alone,
+  # the AOF grows with every write in the 7-day window and a restart replays it
+  # all.
+  #
+  # It is scheduled here instead of relying on auto-aof-rewrite-percentage
+  # because size-triggered rewrites depend on write volume, and a quiet hour
+  # would otherwise leave a large file in place.
+  rewrite.sh: |
+    #!/bin/sh
+    set -eu
+    : "${VALKEY_PASSWORD:?VALKEY_PASSWORD is required}"
+    INTERVAL="${FW_AOF_REWRITE_INTERVAL:-3600}"
+    while true; do
+      touch /tmp/alive
+      # --no-raw so the reply is a status string we can grep. valkey-cli exits 0
+      # even when AUTH fails, so the assertion has to be on the output — the same
+      # defect that made every Dragonfly probe meaningless (docs/valkey.md §5.1).
+      out=$(valkey-cli -p 6379 --no-auth-warning -a "$VALKEY_PASSWORD" BGREWRITEAOF 2>&1 || true)
+      case "$out" in
+        *"Background append only file rewriting started"*) ;;
+        *"already"*|*"in progress"*) ;;
+        *) echo "BGREWRITEAOF not accepted: $out" >&2 ;;
+      esac
+      sleep "$INTERVAL"
+    done

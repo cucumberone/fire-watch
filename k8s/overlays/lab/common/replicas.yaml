@@ -11,7 +11,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: dragonfly
+  name: valkey
 spec:
   replicas: 1
 ---

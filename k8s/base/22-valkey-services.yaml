@@ -1,0 +1,62 @@
+# Valkey Services (docs/networking.md §1).
+#
+# valkey-headless: stable per-pod DNS for REPLICAOF and Sentinel.
+# valkey:          NO selector. Its Endpoints are maintained by sentinel-bridge so
+#                  the Service always points at exactly one pod — the current
+#                  master. A selector here would round-robin across all three and
+#                  send writes to replicas (which answer READONLY).
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-headless
+  labels:
+    app.kubernetes.io/name: valkey
+spec:
+  clusterIP: None
+  # Needed so sentinel-bridge can resolve a pod that is still syncing, and so a
+  # replica booting against a not-yet-Ready master still gets DNS.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: valkey
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  labels:
+    app.kubernetes.io/name: valkey
+spec:
+  type: ClusterIP
+  # Intentionally NO selector — the Endpoints object is owned and rewritten by
+  # sentinel-bridge. No Endpoints object is declared here: until the bridge has
+  # run once, the Service has zero endpoints, so writes fail loudly instead of
+  # silently landing on a replica.
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client
+---
+# Metrics target. Valkey has NO HTTP metrics endpoint — everything is RESP
+# `INFO`, so metrics are produced by redis_exporter (33-redis-exporter.yaml) and
+# the ServiceMonitor scrapes the EXPORTER, not this Service. This headless Service
+# exists so the exporter can reach every pod (headless => one endpoint per pod,
+# not a round-robin VIP) and so `valkey_up`/role metrics exist per replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-metrics
+  labels:
+    app.kubernetes.io/name: valkey
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: valkey
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client

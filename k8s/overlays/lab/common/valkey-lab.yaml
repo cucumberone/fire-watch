@@ -1,0 +1,55 @@
+# Valkey for the lab: ONE pod, no replica, no failover.
+#
+# Valkey reads a conf file, so this patches the config directly rather than a flags
+# list. Three settings change and each has a reason:
+#
+#   min-replicas-to-write 0   There is no replica, so 2 is unsatisfiable and EVERY
+#                             write would be refused with NOREPLICAS. The
+#                             split-brain guard is meaningless with one pod.
+#   maxmemory 512mb           A homelab does not hold a 7-day production window.
+#   save ""                   already off in the base; restated so a reader does
+#                             not wonder whether a dev box takes RDB snapshots.
+#
+# Everything else — AOF, its hourly rewrite, noeviction — is deliberately identical
+# to production, because those are the behaviours worth exercising on a lab. A lab
+# that cannot restart from its AOF is not testing the restart path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: valkey-config
+data:
+  valkey.conf: |
+    # ---- network ------------------------------------------------------------
+    bind 0.0.0.0
+    port 6379
+    protected-mode no
+    tcp-keepalive 60
+    timeout 0
+
+    # ---- persistence --------------------------------------------------------
+    dir /data
+    appendonly yes
+    appendfsync everysec
+    appenddirname appendonlydir
+    aof-use-rdb-preamble yes
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    aof-load-truncated yes
+    aof-timestamp-enabled yes
+    save ""
+
+    # ---- memory -------------------------------------------------------------
+    maxmemory 512mb
+    maxmemory-policy noeviction
+
+    # ---- replication / split brain ------------------------------------------
+    # 0, not 2: with a single pod there is no replica to find, and leaving the
+    # guard on would refuse every write.
+    min-replicas-to-write 0
+    min-replicas-max-lag 10
+    replica-read-only yes
+    replica-ignore-maxmemory yes
+    replica-serve-stale-data no
+
+    # ---- notifications ------------------------------------------------------
+    notify-keyspace-events ""

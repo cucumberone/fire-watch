@@ -1,16 +1,20 @@
 /**
- * worker — RabbitMQ -> Dragonfly event pipeline.
+ * worker — RabbitMQ -> Valkey event pipeline.
  *
  * Pipeline (docs/workers.md §3):
  *
- *   validate -> compress -> record -> index -> alert fold
+ *   validate -> compress -> record+index+fold (ONE atomic script)
  *            -> audit copy (plain, confirmed) -> publish -> ack
  *
  * The order is load-bearing:
  *   - the write happens before the ack, or a crash loses the event
- *   - the audit copy is confirmed before the ack, or Dragonfly becomes the only
- *     copy and it has no AOF
+ *   - the audit copy is confirmed before the ack, or Valkey becomes the only copy
  *   - the ack is last, always
+ *
+ * The record, its indexes and the state fold are now a single script. They used to
+ * be three separate writes because the record was keyed by the MESSAGE id while the
+ * fold was keyed by the CONDITION. With a content-derived key both live at
+ * `event:<key>`, so one atomic call replaces them (docs/valkey.md §2).
  */
 import http from 'node:http';
 import { loadConfig, keys } from './config.js';
@@ -21,14 +25,14 @@ import {
   compressPayload,
   brokerTsMs,
 } from './event.js';
-import { DragonflyClient } from './dragonfly.js';
+import { ValkeyClient } from './valkey.js';
 import { FoldScript, persistEvent, reconcileEventIndex } from './store.js';
 import { AmqpConsumer } from './amqp.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
 
-const dfl = new DragonflyClient(cfg, log);
+const valkey = new ValkeyClient(cfg, log);
 const fold = new FoldScript(cfg.foldScriptPath, log, cfg.foldReloadMs);
 const amqpConsumer = new AmqpConsumer(cfg, log);
 
@@ -53,7 +57,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/metrics') {
     // Minimal Prometheus output: enough to see the pipeline is alive without a
-    // second exporter. Real metrics live in the Dragonfly/RabbitMQ endpoints.
+    // second exporter. Real metrics live in the Valkey/RabbitMQ endpoints.
     res.writeHead(200, { 'content-type': 'text/plain' }).end(
       `# HELP fw_worker_inflight Messages currently being processed\n` +
       `# TYPE fw_worker_inflight gauge\n` +
@@ -111,88 +115,33 @@ async function handleMessage(msg) {
     });
 
     // ---- write + fold. Throws on transient failure -> requeue.
-    const { applied, duplicate, contentDuplicate, ownerId } = await persistEvent({
-      dfl, evt, storedPayload, brokerTs, cfg, fold, log,
+    //
+    // ONE call now covers the record, both timeline indexes and the state rollup.
+    // `applied` is the fold's verdict (docs/event-lifecycle.md §5.2):
+    //
+    //   0  stale or redelivered  -> nothing moved
+    //   1  occurrence            -> count++, lastSeen moved
+    //   3  retired               -> the condition is closed
+    const { applied, bareKey } = await persistEvent({
+      valkey, evt, storedPayload, brokerTs, cfg, fold, log,
     });
     lastWriteOk = true;
 
-    // ---- transport duplicate: the same MESSAGE delivered again.
+    // A redelivery of the same MESSAGE keeps its broker timestamp and id, so the
+    // fold's (ts, id) watermark rejects it. Nothing downstream may see it: no audit
+    // copy, because the first delivery already produced one, and no live frame, so
+    // the tail does not show the same event twice.
     //
-    // Nothing downstream may see it: no fold, so no count and no Last occurrence
-    // change; no audit copy, because the first delivery already produced one; no
-    // live frame, so the tail does not show the same event twice.
-    //
-    // Still ACKED. Requeueing would loop forever on a message that can never
-    // succeed.
-    if (duplicate) {
-      log.debug('duplicate event id, dropped', { id: evt.id });
+    // Still ACKED: requeueing a message that can never succeed would loop forever.
+    if (applied === 0) {
+      log.debug('event dropped as stale or redelivered', { id: evt.id, key: bareKey });
       return 'ack';
     }
 
-    // ---- content duplicate: the same CONDITION, reported again.
-    //
-    // The ALERT ROLLUP is deduplicated — one alert, one count, `last_id` pointing
-    // at the owner — but the ARRIVAL IS STORED under its own id. So this is a real
-    // event record now, indexed in both timelines, and it belongs in the live tail
-    // like any other arrival.
-    //
-    // It used to be discarded: no record, no index member, no audit copy, and the
-    // frame carried `applied: 0` so clients would not count it. That is what made
-    // the All events tab show one row while the live tail showed three for the
-    // same three deliveries — "all events" omitting events. The frame now carries
-    // the fold's real verdict, because the copy is an event and the count must move
-    // once per arrival.
-    if (contentDuplicate) {
-      log.debug('content duplicate: rollup absorbed, arrival stored', {
-        id: evt.id, ownerId, applied,
-      });
-
-      // Audit copy for the arrival too. It is a stored event, so the "recover the
-      // log from the broker" guarantee has to cover it, or the audit trail would
-      // be missing exactly the repeats that a dedup investigation cares about.
-      await amqpConsumer.publishAudit(msg.content);
-
-      try {
-        await dfl.publish(
-          keys.channelEvents,
-          JSON.stringify({
-            event: {
-              ...evt,
-              payload: storedPayload,
-              brokerTs,
-              // Kept: it tells a reader that this arrival shares its condition
-              // with an earlier record. Useful for a dedup drill, ignored by the UI.
-              absorbedBy: ownerId,
-            },
-            applied,
-          }),
-        );
-      } catch (err) {
-        log.warn('content-duplicate fan-out failed', { id: evt.id, err: String(err) });
-      }
-      try {
-        await dfl.publish(
-          keys.channelAlerts,
-          JSON.stringify({
-            kind: 'occurrence',
-            key: `${evt.source}:${evt.type}`,
-            applied,
-            // The ARRIVAL's broker timestamp, so the client can tell that this
-            // frame and the `op: event` frame beside it describe ONE delivery.
-            //
-            // Without it a client cannot pair them: the gateway may fail to read a
-            // row (so `row.lastSeen` is absent) and then the occurrence frame folds
-            // as a SECOND occurrence of the same arrival. Measured on the deployed
-            // app as Count climbing 1 -> 2 -> 3 -> 2 for one repeat while Last
-            // occurrence went backwards.
-            brokerTs,
-          }),
-        );
-      } catch (err) {
-        log.warn('occurrence fan-out failed (rollup already durable)', { id: evt.id, err: String(err) });
-      }
-      return 'ack';
-    }
+    // A content duplicate is NOT a separate case any more. It hashes to the same
+    // key, so the fold incremented `count` and moved `lastSeen` on the existing
+    // record. There is no second record to reconcile and no owner id to chase —
+    // which is why the whole `contentDuplicate` branch is gone.
 
     // ---- audit copy: PLAIN, confirmed, before the ack.
     // Reuse the original buffer: re-serializing would risk a different byte
@@ -202,19 +151,26 @@ async function handleMessage(msg) {
     // ---- live fan-out, carrying the fold verdict.
     // Compression already applied, so the gateway can pass it through.
     try {
-      await dfl.publish(
+      await valkey.publish(
         keys.channelEvents,
         // brokerTs is included deliberately. It is the only timestamp that
         // reflects WHEN THIS EVENT ARRIVED, and a client needs it to move the
         // row's "Last occurrence". Without it the frontend falls back to
         // `prev.lastSeen` and Last occurrence silently stops advancing.
         JSON.stringify({
-          event: { ...evt, payload: storedPayload, brokerTs },
+          // `key` is the record key the row lives at. It is carried on the event
+          // frame because the browser joins the live tail to the open-alert table
+          // on it, and it can no longer be derived from `source`+`type` (the key is
+          // a hash of device + summary). Without it the client would have to
+          // reimplement the hash, which is how the two would drift.
+          event: { ...evt, payload: storedPayload, brokerTs, key: bareKey },
           applied,
         }),
       );
       if (applied === 1 || applied === 3) {
-        await dfl.publish(keys.channelAlerts, JSON.stringify({ key: `${evt.source}:${evt.type}`, applied }));
+        // The wire key is the bare record key, not `source:type`. The client joins
+        // on it directly, so the frame carries exactly what the row is keyed by.
+        await valkey.publish(keys.channelAlerts, JSON.stringify({ key: bareKey, applied }));
       }
     } catch (err) {
       // The event is durable already. A missed pub/sub frame is recovered by
@@ -249,18 +205,18 @@ async function main() {
   // Warm the fold script so a bad mount fails at boot, not on the first event.
   fold.get();
 
-  // Connect Dragonfly first: if it is unreachable we should not consume at all,
+  // Connect Valkey first: if it is unreachable we should not consume at all,
   // because every message would be nacked immediately.
   let connected = false;
   for (let i = 0; i < 30 && !connected; i += 1) {
-    connected = await dfl.ping();
+    connected = await valkey.ping();
     if (!connected) {
-      log.warn('dragonfly not reachable yet, retrying', { attempt: i + 1 });
+      log.warn('valkey not reachable yet, retrying', { attempt: i + 1 });
       await new Promise((r) => setTimeout(r, 2000));
     }
   }
   if (!connected) {
-    log.error('could not reach dragonfly through sentinel; starting anyway with readiness false');
+    log.error('could not reach valkey through sentinel; starting anyway with readiness false');
   }
   lastWriteOk = connected;
 
@@ -273,7 +229,7 @@ async function main() {
   // same two sets.
   if (connected && cfg.indexReconcile) {
     try {
-      const res = await reconcileEventIndex(dfl, cfg, log, {
+      const res = await reconcileEventIndex(valkey, cfg, log, {
         maxToAdd: cfg.indexReconcileMax,
       });
       if (res.added > 0) {
@@ -286,7 +242,7 @@ async function main() {
 
   // Keep probing so readiness recovers without a restart.
   setInterval(async () => {
-    if (!draining) lastWriteOk = await dfl.ping();
+    if (!draining) lastWriteOk = await valkey.ping();
   }, 10000).unref();
 
   // Consume. Reconnect on channel death rather than exiting: an exit would drop
@@ -319,7 +275,7 @@ async function shutdown(signal) {
   log.info('shutting down', { signal });
   draining = true;
   await amqpConsumer.close();
-  await dfl.quit();
+  await valkey.quit();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 8000).unref();
 }

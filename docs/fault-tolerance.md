@@ -9,7 +9,7 @@ Verification of every component against R3 (**100% H/A, 3 replicas on different 
 | Component | 3 replicas | Different nodes | Survives 1 pod loss | Survives 1 node loss | Split brain | Verdict |
 |---|---|---|---|---|---|---|
 | RabbitMQ | ✓ | ✓ required | ✓ | ✓ 2/3 quorate | ✓ quorum queues | **PASS** after §3.1 |
-| DragonflyDB | ✓ | ✓ required | ✓ | ✓ (master failover) | ⚠ routing gate only | **PARTIAL** — §4 |
+| Valkey | ✓ | ✓ required | ✓ | ✓ (master failover) | ✓ engine + routing gate | **PASS** after §4 |
 | Redis Sentinel | ✓ | ✓ required | ✓ | ✓ 2/3 quorum | ✗ **broken by `emptyDir`** | **FAIL** → fixed §3.2 |
 | Workers | ✓ | ✓ required | ✓ | ✓ | n/a stateless | **PASS** after §3.3 |
 | WS gateway | ✓ | ✗ **preferred only** | ✓ | ✗ possible total outage | n/a stateless | **FAIL** → fixed §3.4 |
@@ -21,12 +21,12 @@ Verification of every component against R3 (**100% H/A, 3 replicas on different 
 
 | # | Defect | Severity | Impact |
 |---|---|---|---|
-| D1 | `x-delivery-limit: 10` on `q.event.ingest` combined with `nack(requeue=true)` | **CRITICAL** | **Silent data loss.** A Dragonfly outage longer than 10 redeliveries dead-letters events that were never written. Directly violates R1. |
+| D1 | `x-delivery-limit: 10` on `q.event.ingest` combined with `nack(requeue=true)` | **CRITICAL** | **Silent data loss.** A Valkey outage longer than 10 redeliveries dead-letters events that were never written. Directly violates R1. |
 | D2 | Sentinel uses `emptyDir` for `sentinel.conf` | **CRITICAL** | Restarted sentinels lose `config epoch`, `known-sentinels` and `known-replicas`. Two restarted sentinels can authorise a failover with a stale epoch → **the exact split-brain the quorum was meant to prevent**. |
 | D3 | WS gateway and frontend use *preferred* anti-affinity | **HIGH** | All 3 pods can land on one node. Losing that node takes the component to **zero replicas** — not 100% H/A. |
-| D4 | `sentinel-bridge` is 1 replica | **HIGH** | Single point of failure for the `dragonfly` Service selector and `REPLICAOF` application. If it dies, no client can find the master after the next failover. |
-| D5 | No `--requirepass` on Dragonfly, yet Sentinel and clients use `auth-pass` | **HIGH** | Sentinel cannot authenticate → it cannot monitor the master, so **failover never happens**. Or, if auth is skipped, Dragonfly is unauthenticated. |
-| D6 | `fw:write_guard:state` is read by workers but written by **nothing** | **HIGH** | The write-guard publishes to `fw:ch:alerts` and sets a pod label, but never sets the key workers check. The guard is therefore inert. |
+| D4 | `sentinel-bridge` is 1 replica | **HIGH** | Single point of failure for the `valkey` Service selector and `REPLICAOF` application. If it dies, no client can find the master after the next failover. |
+| D5 | No `--requirepass` on Valkey, yet Sentinel and clients use `auth-pass` | **HIGH** | Sentinel cannot authenticate → it cannot monitor the master, so **failover never happens**. Or, if auth is skipped, Valkey is unauthenticated. |
+| D6 | `fw:write_guard:state` is read by workers but written by **nothing** | **HIGH** | The write-guard publishes to `fw:ch:alerts` and sets a pod label, but never sets the key workers check. The guard is therefore inert. Fixed by moving the gate to `Endpoints/valkey` (§3.7), and now reinforced by the engine's `min-replicas-to-write` |
 | D7 | No `PodDisruptionBudget` for workers, gateway, frontend, sentinel, bridge | **MEDIUM** | `kubectl drain` can evict all replicas of a component simultaneously. R3 explicitly requires surviving eviction. |
 
 Two additional correctness issues:
@@ -34,7 +34,7 @@ Two additional correctness issues:
 | # | Issue | Impact |
 |---|---|---|
 | D8 | `cluster_partition_handling` never set (RabbitMQ default `ignore`) | On a 3-node cluster the recommended value is `pause_minority`. Absent it, a partitioned node keeps serving clients with an incomplete view. |
-| D9 | `maxmemory-policy` never set for Dragonfly | If it is not `noeviction`, hitting `maxmemory` **silently evicts live events** and quietly breaks the 7-day retention promise. |
+| D9 | `maxmemory-policy` never set for Valkey | If it is not `noeviction`, hitting `maxmemory` **silently evicts live events** and quietly breaks the 7-day retention promise. |
 
 ## 3. Fixes
 
@@ -52,7 +52,7 @@ Two additional correctness issues:
 `x-delivery-limit` is **removed**. Rationale:
 
 - The only legitimate reason to dead-letter an ingest message is a **schema violation**, and that is an explicit `nack(requeue=false)` from the validator — it does not need a broker-side counter.
-- Every other requeue is *transient* (Dragonfly down, master failover, audit queue full). A delivery limit converts those into permanent loss.
+- Every other requeue is *transient* (Valkey down, master failover, audit queue full). A delivery limit converts those into permanent loss.
 - A poison message that crashes the worker is now prevented by the watermark and idempotency design ([event-lifecycle.md](event-lifecycle.md) §5), not by a counter.
 - Bound the risk instead with `x-max-length-bytes` on the DLQ and an alert on `q.event.ingest.dlq > 0`.
 
@@ -79,7 +79,7 @@ The prior claim that `emptyDir` is fine because "a lost sentinel just relearns t
 | Component | PDB |
 |---|---|
 | RabbitMQ | `minAvailable: 2` |
-| Dragonfly | `minAvailable: 2` |
+| Valkey | `minAvailable: 2` |
 | Sentinel | `minAvailable: 2` |
 | Workers | `minAvailable: 1` |
 | WS gateway | `minAvailable: 2` |
@@ -101,7 +101,7 @@ affinity:
 
 The prior reasoning — "preferred, because required spread would leave pods Pending on a 2-node cluster" — is not applicable: **the target is 3 nodes** ([sizing.md](sizing.md) §3.2). With 3 nodes and 3 replicas, required spread always schedules. Preferred anti-affinity only buys tolerance for a mis-sized cluster, at the cost of the actual requirement.
 
-Consequence to accept: after a node loss the third pod stays `Pending` (no second copy can share a node). That is the same behaviour as RabbitMQ and Dragonfly, and it is the correct one — a component that has silently collapsed onto one node is not H/A.
+Consequence to accept: after a node loss the third pod stays `Pending` (no second copy can share a node). That is the same behaviour as RabbitMQ and Valkey, and it is the correct one — a component that has silently collapsed onto one node is not H/A.
 
 ### 3.5 D4 — sentinel-bridge with 2 replicas + leader election
 
@@ -118,37 +118,43 @@ spec:
 
 Both replicas run; only the lease holder acts (`coordination.k8s.io/v1` `Lease`, the same mechanism the kube scheduler uses). A non-leader stays warm and takes over within one lease duration (15s).
 
-Alternative rejected: 1 replica with a `restartPolicy: Always` Deployment. A restart takes seconds to a minute, and during that window **no component can determine the master**, so writes stop even if Dragonfly is perfectly healthy. That is not 100% H/A.
+Alternative rejected: 1 replica with a `restartPolicy: Always` Deployment. A restart takes seconds to a minute, and during that window **no component can determine the master**, so writes stop even if Valkey is perfectly healthy. That is not 100% H/A.
 
-### 3.6 D5 — Dragonfly authentication
+### 3.6 D5 — Valkey authentication
 
 ```yaml
 args:
-  - --requirepass=$(DRAGONFLY_PASSWORD)
+  - --requirepass=$(VALKEY_PASSWORD)
 ```
 
 `auth-pass` in `sentinel.conf` and the client password in workers/gateway must match. Without it Sentinel's `PING` is rejected and the master is considered permanently down — a failover loop that never converges.
 
-The password comes from `Secret/fire-watch-dragonfly`, injected via `valueFrom`, never inlined.
+The password comes from `Secret/fire-watch-valkey`, injected via `valueFrom`, never inlined.
 
 ### 3.7 D6 — fix the write-guard contract
 
-The guard cannot write to Dragonfly (that is the very component it is judging), so the state must not live there. Corrected design:
+The guard cannot write to Valkey (that is the very component it is judging), so the state must not live there. Corrected design:
 
 | Signal | Written by | Read by | Mechanism |
 |---|---|---|---|
-| `Endpoints/dragonfly` (zero addresses) | `sentinel-bridge` | workers, gateway | cluster state, no Dragonfly dependency |
+| `Endpoints/valkey` (zero addresses) | `sentinel-bridge` | workers, gateway | cluster state, no Valkey dependency |
 | `fire-watch.io/writable` label | `sentinel-bridge` | humans, alerts | pod patch |
 
-The bridge evaluates the guard itself: it already reads `ROLE` on every pod each cycle, and the replica count is right there in the reply. The separate per-pod `dragonfly-write-guard` sidecar was **removed** — it duplicated that polling, could only express a verdict as a label for someone else to interpret, and needed its own lab override. Fewer moving parts, same guarantee.
+The bridge evaluates the guard itself: it already reads `ROLE` on every pod each cycle, and the replica count is right there in the reply. The separate per-pod `valkey-write-guard` sidecar was **removed** — it duplicated that polling, could only express a verdict as a label for someone else to interpret, and needed its own lab override. Fewer moving parts, same guarantee.
 
 Workers then rely on the **Service** rather than on a key:
 
 ```text
-if the dragonfly Service has no ready endpoint -> do not write; nack(requeue=true)
+if the valkey Service has no ready endpoint -> do not write; nack(requeue=true)
 ```
 
-This removes the broken `fw:write_guard:state` key entirely, and removes the circularity of a degraded Dragonfly being asked to report its own degradation.
+This removes the broken `fw:write_guard:state` key entirely, and removes the
+circularity of a degraded Valkey being asked to report its own degradation.
+
+**Valkey adds a third, independent signal**: `min-replicas-to-write 2` makes the
+datastore itself refuse the write. It is not a replacement for the endpoint gate — an
+engine flag cannot stop stale reads — but it is the one control that survives a client
+that ignores the Service (§4).
 
 ### 3.8 D8 — RabbitMQ partition handling
 
@@ -161,38 +167,48 @@ With quorum queues, `pause_minority` is the correct setting for a 3-node cluster
 
 `autoheal` is wrong here — it can restart the minority side and discard its state, which is fine for classic mirrored queues but pointless with quorum queues and disruptive to connections.
 
-### 3.9 D9 — Dragonfly eviction policy
+### 3.9 D9 — Valkey eviction policy
 
-```yaml
-args:
-  - --maxmemory-policy=noeviction
+```ini
+maxmemory-policy noeviction
 ```
 
 Eviction must be an **incident**, not a silent behaviour. With `noeviction`, writes fail loudly when `maxmemory` is reached, the worker requeues, and the backlog becomes visible — exactly the behaviour the audit WAL is designed to recover from ([persistence-and-durability.md](persistence-and-durability.md) §4). Any other policy quietly deletes events and breaks retention without any signal.
 
-## 4. The one gap that cannot be closed by configuration
+## 4. Split brain: what the engine now closes, and what it does not
 
-**Dragonfly split brain: the write guard is a routing gate, not a storage gate.**
+Valkey has `min-replicas-to-write`, so the guard has two layers, and only ONE residual
+gap remains:
 
 | Scenario | Behaviour |
 |---|---|
-| Master partitioned from both replicas, Sentinel quorum on the majority side | Guard trips in 30s, master removed from the `dragonfly` Service, new master elected. **All routed writes are safe.** |
-| A client that ignores the Service and writes to the old master's pod IP | **The write succeeds and is later discarded on rejoin.** |
+| Master partitioned from both replicas, Sentinel quorum on the majority side | Guard trips in 30 s, master removed from the `valkey` Service, new master elected. **All routed writes are safe.** |
+| A client that ignores the Service and writes **through a pod IP** | **The engine refuses it**: `NOREPLICAS Not enough good replicas to write`. `min-replicas-to-write 2` is evaluated by the datastore, not by routing |
+| A client that ignores the Service and **reads** from the old master's pod IP | **The read succeeds and may be stale.** Reads are not gated by `min-replicas-to-write` |
 
-Layer 3 (Sentinel) prevents two masters from being *authoritative*, and layer 2 prevents clients from *routing* to the stale one. What is left is a direct-IP write, which is not routed through anything the design controls.
+So the residual risk is no longer "an unrouted write is accepted"; it is "an unrouted
+READ can be stale for the duration of the partition". That is a materially smaller
+claim, and it is what this audit now asserts.
 
-Why it cannot be closed with manifests: Dragonfly has no `min-replicas-to-write` equivalent ([dragonfly.md](dragonfly.md) §3). There is no server-side switch that makes a replica-starved master reject writes.
+```ini
+# k8s/base/20-valkey-config.yaml
+min-replicas-to-write 2
+min-replicas-max-lag 10
+```
 
-Three ways to close it, in order of cost:
+The lab sets both `min-replicas-to-write` and the bridge's
+`FW_WRITE_GUARD_MIN_REPLICAS` to `0`, because one pod has no replica and the guard
+would refuse every write forever ([kustomize.md](kustomize.md) §3.4).
 
-| Option | Result | Cost |
-|---|---|---|
-| **Enforce the rule in code and review** — workers and gateway are forbidden from using pod IPs; the only remaining control is configuration discipline | The only realistic writer is a human with `kubectl exec` | zero, and it is the current design |
-| Add NetworkPolicies denying worker→`dragonfly-N` traffic | closes the gap at the network layer | **not available** — the deployment target is a shared namespace ([networking.md](networking.md) §5.1) |
-| Run Dragonfly in Valkey/Redis with `min-replicas-to-write 2` | True storage-level gate | contradicts the Dragonfly requirement |
-| Accept it | Documented residual risk | none |
+### Why the routing gate is still needed
 
-The design takes the first option. **NetworkPolicy was previously listed as a second control and is no longer deployed**, so the gap is now narrower in mitigation than it was in the earlier revision. It is **not** equivalent to a storage-level gate and this audit does not claim otherwise.
+`min-replicas-to-write` only stops WRITES. The `Endpoints/valkey` gate in
+`sentinel-bridge` also stops stale READS, and it makes the condition visible as a pod
+label and an empty Service — which is what the worker's `nack(requeue=true)` and the
+`ValkeyServiceEndpointGateClosed` alert key on
+([workers.md](workers.md) §5).
+
+Two layers, because they close different things.
 
 ### 4.1 Also verify: is layer 3 actually sufficient?
 
@@ -218,7 +234,7 @@ The 2-node-loss row is important and correct: **the cluster is not available wit
 | Survives node loss | 2/3 quorums + reschedule on 128 GiB nodes | [validation.md](validation.md) §3 |
 | RabbitMQ split brain | quorum queues + `pause_minority` | §3.8 |
 | Sentinel split brain | quorum 2 + **persisted config epoch** | §3.2 |
-| Dragonfly split brain | 3 layers, one residual gap | §4 |
+| Valkey split brain | 3 layers; writes closed by the engine, stale reads residual | §4 |
 | No data loss under retry | no delivery limit + ack-last + WAL | §3.1 |
 
 ## 6. Residual risks (accepted, not hidden)
@@ -228,7 +244,7 @@ The 2-node-loss row is important and correct: **the cluster is not available wit
 | Direct-pod-IP write to a minority master (§4) | application configuration + code review only; NetworkPolicy is **not** deployed ([networking.md](networking.md) §5.2) | possible for any client that ignores the Service |
 | Namespace is shared, no traffic isolation | ClusterIP-only Services, two Routes, no pod-IP usage in code | lateral traffic from other tenants is unrestricted |
 | 2 simultaneous node losses | none — no quorum system survives it | **cluster unavailable** |
-| Dragonfly eviction at `maxmemory` | `noeviction` makes it loud, not silent | writes blocked until TTL frees memory |
+| Valkey eviction at `maxmemory` | `noeviction` makes it loud, not silent | writes blocked until TTL frees memory |
 | Sentinel epoch reset if the PVC is also lost | 1Gi PV, treated as critical data | needs a manual epoch check on restore |
 | `sentinel-bridge` lease split during a partition | only one lease holder acts; both watch the same label | ≤15s of ambiguous selector |
 
@@ -252,22 +268,23 @@ kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqctl list_queues name arguments 
 
 # 5. Sentinel epochs agree and are non-zero (D2)
 for i in 0 1 2; do kubectl -n fire-watch exec sentinel-$i -- \
-  redis-cli -p 26379 SENTINEL CKQUORUM fire-watch-dragonfly; done
+  valkey-cli -p 26379 SENTINEL CKQUORUM fire-watch-valkey; done
 
 # 6. Sentinel can authenticate (D5)
-kubectl -n fire-watch exec sentinel-0 -- redis-cli -p 26379 \
-  SENTINEL MASTER fire-watch-dragonfly | grep -E 'flags|num-slaves'
+kubectl -n fire-watch exec sentinel-0 -- valkey-cli -p 26379 \
+  SENTINEL MASTER fire-watch-valkey | grep -E 'flags|num-slaves'
 # expect: flags master, num-slaves 2   (not "s_down")
 
 # 7. partition handling and eviction policy are what we think
 kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqctl environment | grep partition
-kubectl -n fire-watch exec dragonfly-0 -- redis-cli -p 6379 CONFIG GET maxmemory-policy
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 CONFIG GET maxmemory-policy
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 CONFIG GET min-replicas-to-write
 
 # 8. exactly one bridge holds the lease (D4)
 kubectl -n fire-watch get lease -o wide
 
 # 9. the master-pointing Service has exactly one endpoint
-kubectl -n fire-watch get endpoints dragonfly -o wide
+kubectl -n fire-watch get endpoints valkey -o wide
 ```
 
 Drill coverage is in [validation.md](validation.md) §1–§6; this document supplies the acceptance criteria those drills assert.

@@ -12,7 +12,7 @@ Open it with:
 - the VS Code `hediet.vscode-drawio` extension (click the file), or
 - the draw.io desktop app.
 
-The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the two Routes, the external producer and browser, and every data path with its encoding — RabbitMQ quorum queues, the `q.audit.events` write-ahead log, worker fan-out, Dragonfly replication, Sentinel quorum, and the gateway→browser WebSocket leg.
+The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the two Routes, the external producer and browser, and every data path with its encoding — RabbitMQ quorum queues, the `q.audit.events` write-ahead log, worker fan-out, Valkey replication, Sentinel quorum, and the gateway→browser WebSocket leg.
 
 ## Components
 
@@ -21,7 +21,7 @@ The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the t
 | http-ingress | 3 | external nginx (HTTP) → AMQP, 202 only after a confirm |
 | RabbitMQ | 3 | quorum queues, ingest + audit WAL |
 | Workers | 3 | consume, compress, write, ack last |
-| DragonflyDB | 3 | 1 master + 2 replicas, snapshots, no operator |
+| Valkey | 3 | 1 master + 2 replicas, AOF, no operator |
 | Redis Sentinel | 3 | master discovery and failover |
 | sentinel-bridge | 2 | applies `REPLICAOF`, patches the Service selector (lease-elected) |
 | WebSocket gateway | 3..12 | stateless fan-out, HPA |
@@ -34,7 +34,7 @@ The canvas shows the `fire-watch` namespace boundary, all 19 planned pods, the t
 - [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering
 - [Payload & Compression](docs/payload-and-compression.md) — `msg`/`msgc`, gzip at the worker
 - [RabbitMQ](docs/rabbitmq.md) — quorum cluster, peer discovery, audit queue
-- [DragonflyDB](docs/dragonfly.md) — replication, write guard, snapshots
+- [Valkey](docs/valkey.md) — replication, `min-replicas-to-write`, AOF, the `event:<key>` record model
 - [Redis Sentinel](docs/redis-sentinel.md) — failover, split-brain walkthrough
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met
 - [Workers](docs/workers.md) — ack-last ordering, idempotency, coalescing
@@ -70,8 +70,8 @@ The workflow takes an `environment` input — **`lab`** or **`prod`** — and us
 
 | Store | Names |
 |---|---|
-| Variables (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `DFLY_MASTER_NAME`, `AMQP_USER` |
-| Secrets (masked) | `AMQP_PASS`, `DRAGONFLY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` |
+| Variables (plaintext) | `NAMESPACE`, `AMQP_HOST`, `AMQP_PORT`, `VALKEY_MASTER_NAME`, `AMQP_USER` |
+| Secrets (masked) | `AMQP_PASS`, `VALKEY_PASSWORD`, `FW_INGEST_TOKEN`, `KUBECONFIG_B64` |
 
 `NAMESPACE` must match the namespace the overlay hard-codes: `fire-watch-lab` for the lab overlays, `fire-watch` for `k8s/base` and `k8s/overlays/ghcr`. The workflow refuses to run when they disagree.
 
@@ -81,16 +81,16 @@ Then run the **Deploy** workflow, picking the environment and overlay. It defaul
 
 Either path produces identical Kubernetes objects; pods read the Secret via `secretKeyRef` and never see `.env` or GitHub. `.env` is git-ignored, `.env.example` is the committed template.
 
-The script reads one file, so the Dragonfly password the pods get and the password the Sentinels seed into `sentinel.conf` are provably the same string — the old commented-out snippet in `k8s/base/kustomization.yaml` regenerated a fresh password per invocation, which would have brought the cluster up with mismatched credentials.
+The script reads one file, so the Valkey password the pods get and the password the Sentinels seed into `sentinel.conf` are provably the same string — the old commented-out snippet in `k8s/base/kustomization.yaml` regenerated a fresh password per invocation, which would have brought the cluster up with mismatched credentials.
 
 | Secret | Keys | Consumed by |
 |---|---|---|
 | `fire-watch-rabbitmq` | `password` | RabbitMQ, workers, http-ingress |
 | ConfigMap `fire-watch-rabbitmq-user` | `AMQP_USER` | the broker's account *name* — not a secret, so it is a ConfigMap |
-| `fire-watch-dragonfly` | `password` | Dragonfly `--requirepass`, all 3 Sentinels, workers, ws-gateway, sentinel-bridge, redis-exporter |
+| `fire-watch-valkey` | `password` | Valkey `requirepass`/`masterauth`, all 3 Sentinels, workers, ws-gateway, sentinel-bridge, both exporters |
 | `fire-watch-ingress` | `token` | http-ingress bearer auth |
 
-Rotation notes — including the extra Sentinel step that a Dragonfly password change needs — are in `.env`.
+Rotation notes — including the extra Sentinel step that a Valkey password change needs — are in `.env`.
 
 ### 2. Build images (on demand)
 
@@ -125,7 +125,7 @@ Still needed before a real deploy:
 | Pin real image digests | base uses tags; production requires digests |
 | ~~Create the two Secrets~~ | done — `./scripts/create-secrets.sh` reads `.env`, or use the Deploy workflow |
 | Set Variables + Secrets for both Environments | only if deploying from CI; `lab` and `prod` each need their own copy — see §1 option B |
-| Confirm node size | 48Gi Dragonfly limit needs 128 GiB nodes to reschedule ([docs/sizing.md](docs/sizing.md) §3.3) |
+| Confirm node size | 52Gi Valkey limit needs 128 GiB nodes to reschedule ([docs/sizing.md](docs/sizing.md) §3.3) |
 | `ghcr-pull` pull secret | only if deploying via `k8s/overlays/ghcr` and the packages stay private ([docs/images.md](docs/images.md) §5) |
 
 `sentinel-bridge` is implemented — [services/sentinel-bridge](services/sentinel-bridge/). It needed a container build, not a rewrite, and CI now builds it.

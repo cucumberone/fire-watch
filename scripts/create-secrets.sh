@@ -8,7 +8,7 @@
 # Idempotent: it applies, so re-running after a rotation just updates the values.
 #
 # Why a script and not the commented snippet in k8s/base/kustomization.yaml:
-# that snippet regenerates a random password on every run, so the Dragonfly pods
+# that snippet regenerates a random password on every run, so the Valkey pods
 # and the Sentinels would end up with DIFFERENT passwords and the cluster would
 # come up broken. Reading one file makes the two provably the same value.
 #
@@ -18,7 +18,7 @@
 #                    `fire-watch-rabbitmq-user` so it can be read with
 #                    `kubectl get cm` instead of a secret round-trip.
 #   AMQP_PASS        a Secret. The actual credential.
-#   DRAGONFLY_PASSWORD, FW_INGEST_TOKEN   Secrets.
+#   VALKEY_PASSWORD, FW_INGEST_TOKEN   Secrets.
 #
 # Only `password` and `token` ever enter a Secret. If a value is not a
 # credential, putting it in a Secret buys nothing and costs inspectability.
@@ -39,7 +39,7 @@ set +a
 : "${NAMESPACE:?NAMESPACE missing from .env}"
 : "${AMQP_USER:?AMQP_USER missing from .env}"
 : "${AMQP_PASS:?AMQP_PASS missing from .env}"
-: "${DRAGONFLY_PASSWORD:?DRAGONFLY_PASSWORD missing from .env}"
+: "${VALKEY_PASSWORD:?VALKEY_PASSWORD missing from .env}"
 : "${FW_INGEST_TOKEN:?FW_INGEST_TOKEN missing from .env}"
 
 DRY_RUN=0
@@ -95,8 +95,8 @@ echo "==> ConfigMap fire-watch-rabbitmq-user agrees: AMQP_USER=$cm_user" >&2
 apply_secret fire-watch-rabbitmq \
   --from-literal=password="$AMQP_PASS"
 
-apply_secret fire-watch-dragonfly \
-  --from-literal=password="$DRAGONFLY_PASSWORD"
+apply_secret fire-watch-valkey \
+  --from-literal=password="$VALKEY_PASSWORD"
 
 apply_secret fire-watch-ingress \
   --from-literal=token="$FW_INGEST_TOKEN"
@@ -106,7 +106,7 @@ echo
 echo "Done. Next:"
 echo "  kubectl apply -k k8s/overlays/lab/openshift     # or .../kubernetes"
 echo
-echo "Order matters on a FIRST install: Dragonfly reads --requirepass from the"
-echo "Secret at start, and the Sentinels read DRAGONFLY_PASSWORD when they seed"
+echo "Order matters on a FIRST install: Valkey reads --requirepass from the"
+echo "Secret at start, and the Sentinels read VALKEY_PASSWORD when they seed"
 echo "their config. Create the Secrets before the workloads, which is what this"
 echo "script does."

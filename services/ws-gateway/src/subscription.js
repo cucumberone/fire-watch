@@ -21,25 +21,29 @@ export function matchesSubscription(sub, evt) {
 }
 
 /**
- * Match a bare alert key (`source:type`) against a subscription.
+ * Match a snapshot ROW against a subscription.
  *
- * Snapshots arrive as alert rows rather than events, so they have no `source` or
- * `type` fields to compare — the key has to be split. The split is on the FIRST
- * `:` only, because a type may legitimately contain colons while a source may
- * not (alertKey builds the string as `${source}:${type}`).
+ * Rows used to arrive with keys of the form `source:type`, so this function had to
+ * split the key on its first colon to recover the two fields it filters on. That
+ * split no longer exists: the record key is an opaque 32-hex hash of device +
+ * summary (services/worker/src/keygen.js), so the fields are read directly.
+ *
+ * Passing the row rather than the key is also why this cannot silently regress: a
+ * caller that hands over a hash string instead of a row would filter on a value
+ * with no `source` field at all, which is caught by `matchesSubscription`-style
+ * behaviour below (an empty source never matches a non-empty filter).
  */
-export function matchesAlertSubscription(sub, alertKey) {
+export function matchesAlertSubscription(sub, row) {
   const sources = sub.sources || [];
   const types = sub.types || [];
   if (sources.length === 0 && types.length === 0) return true;
 
-  const s = String(alertKey);
-  const i = s.indexOf(':');
-  const source = i === -1 ? s : s.slice(0, i);
-  const type = i === -1 ? '' : s.slice(i + 1);
-
-  const sourceOk = sources.length === 0 || sources.includes(source);
-  const typeOk = types.length === 0 || types.includes(type);
+  // Tolerate a bare key or a missing row: an unknown source matches no filter,
+  // which is the safe direction (a row is hidden rather than shown to a client
+  // that asked for something else).
+  const r = row && typeof row === 'object' ? row : {};
+  const sourceOk = sources.length === 0 || sources.includes(r.source);
+  const typeOk = types.length === 0 || types.includes(r.type);
   return sourceOk && typeOk;
 }
 

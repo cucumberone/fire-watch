@@ -160,50 +160,45 @@ const body = COUNT === 1 ? thisRun : Array.from({ length: COUNT }, () => thisRun
 
 // ------------------------------------------------------------------- reset
 /**
- * Delete everything this event owns, so the next run is a first run again.
+ * Delete everything this condition owns, so the next run is a first run again.
  *
- * All five keys matter:
+ * ONE record, three indexes:
  *
- *   fw:evt:{id}            the stored record (and the transport-dedup gate)
- *   fw:fp:{fingerprint}    the CONTENT-dedup gate — while this exists, a re-run
- *                          is absorbed by the original record instead of being
- *                          stored (this is the key that must be cleared to make
- *                          a re-run create a fresh record)
- *   fw:alert:{key}         the alert record, including state=closed
- *   fw:alert:open:{key}    the "is it firing" flag
- *   fw:idx:alert:open      the snapshot index — leaving a member here means a
- *                          closed alert reappears on the next page load
+ *   event:{key}        the record itself — payload, count, state, ack
+ *   idx:event:all      the global timeline
+ *   idx:event:open     the snapshot index. Leaving a member here means a closed
+ *                      condition reappears on the next page load.
+ *   idx:event:closed   the Closed tab's index
  *
- * Run through kubectl + redis-cli rather than the app, deliberately: there is no
- * HTTP endpoint that deletes an event, and inventing one for a test helper would
- * add a destructive route to a service that must not have one.
+ * There is no fingerprint key to clear any more. It existed because the record was
+ * keyed by the MESSAGE id, so "the same condition again" needed a second key to
+ * detect. The record is keyed by the CONDITION now, so deleting the record IS
+ * clearing the dedup state — which is why this list is shorter, not longer.
+ *
+ * Run through kubectl + valkey-cli rather than the app, deliberately: there is no
+ * HTTP endpoint that deletes an event, and inventing one for a test helper would add
+ * a destructive route to a service that must not have one.
  */
 if (RESET) {
-  const pw = env.DRAGONFLY_PASSWORD || '';
+  const pw = env.VALKEY_PASSWORD || '';
   if (!pw) {
-    console.error('send-same-event.mjs: --reset needs DRAGONFLY_PASSWORD in .env');
+    console.error('send-same-event.mjs: --reset needs VALKEY_PASSWORD in .env');
     process.exit(2);
   }
   const ns = env.NAMESPACE || 'fire-watch-lab';
-  // The alert key and the fingerprint must be computed by the SAME code the
-  // ingress and worker use, or this deletes keys that do not exist and the
-  // re-run is still absorbed. Import the real functions rather than re-deriving.
+  // The record key must be computed by the SAME code the worker uses, or this
+  // deletes a key that does not exist and the re-run is still folded into the
+  // original. Import the real function rather than re-deriving the hash.
   const { fromUpstream } = await import('../services/http-ingress/src/normalise.js');
-  const { contentFingerprint } = await import('../services/worker/src/event.js');
+  const { bareKeyFor } = await import('../services/worker/src/keygen.js');
   const canonical = fromUpstream(EVENT);
-  const key = `${canonical.source}:${canonical.type}`;
-  const fp = contentFingerprint(canonical);
+  const key = bareKeyFor(canonical);
   const script = [
-    `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw del`,
-    `fw:evt:${canonical.id}`,
-    // The content-dedup gate. Without this, a re-run is absorbed by the original
-    // record instead of creating a new one, which is correct behaviour but not
-    // what --reset is being asked for.
-    `fw:fp:${fp}`,
-    `fw:alert:${key}`,
-    `fw:alert:open:${key}`,
+    `valkey-cli -p 6379 --no-auth-warning -a '${pw}' --raw del`,
+    `event:${key}`,
     `> /dev/null;`,
-    `redis-cli -p 6379 --no-auth-warning -a '${pw}' --raw zrem fw:idx:alert:open '${key}' > /dev/null;`,
+    `valkey-cli -p 6379 --no-auth-warning -a '${pw}' --raw zrem`,
+    `idx:event:all idx:event:open idx:event:closed '${key}' > /dev/null;`,
     `echo reset-ok`,
   ].join(' ');
 
@@ -211,7 +206,7 @@ if (RESET) {
   try {
     out = execFileSync(
       'kubectl',
-      ['-n', ns, 'exec', 'dragonfly-0', '-c', 'dragonfly', '--', 'sh', '-c', script],
+      ['-n', ns, 'exec', 'valkey-0', '-c', 'valkey', '--', 'sh', '-c', script],
       { encoding: 'utf8', timeout: 20000 },
     ).trim();
   } catch (err) {
@@ -222,7 +217,7 @@ if (RESET) {
     console.error(`send-same-event.mjs: --reset produced no confirmation: ${out}`);
     process.exit(1);
   }
-  console.log(`reset: cleared event ${canonical.id} and alert ${key}`);
+  console.log(`reset: cleared record ${key} and its three index members`);
 }
 
 const res = await fetch(url, {

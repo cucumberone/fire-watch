@@ -13,9 +13,9 @@ data:
     dir /data
     sentinel resolve-hostnames yes
     sentinel announce-hostnames yes
-    sentinel monitor fire-watch-dragonfly dragonfly-0.dragonfly-headless.fire-watch-lab.svc.cluster.local 6379 1
-    sentinel auth-pass fire-watch-dragonfly __DRAGONFLY_PASSWORD__
-    sentinel down-after-milliseconds fire-watch-dragonfly 5000
-    sentinel failover-timeout fire-watch-dragonfly 60000
-    sentinel parallel-syncs fire-watch-dragonfly 1
+    sentinel monitor fire-watch-valkey valkey-0.valkey-headless.fire-watch-lab.svc.cluster.local 6379 1
+    sentinel auth-pass fire-watch-valkey __VALKEY_PASSWORD__
+    sentinel down-after-milliseconds fire-watch-valkey 5000
+    sentinel failover-timeout fire-watch-valkey 60000
+    sentinel parallel-syncs fire-watch-valkey 1
     sentinel deny-scripts-reconfig yes

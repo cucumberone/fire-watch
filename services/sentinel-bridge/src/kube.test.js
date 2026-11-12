@@ -5,7 +5,7 @@
  * Regression covered: @kubernetes/client-node 0.22.x takes POSITIONAL arguments
  * and resolves to an envelope `{ response, body }`. The code originally used the
  * v1.x object form and read `.items` off the envelope, so it silently saw zero
- * pods and the bridge logged "no dragonfly pods found" on a healthy cluster while
+ * pods and the bridge logged "no valkey pods found" on a healthy cluster while
  * holding the leader lease. Nothing threw; the wrong answer simply looked like an
  * empty cluster. These tests fail if either half of that returns.
  *
@@ -24,7 +24,7 @@ const silentLog = {
 
 function pod(name, ip = '10.0.0.1') {
   return {
-    metadata: { name, labels: { 'app.kubernetes.io/name': 'dragonfly' } },
+    metadata: { name, labels: { 'app.kubernetes.io/name': 'valkey' } },
     spec: { nodeName: 'node1' },
     status: {
       podIP: ip,
@@ -39,11 +39,11 @@ test('listPods passes the selector positionally, not as an object', async () => 
     async listNamespacedPod(...args) {
       seen.push(args);
       // The real client resolves to this envelope shape.
-      return { response: { statusCode: 200 }, body: { items: [pod('dragonfly-0')] } };
+      return { response: { statusCode: 200 }, body: { items: [pod('valkey-0')] } };
     },
   };
 
-  const items = await listPods(core, 'fire-watch-lab', 'app.kubernetes.io/name=dragonfly');
+  const items = await listPods(core, 'fire-watch-lab', 'app.kubernetes.io/name=valkey');
 
   assert.equal(seen.length, 1);
   const args = seen[0];
@@ -51,11 +51,11 @@ test('listPods passes the selector positionally, not as an object', async () => 
   assert.equal(typeof args[0], 'string', 'namespace must be positional arg 0');
   assert.equal(args[0], 'fire-watch-lab');
   // labelSelector is the 6th positional parameter (index 5).
-  assert.equal(args[5], 'app.kubernetes.io/name=dragonfly');
+  assert.equal(args[5], 'app.kubernetes.io/name=valkey');
 
   // And the envelope must have been unwrapped.
   assert.equal(items.length, 1);
-  assert.equal(items[0].metadata.name, 'dragonfly-0');
+  assert.equal(items[0].metadata.name, 'valkey-0');
 });
 
 test('listPods returns ordinal order', async () => {
@@ -64,16 +64,16 @@ test('listPods returns ordinal order', async () => {
       return {
         response: { statusCode: 200 },
         body: {
-          items: [pod('dragonfly-2'), pod('dragonfly-0'), pod('dragonfly-1')],
+          items: [pod('valkey-2'), pod('valkey-0'), pod('valkey-1')],
         },
       };
     },
   };
   const items = await listPods(core, 'ns', 'sel');
   assert.deepEqual(items.map((p) => p.metadata.name), [
-    'dragonfly-0',
-    'dragonfly-1',
-    'dragonfly-2',
+    'valkey-0',
+    'valkey-1',
+    'valkey-2',
   ]);
 });
 
@@ -93,12 +93,12 @@ test('patchEndpoints uses the positional replace signature', async () => {
     },
   };
 
-  const pods = new Map([['dragonfly-0', pod('dragonfly-0', '10.0.0.7')]]);
-  await patchEndpoints(core, 'fire-watch-lab', 'dragonfly', ['dragonfly-0'], pods, { dragonflyPort: 6379 }, silentLog);
+  const pods = new Map([['valkey-0', pod('valkey-0', '10.0.0.7')]]);
+  await patchEndpoints(core, 'fire-watch-lab', 'valkey', ['valkey-0'], pods, { valkeyPort: 6379 }, silentLog);
 
   assert.equal(calls.length, 1);
   const [name, namespace, body] = calls[0];
-  assert.equal(name, 'dragonfly');
+  assert.equal(name, 'valkey');
   assert.equal(namespace, 'fire-watch-lab');
   assert.equal(body.subsets[0].addresses[0].ip, '10.0.0.7');
   assert.equal(body.subsets[0].ports[0].port, 6379);
@@ -112,7 +112,7 @@ test('an empty endpoint list is published as no subsets (write guard)', async ()
       return { response: { statusCode: 200 }, body: {} };
     },
   };
-  await patchEndpoints(core, 'ns', 'dragonfly', [], new Map(), { dragonflyPort: 6379 }, silentLog);
+  await patchEndpoints(core, 'ns', 'valkey', [], new Map(), { valkeyPort: 6379 }, silentLog);
   assert.deepEqual(calls[0][2].subsets, []);
 });
 
@@ -121,7 +121,7 @@ test('endpoints === null leaves the Service untouched', async () => {
   const core = {
     async replaceNamespacedEndpoints() { called = true; },
   };
-  await patchEndpoints(core, 'ns', 'dragonfly', null, new Map(), { dragonflyPort: 6379 }, silentLog);
+  await patchEndpoints(core, 'ns', 'valkey', null, new Map(), { valkeyPort: 6379 }, silentLog);
   assert.equal(called, false, 'a null plan must not rewrite Endpoints');
 });
 
@@ -137,8 +137,8 @@ test('a 404 on replace creates the Endpoints positionally', async () => {
     },
   };
 
-  const pods = new Map([['dragonfly-0', pod('dragonfly-0', '10.0.0.9')]]);
-  await patchEndpoints(core, 'fire-watch-lab', 'dragonfly', ['dragonfly-0'], pods, { dragonflyPort: 6379 }, silentLog);
+  const pods = new Map([['valkey-0', pod('valkey-0', '10.0.0.9')]]);
+  await patchEndpoints(core, 'fire-watch-lab', 'valkey', ['valkey-0'], pods, { valkeyPort: 6379 }, silentLog);
 
   assert.equal(created.length, 1);
   assert.equal(created[0][0], 'fire-watch-lab', 'namespace is positional arg 0');
@@ -154,11 +154,11 @@ test('setWritableLabel uses the positional patch signature', async () => {
     },
   };
 
-  await setWritableLabel(core, 'fire-watch-lab', 'dragonfly-0', true, 'fire-watch.io/writable', silentLog);
+  await setWritableLabel(core, 'fire-watch-lab', 'valkey-0', true, 'fire-watch.io/writable', silentLog);
 
   assert.equal(calls.length, 1);
   const [name, namespace, body] = calls[0];
-  assert.equal(name, 'dragonfly-0');
+  assert.equal(name, 'valkey-0');
   assert.equal(namespace, 'fire-watch-lab');
   assert.equal(body.metadata.labels['fire-watch.io/writable'], 'true');
 });

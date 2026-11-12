@@ -34,7 +34,7 @@ export function createKube() {
  *      callers then treat as "zero results".
  *
  * Both bugs shipped here: `listPods` used the object form, so `.items` was
- * undefined and the bridge reported "no dragonfly pods found" on a healthy
+ * undefined and the bridge reported "no valkey pods found" on a healthy
  * 1-pod cluster while holding the leader lease.
  *
  * This helper exists so there is exactly one place where the shape is handled.
@@ -43,7 +43,7 @@ function unwrap(res) {
   return res?.body ?? res;
 }
 
-/** List the Dragonfly pods, in ordinal order. */
+/** List the Valkey pods, in ordinal order. */
 export async function listPods(core, namespace, labelSelector) {
   // listNamespacedPod(namespace, pretty, allowWatchBookmarks, _continue,
   //                   fieldSelector, labelSelector, limit, resourceVersion, ...)
@@ -62,7 +62,7 @@ export async function listPods(core, namespace, labelSelector) {
 }
 
 /**
- * Read one pod's replication state directly from Dragonfly.
+ * Read one pod's replication state directly from Valkey.
  *
  * The bridge talks to the pod IP because it is a control-plane component; the
  * rule that applications must not use pod IPs (docs/redis-sentinel.md §5) is
@@ -81,8 +81,8 @@ export async function readRole(pod, cfg, log) {
 
   const client = new Redis({
     host: ip,
-    port: cfg.dragonflyPort,
-    password: cfg.dragonflyPassword,
+    port: cfg.valkeyPort,
+    password: cfg.valkeyPassword,
     lazyConnect: true,
     connectTimeout: 2000,
     maxRetriesPerRequest: 1,
@@ -131,8 +131,8 @@ export async function applyReplicaOf(podIps, podName, target, cfg, log) {
   }
   const client = new Redis({
     host: ip,
-    port: cfg.dragonflyPort,
-    password: cfg.dragonflyPassword,
+    port: cfg.valkeyPort,
+    password: cfg.valkeyPassword,
     lazyConnect: true,
     connectTimeout: 2000,
     maxRetriesPerRequest: 1,
@@ -159,8 +159,8 @@ export async function applyReplicaOfNoOne(podIps, podName, cfg, log) {
   if (!ip) return false;
   const client = new Redis({
     host: ip,
-    port: cfg.dragonflyPort,
-    password: cfg.dragonflyPassword,
+    port: cfg.valkeyPort,
+    password: cfg.valkeyPassword,
     lazyConnect: true,
     connectTimeout: 2000,
     maxRetriesPerRequest: 1,
@@ -205,7 +205,7 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
       ? [
           {
             addresses,
-            ports: [{ name: 'client', port: cfg.dragonflyPort, protocol: 'TCP' }],
+            ports: [{ name: 'client', port: cfg.valkeyPort, protocol: 'TCP' }],
           },
         ]
       : [],
@@ -222,7 +222,7 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
       const created = {
         apiVersion: 'v1',
         kind: 'Endpoints',
-        metadata: { name, namespace, labels: { 'app.kubernetes.io/name': 'dragonfly' } },
+        metadata: { name, namespace, labels: { 'app.kubernetes.io/name': 'valkey' } },
         ...body,
       };
       try {

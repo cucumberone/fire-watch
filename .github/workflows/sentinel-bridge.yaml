@@ -110,7 +110,7 @@ jobs:
             type=raw,value=latest,enable=${{ inputs.push_latest }}
           labels: |
             org.opencontainers.image.title=fire-watch sentinel-bridge
-            org.opencontainers.image.description=fire-watch event server — Sentinel to Dragonfly reconciler
+            org.opencontainers.image.description=fire-watch event server — Sentinel to Valkey reconciler
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 

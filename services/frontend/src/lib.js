@@ -564,7 +564,7 @@ export function insertEvent(list, evt, limit) {
  *   Live events  — "what arrived", so an absorbed repeat is a distinct row
  *                  (same id, new arrival time) and belongs on screen.
  *   All events   — "what is stored", which is one record per id in
- *                  `fw:evt:{id}`. An repeat the worker absorbed was never
+ *                  `event:<key>`. A repeat the worker folded in never
  *                  stored, so adding it would invent a row the tab's own
  *                  query would never return.
  *

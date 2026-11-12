@@ -10,7 +10,7 @@
 # story is silently absent.
 #
 # The base config is a ConfigMap, so this patches the *file content* rather than
-# a flag list — same approach as dragonfly-lab.yaml.
+# a flag list — same approach as valkey-lab.yaml.
 apiVersion: v1
 kind: ConfigMap
 metadata:

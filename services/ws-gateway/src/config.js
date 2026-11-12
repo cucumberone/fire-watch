@@ -25,8 +25,9 @@ export function loadConfig() {
         if (!host || !port) throw new Error(`malformed SENTINELS entry: ${s}`);
         return { host, port: Number(port) };
       }),
-    masterName: required('DFLY_MASTER_NAME'),
-    dragonflyPassword: required('DRAGONFLY_PASSWORD'),
+    // The Sentinel monitor name (k8s/base/30-sentinel-config.yaml).
+    masterName: required('VALKEY_MASTER_NAME'),
+    valkeyPassword: required('VALKEY_PASSWORD'),
 
     channelEvents: required('FW_CHANNEL_EVENTS'),
     channelAlerts: required('FW_CHANNEL_ALERTS'),
@@ -103,10 +104,26 @@ export function loadConfig() {
   };
 }
 
+/**
+ * Valkey key names. Mirrors services/worker/src/config.js — one record per
+ * CONDITION, at `event:<32 hex>`.
+ *
+ * The gateway does NOT derive the key from an event: it receives the bare key from
+ * the worker over pub/sub and from the browser over the socket. Two independent
+ * derivations is how the two would drift, and a drifted key is a row that renders
+ * for nobody.
+ */
 export const keys = {
-  index: (source) => `fw:idx:src:${source}`,
-  event: (id) => `fw:evt:${id}`,
-  // Maintained by the worker's alert fold, scored by `closed_at`. Read-only here:
-  // the gateway performs exactly one write in the whole system (an ack).
-  alertClosedIndex: 'fw:idx:alert:closed',
+  /** Per-device timeline. */
+  sourceIndex: (source) => `idx:source:${source}`,
+  /** Global timeline, scored by last broker ts. Backs All events. */
+  eventAllIndex: 'idx:event:all',
+  /** Open conditions. Maintained by the fold; read-only here. */
+  eventOpenIndex: 'idx:event:open',
+  /** Retired conditions, scored by `closedAt`. */
+  eventClosedIndex: 'idx:event:closed',
+  /** The record itself. `bare` has no prefix. */
+  event: (bare) => `event:${bare}`,
+  /** Operator journal, a LIST per record. Separate from the hash on purpose. */
+  journal: (bare) => `journal:${bare}`,
 };

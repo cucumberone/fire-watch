@@ -61,7 +61,7 @@ channel_max                          = 2047
 
 - `default_queue_type = quorum` guarantees any queue declared without `x-queue-type` is a quorum queue. Classic queues are non-replicated and cannot satisfy R1.
 - `cluster_partition_handling = pause_minority` is required for split-brain safety on 3 nodes: a node that cannot reach a majority of peers **stops serving** rather than answering from a stale view ([fault-tolerance.md](fault-tolerance.md) §3.8). The default `ignore` would let an isolated node keep accepting publishes that can never reach a quorum queue.
-- **No `x-delivery-limit` on `q.event.ingest`.** A delivery limit combined with `nack(requeue=true)` dead-letters events that were never written — silent data loss during any Dragonfly outage longer than 10 retries ([fault-tolerance.md](fault-tolerance.md) §3.1).
+- **No `x-delivery-limit` on `q.event.ingest`.** A delivery limit combined with `nack(requeue=true)` dead-letters events that were never written — silent data loss during any Valkey outage longer than 10 retries ([fault-tolerance.md](fault-tolerance.md) §3.1).
 - Quorum queues need **2 of 3 members online** to accept publishes. Publishing is refused while only 1 node is up — this is the intended behaviour, not a bug.
 - Publishers **must** use publisher confirms. A publish without a confirm can be silently dropped when the connection dies. Worker/gateway code must not `basic_publish` without `confirm.select`.
 
@@ -120,22 +120,22 @@ Do **not** use `check_port_connectivity` or a cluster-wide check for liveness.
 
 ### 6.1 Audit queue (durability, not delivery)
 
-`q.audit.events` is the write-ahead log that makes R1 achievable without Dragonfly AOF.
+`q.audit.events` is the write-ahead log that makes R1 achievable without Valkey AOF.
 
 ```yaml
 # in definitions.json
 q.audit.events:
   arguments:
     x-queue-type: quorum
-    x-message-ttl: 604800000              # 7 days — matches Dragonfly retention
+    x-message-ttl: 604800000              # 7 days — matches Valkey retention
     x-max-length-bytes: 68719476736        # 64GiB
     x-overflow: reject-publish              # never drop the newest events silently
 ```
 
 - Written by the worker **before** it acks the ingest message ([persistence-and-durability.md](persistence-and-durability.md) §4.1).
-- No steady-state consumers. A `replay-gap` Job drains it non-destructively after a Dragonfly restore.
-- Because the sustained volume is only ≈2.75 GiB/day (1 000/min × 2 048 B), the WAL can cover the **same 7 days as Dragonfly** — ≈19.3 GiB total. That means a total PVC loss is recoverable for the full retention window. At the 64GiB cap there is **3.3x slack**.
-- `x-message-ttl: 7d` must match `FW_EVENT_TTL`. If the Dragonfly TTL is ever shortened, shorten this too, or the queue holds more history than the cache can serve.
+- No steady-state consumers. A `replay-gap` Job drains it non-destructively after a Valkey restore.
+- Because the sustained volume is only ≈2.75 GiB/day (1 000/min × 2 048 B), the WAL can cover the **same 7 days as Valkey** — ≈19.3 GiB total. That means a total PVC loss is recoverable for the full retention window. At the 64GiB cap there is **3.3x slack**.
+- `x-message-ttl: 7d` must match `FW_EVENT_TTL`. If the Valkey TTL is ever shortened, shorten this too, or the queue holds more history than the cache can serve.
 - `x-max-length-bytes` is the hard backstop: a sustained burst that exceeds 3x the design volume trips `reject-publish` and surfaces as ingest backpressure rather than silent audit loss.
 - `x-overflow: reject-publish` is deliberate: when the audit queue is full the audit publish fails, the ingest message is requeued, and the backlog becomes visible instead of silent data loss.
 - Monitoring: `rabbitmq_quorum_queue_messages_ready{q.queue="q.audit.events"}` on a slow upward trend means the audit window is filling faster than it is being trimmed. Alert at 70% of `x-max-length-bytes` and on `> 6 days` of queued messages when the design window is 7 days.

@@ -12,6 +12,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { gzipSync } from 'node:zlib';
+// The record key is a hash of device + summary, and it is computed by the same
+// module the worker uses. Re-deriving it here would let the harness drift from the
+// real key, which would make every local test of the join pass while the deployed
+// one failed.
+import { bareKeyFor } from '../worker/src/keygen.js';
 
 const PORT = Number(process.env.PORT || 5599);
 // Module-relative, NOT cwd-relative: the terminal may run this from anywhere.
@@ -92,23 +97,30 @@ function mkEvent(i, overrides = {}) {
     CLOSE: 'CLEAR',
     CLEAR: 'CLOSE',
   }[internal] ?? internal;
+  const source = SOURCES[i % SOURCES.length];
+  const summary = [
+    'uplink flapping on port Gi0/24',
+    'PSU 2 input voltage out of range',
+    'inlet temperature 41.2C above threshold',
+    'SMART predictive failure on /dev/sda',
+    'link restored after 3 retries',
+    'operator acknowledged and closed',
+  ][i % 6];
   return {
     id: `evt-${i}`,
-    source: SOURCES[i % SOURCES.length],
+    // The record key the real worker publishes. Computed with the real keygen
+    // module so the harness cannot drift from the deployed key: the frontend joins
+    // the live tail and the board on this value, so a mock that invented its own
+    // would pass locally and break in production.
+    key: bareKeyFor({ source, payload: { msg: overrides.payload?.msg ?? summary } }),
+    source,
     type: TYPES[i % TYPES.length],
     severity: internal,
     ts: new Date(first).toISOString(),
     brokerTs: first,
     payload: {
       EVT_Severity: producerSeverity,
-      msg: [
-        'uplink flapping on port Gi0/24',
-        'PSU 2 input voltage out of range',
-        'inlet temperature 41.2C above threshold',
-        'SMART predictive failure on /dev/sda',
-        'link restored after 3 retries',
-        'operator acknowledged and closed',
-      ][i % 6],
+      msg: overrides.payload?.msg ?? summary,
       FirstOccurrence: new Date(first).toISOString(),
       LastOccurrence: new Date(first + 30_000).toISOString(),
       // No `Count`. The real ingress never emits one, and the mock fabricating
@@ -137,7 +149,7 @@ function mkEvent(i, overrides = {}) {
 }
 
 // Ack state, shared across sockets the way the real gateway shares it through
-// fw:alert:{key} in Dragonfly.
+// event:{key} in Valkey.
 const acks = new Map();
 
 // One shared timer so every socket sees the same simulated database flip, rather
@@ -151,15 +163,15 @@ let devserverDbTimer = null;
  * idempotent with respect to the live demo stream: if it answered with a fixed
  * set it would resurrect rows the stream had just retired, and the local
  * behaviour would disagree with the real gateway (which derives the set from
- * `fw:idx:alert:open`). That makes the harness useless for the exact bug this
+ * `idx:event:open`). That makes the harness useless for the exact bug this
  * feature exists to fix.
  */
 const openAlerts = new Map();
 
 /** Apply a fold-like outcome to the mock's open set. */
 function foldMock(evt, applied) {
-  if (!evt?.source || !evt?.type) return;
-  const key = `${evt.source}:${evt.type}`;
+  const key = evt?.key;
+  if (!key) return;
   if (applied === 3) { openAlerts.delete(key); return; }
   if (applied === 1 || applied === 2) {
     const prev = openAlerts.get(key);
@@ -212,7 +224,7 @@ function logMockEvent(evt) {
 
 // Seed the log at load, NOT inside the subscribe handler.
 //
-// The real gateway answers `op: allEvents` from Dragonfly, where the events exist
+// The real gateway answers `op: allEvents` from Valkey, where the records exist
 // whether or not anyone is connected. Seeding on subscribe made the mock answer an
 // early query with ZERO rows and then populate a second later — which is exactly
 // how a client that asks too early looks correct in the harness and empty in
@@ -261,8 +273,8 @@ for (let i = 0; i < 14; i += 1) logMockEvent(mkEvent(i));
 }
 
 function retireMock(evt, applied) {
-  if (applied !== 3 || !evt?.source || !evt?.type) return;
-  const key = `${evt.source}:${evt.type}`;
+  if (applied !== 3 || !evt?.key) return;
+  const key = evt.key;
   const open = openAlerts.get(key);
   const closedAt = evt.brokerTs ?? Date.now();
   if (!closedMock.has(key)) {
@@ -335,7 +347,7 @@ wss.on('connection', async (ws) => {
     }
 
     // ---- op: resync — re-send the authoritative open set, mirroring
-    // handleResync in the gateway. The real one reads fw:idx:alert:open; this
+    // handleResync in the gateway. The real one reads idx:event:open; this
     // mock has no alert store, so it reports whatever the demo believes is open.
     // The point of supporting it at all is that the client must not sit waiting
     // for a reply that never comes when developing locally.
@@ -349,7 +361,7 @@ wss.on('connection', async (ws) => {
       const key = frameIn.key;
       const text = typeof frameIn.text === 'string' ? frameIn.text.trim() : '';
       if (typeof key !== 'string' || !key.includes(':')) {
-        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be source:type' }));
+        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be a 32-hex record key' }));
         return;
       }
       if (text === '') {
@@ -402,7 +414,7 @@ wss.on('connection', async (ws) => {
     if (frameIn.op === 'close') {
       const key = frameIn.key;
       if (typeof key !== 'string' || !key.includes(':')) {
-        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be source:type' }));
+        ws.send(JSON.stringify({ op: 'error', code: 'bad_key', message: 'key must be a 32-hex record key' }));
         return;
       }
       const open = openAlerts.get(key);
@@ -497,10 +509,10 @@ wss.on('connection', async (ws) => {
         .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
       const page = rows.slice(0, limit);
       // Join the alert state the way the real gateway does: the EVENT has no state,
-      // the ALERT (`source:type`) does. A key in openAlerts is open; one in
+      // the RECORD does. A key in openAlerts is open; one in
       // closedMock is closed; neither means unknown.
       const withState = page.map((e) => {
-        const key = `${e.source}:${e.type}`;
+        const key = e.key;
         const isOpen = openAlerts.has(key);
         const closed = closedMock.get(key);
         const row = isOpen ? openAlerts.get(key) : closed;
@@ -557,7 +569,7 @@ wss.on('connection', async (ws) => {
       await new Promise((r) => setTimeout(r, 15));
     }
     ws.send(JSON.stringify({ op: 'hello', server: 'ws-gateway-demo', backfill: history.length, truncated: false,
-      // The real gateway reports Dragonfly health here and on every transition.
+      // The real gateway reports Valkey health here and on every transition.
       // Sending it keeps the two-chip header exercisable in the harness.
       db: { up: true, checkedAt: Date.now() } }));
 

@@ -121,7 +121,7 @@ The traffic comes from **outside** the cluster, which changes the calculus:
 | Route | works, but adds the router as a hop and inherits its 30s timeout. A large batch under confirm pressure could exceed it |
 | LoadBalancer | needs a cloud provider or MetalLB; more moving parts for the same result |
 
-Nothing else is exposed. RabbitMQ, Dragonfly and Sentinel stay ClusterIP-only.
+Nothing else is exposed. RabbitMQ, Valkey and Sentinel stay ClusterIP-only.
 
 The Service is `NodePort` with a **fixed** port so the external nginx config is a constant.
 

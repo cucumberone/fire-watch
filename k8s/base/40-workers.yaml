@@ -17,7 +17,7 @@ spec:
       labels:
         app.kubernetes.io/name: worker
       annotations:
-        # Bumped by hand whenever `alert-fold.lua` changes.
+        # Bumped by hand whenever `event-fold.lua` changes.
         #
         # A ConfigMap volume is updated in place by kubelet, but the PROCESS is
         # not restarted and `FoldScript` only re-reads the file when its mtime or
@@ -30,7 +30,12 @@ spec:
         # This is not hypothetical. A worker that passed four keys to a three-key
         # script retired alerts silently and wrote no closed index, so the Closed
         # tab read "nothing has closed" with no error anywhere.
-        fire-watch/alert-fold-checksum: "3"
+        #
+        # 4: the Valkey rewrite. The script now takes FIVE keys (the event hash,
+        # the global index, BOTH state indexes and the per-source index) and
+        # applies record fields from ARGV, because one hash per condition replaced
+        # the old evt-hash + alert-hash pair.
+        fire-watch/event-fold-checksum: "4"
     spec:
       terminationGracePeriodSeconds: 60
       securityContext:
@@ -81,30 +86,26 @@ spec:
             - { name: AMQP_AUDIT_KEY,       value: event.audit }
             - { name: AMQP_PREFETCH,        value: "32" }
 
-            # ---- Dragonfly (Sentinel-aware, never a pod IP) --------------
-            - { name: SENTINELS,           value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
-            - { name: DFLY_MASTER_NAME,    value: fire-watch-dragonfly }
-            - name: DRAGONFLY_PASSWORD
+            # ---- Valkey (Sentinel-aware, never a pod IP) ------------------
+            - { name: SENTINELS,          value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
+            - { name: VALKEY_MASTER_NAME, value: fire-watch-valkey }
+            - name: VALKEY_PASSWORD
               valueFrom:
-                secretKeyRef: { name: fire-watch-dragonfly, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }
 
             # ---- behaviour ----------------------------------------------
             - { name: FW_EVENT_TTL,            value: "604800" }
             - { name: FW_INDEX_PRUNE_EVERY,    value: "1000" }
-            # Repair fw:idx:evt:all against the per-source indexes at startup.
+            # Repair idx:event:all against the per-source indexes at startup.
             # Records written before that index existed are in storage and absent
             # from it, so the All events tab could not list them (measured: 3 index
             # members for 7 records). Bounded, skipped when the gap is zero, and
             # non-fatal so ingestion never depends on it (docs/workers.md §4.2).
             - { name: FW_INDEX_RECONCILE,      value: "1" }
             - { name: FW_INDEX_RECONCILE_MAX,  value: "50000" }
-            # Kept for wire compatibility only: the coalescing window was removed,
-            # so this value no longer changes how events are counted. A redelivered
-            # event is dropped by the fold's (timestamp, id) watermark instead.
-            - { name: FW_ALERT_DEDUP_WINDOW,   value: "300000" }
             - { name: FW_COMPRESS_MIN,         value: "1024" }
             - { name: FW_COMPRESS_LEVEL,       value: "6" }
-            - { name: FW_FOLD_SCRIPT,          value: /opt/fold/alert-fold.lua }
+            - { name: FW_FOLD_SCRIPT,          value: /opt/fold/event-fold.lua }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits:   { cpu: 500m, memory: 512Mi }
@@ -139,6 +140,6 @@ spec:
       volumes:
         - name: fold
           configMap:
-            name: alert-fold
+            name: event-fold
         - name: tmp
           emptyDir: {}

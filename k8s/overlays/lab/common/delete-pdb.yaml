@@ -12,7 +12,7 @@ $patch: delete
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: dragonfly
+  name: valkey
 $patch: delete
 ---
 apiVersion: policy/v1

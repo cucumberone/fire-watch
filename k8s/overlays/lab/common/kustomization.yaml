@@ -27,7 +27,7 @@ patches:
   - path: delete-monitoring.yaml
 
   # ---- component configuration for a single-node install
-  - path: dragonfly-lab.yaml
+  - path: valkey-lab.yaml
   - path: sentinel-lab.yaml
   - path: bridge-lab.yaml
   # Peer discovery must look in fire-watch-lab, not the base's fire-watch.

@@ -9,7 +9,7 @@ This repo sets up an event server.
 - **100% H/A** for every component, and it must handle split brain for every component.
   - 3 replicas on different nodes.
   - Must handle eviction / deletion of pods etc.
-- **Dragonfly operator is off the table.** Make it work with manifests.
+- **Valkey operator is off the table.** Make it work with manifests.
 - **WebSocket node deployment** acting as server for web clients. Can scale with HPA or whatever it is called.
 - **React frontend** talking to the node websocket server for visualization.
 
@@ -17,12 +17,13 @@ This repo sets up an event server.
 
 - Create manifests that fit OpenShift (i.e. **routes instead of ingress**) in the `k8s` directory.
 - **RabbitMQ:** 3 replicas of the latest RabbitMQ server with quorum queues and affinity so they never run on the same node.
-- **DragonflyDB:** 3 replicas. They need the "always find 2 replicas" setting to receive writes — split brain protection.
-- **Workers:** 3 replicas getting messages from RabbitMQ. For now, write a small JavaScript service that writes whatever comes to the worker into Dragonfly.
+- **Valkey:** 3 replicas. They need the "always find 2 replicas" setting to receive writes — split brain protection. That is `min-replicas-to-write 2`, enforced by the engine; the lab runs **1 replica** with it set to `0`.
+- **One record per condition.** The Valkey key is derived from `EVT_Device` + `EVT_Summary` (`event:<sha256[0:32]>`), so a duplicate is dropped by updating `lastSeen` / `count` on the existing hash instead of storing a second record.
+- **Workers:** 3 replicas getting messages from RabbitMQ. For now, write a small JavaScript service that writes whatever comes to the worker into Valkey.
 - **Probes:** if you see the need for readiness probes, create them and handle them.
-- **Dragonfly persistence:** use the AOF feature, but every hour refresh that file with a new one from what's left in Dragonfly. This is to make restart and reread fast.
+- **Valkey persistence:** use the AOF feature, but every hour refresh that file with a new one from what's left in Valkey. This is to make restart and reread fast. Implemented as `appendonly yes` + `appendfsync everysec` with an hourly `BGREWRITEAOF` sidecar.
 - **Redis Sentinels:** needed for the workers, I think.
-- **Sizing:** 1 000 events/min sustained (500/s storm peaks), 7-day retention — see [docs/sizing.md](docs/sizing.md), which shows this needs ~48 GiB per Dragonfly pod.
+- **Sizing:** 1 000 events/min sustained (500/s storm peaks), 7-day retention — see [docs/sizing.md](docs/sizing.md), which shows this needs ~52 GiB limit per Valkey pod.
 
 ## Plan
 
@@ -34,12 +35,12 @@ This repo sets up an event server.
 - [Architecture](docs/architecture.md) — components, data flow, message contract, failure matrix
 - [Event Schema](docs/event-schema.md) — the producer contract (`EVT_*`), severity mapping, validation rules
 - [Fault Tolerance Audit](docs/fault-tolerance.md) — per-component H/A and split-brain verification, 9 defects found and fixed
-- [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, redelivery safety
+- [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, content-keyed dedup, redelivery safety
 - [Acknowledgement](docs/acknowledge.md) — operator ack, the one gateway write, cleared on re-fire
 - [Operator Journal](docs/journal.md) — right-click notes per incident, append-only, signed, and the audit copy that makes them durable
 - [Payload & Compression](docs/payload-and-compression.md) — `msg` / `msgc`, gzip at the worker, `DecompressionStream` in the browser
 - [RabbitMQ](docs/rabbitmq.md) — 3-node quorum cluster, peer discovery, anti-affinity, probes
-- [DragonflyDB](docs/dragonfly.md) — master + 2 replicas, write guard, snapshots, sizing
+- [Valkey](docs/valkey.md) — master + 2 replicas, `min-replicas-to-write`, AOF, the `event:<key>` record model, the Lua fold, sizing
 - [Redis Sentinel](docs/redis-sentinel.md) — failover, `sentinel-bridge`, split-brain walkthrough
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
 - [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
@@ -47,7 +48,7 @@ This repo sets up an event server.
 - [Frontend](docs/frontend.md) — static React + MUI app, two Routes, CSP
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
 - [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms
-- [Monitoring](docs/monitoring.md) — 21 alerts, the redis-exporter, and two Dragonfly metric names that were wrong
+- [Monitoring](docs/monitoring.md) — the alert set, the two exporters (Sentinel and master), and the metric names that were wrong before
 - [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay, the `ghcr` image overlay
 - [Images](docs/images.md) — manual GitHub Actions build/push to GHCR, tag derivation under `workflow_dispatch`, pull secret, pinning, weekly version purge, repo variables vs secrets for deploy
 - [Sizing](docs/sizing.md) — capacity model and resource totals

@@ -15,7 +15,7 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
-import { DragonflyReader } from './dragonfly.js';
+import { ValkeyReader } from './valkey.js';
 import {
   matchesSubscription,
   matchesAlertSubscription,
@@ -34,7 +34,6 @@ import {
   validateDelete,
   validateClosedQuery,
   validateAllEventsQuery,
-  ackAlertKey,
   normaliseAck,
   ackFrame,
   closeFrame,
@@ -61,7 +60,7 @@ const log = createLogger(cfg.logLevel);
  */
 const POD_NAME = process.env.POD_NAME || 'local';
 
-const reader = new DragonflyReader(cfg, log);
+const reader = new ValkeyReader(cfg, log);
 const recent = new RecentIds(cfg.dedupeLru);
 // Replicates journal entries to the audit exchange, because Dragonfly alone cannot
 // make a note durable. Logged at startup either way, so a deployment without it
@@ -288,8 +287,8 @@ wss.on('connection', (ws, req) => {
           //
           // This used to be live-only, on the grounds that without a source there
           // was no bounded index to read and scanning every source is the unbounded
-          // scan the design forbids. That reasoning predates `fw:idx:evt:all`: the
-          // worker now writes every event to ONE global timeline, so a windowed read
+          // scan the design forbids. That reasoning predates `idx:event:all`: the worker
+          // now writes every record to ONE global timeline, so a windowed read
           // over it is a single bounded ZREVRANGEBYSCORE — exactly what `op:
           // allEvents` already does.
           //
@@ -369,10 +368,11 @@ async function handleAck(conn, frame, send) {
     return;
   }
 
-  const hashKey = ackAlertKey(verdict.key);
+  // Bare key, no prefix: valkey.js adds `event:` exactly once.
+  const bareKey = verdict.key;
   let result;
   try {
-    result = await reader.ackAlert(hashKey, verdict.by, Date.now(), cfg.alertTtlMs);
+    result = await reader.ackAlert(bareKey, verdict.by, Date.now(), cfg.alertTtlMs);
   } catch (err) {
     log.error('ack write failed', { key: verdict.key, err: String(err) });
     send(JSON.stringify({
@@ -422,7 +422,7 @@ async function handleAck(conn, frame, send) {
 /**
  * Bulk ack-state read for the alerts a client is currently showing.
  *
- * Client-supplied keys, never a server-side scan: `SCAN fw:alert:*` on every
+ * Client-supplied keys, never a server-side scan: `SCAN event:*` on every
  * connect is exactly the unbounded read the design forbids
  * (websocket-server.md §3).
  */
@@ -442,10 +442,11 @@ async function handleClose(conn, frame, send) {
     return;
   }
 
-  const hashKey = ackAlertKey(verdict.key);
+  // Bare key, no prefix: valkey.js adds `event:` exactly once.
+  const bareKey = verdict.key;
   let result;
   try {
-    result = await reader.closeAlert(hashKey, verdict.by, Date.now(), cfg.alertTtlMs);
+    result = await reader.closeAlert(bareKey, verdict.by, Date.now(), cfg.alertTtlMs);
   } catch (err) {
     log.error('close write failed', { key: verdict.key, err: String(err) });
     send(JSON.stringify({
@@ -574,7 +575,9 @@ async function handleDelete(conn, frame, send) {
   }
 
   try {
-    const res = await reader.deleteEvent(verdict.id, evt.source || '');
+    // One argument now: the bare key addresses the record AND both of its timeline
+    // members, so there is no separate source index to name.
+    const res = await reader.deleteEvent(verdict.id);
     if (res.status === 'missing') {
       // Lost a race with another delete. Report it rather than claiming success.
       send(JSON.stringify({
@@ -636,7 +639,7 @@ async function sendSnapshot(sub, send) {
     for (const a of open) {
       // Only the alerts the client asked about. An unfiltered subscribe means
       // "everything", which is the common case.
-      if (matchesAlertSubscription(sub, a.key)) alerts.push(a);
+      if (matchesAlertSubscription(sub, a)) alerts.push(a);
     }
     send(JSON.stringify({ op: 'snapshot', alerts }));
     return alerts.length;
@@ -778,7 +781,7 @@ async function handleAllEventsQuery(conn, frame, send) {
 }
 
 /**
- * `{"op":"journal","key":"source:type","text":"…"}` — append one operator note.
+ * `{"op":"journal","key":"<32-hex>","text":"…"}` — append one operator note.
  *
  * The only append in the system. Everything else the gateway writes (ack, close)
  * is a single-field overwrite of state that has exactly one correct value; a journal
@@ -856,7 +859,7 @@ async function handleJournalAppend(conn, frame, send) {
 }
 
 /**
- * `{"op":"journals","keys":["source:type",…]}` — bulk read of recent notes.
+ * `{"op":"journals","keys":["<32-hex>",…]}` — bulk read of recent notes.
  *
  * Bulk rather than one-key-per-frame for the same reason `op: alerts` is bulk: an
  * operator opening the journal on a table of alerts should not cause one round trip
@@ -902,7 +905,7 @@ async function handleAlertQuery(conn, frame, send) {
 
   let hashes;
   try {
-    hashes = await reader.readAcks(verdict.keys.map(ackAlertKey));
+    hashes = await reader.readAcks(verdict.keys);
   } catch (err) {
     log.warn('ack state read failed', { err: String(err) });
     send(JSON.stringify({ op: 'error', code: 'alerts_failed', message: 'could not read ack state' }));

@@ -621,6 +621,33 @@ export class ValkeyReader {
     this.client = null;
   }
 
+  /**
+   * Is the datastore reachable?
+   *
+   * Used by the DB-health probe, which runs on a timer and pushes a
+   * `{"op":"db","up":…}` frame to every client when the reported state CHANGES.
+   * It deliberately returns a boolean rather than throwing: a probe that throws
+   * on an outage becomes an unhandled rejection every interval, and the caller
+   * only needs to know up/down so it can apply its own failure threshold.
+   *
+   * THIS WAS MISSING after the Valkey rewrite — the whole class was rewritten and
+   * `ping()` was dropped while `index.js` kept calling `reader.ping()`. The result
+   * was `TypeError: reader.ping is not a function` every 10s in the gateway log,
+   * and the UI's database chip could never turn red: the only signal that the
+   * gateway's reads are failing was gone. It is a one-line method, which is
+   * exactly why its absence was easy to miss — the process stayed healthy and
+   * every other read worked.
+   */
+  async ping() {
+    try {
+      const c = await this.connect();
+      await c.ping();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Publish a frame. Used only to broadcast a state change. */
   async publish(channel, payload) {
     const c = await this.connect();

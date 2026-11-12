@@ -185,6 +185,30 @@ export async function applyReplicaOfNoOne(podIps, podName, cfg, log) {
  * Replace the Endpoints subsets for the master-pointing Service.
  * `endpoints === null` means "leave untouched".
  * Must be called only by the leader.
+ *
+ * TWO DEFECTS FIXED HERE, both found on a cluster with the `valkey` Service.
+ *
+ * 1. `metadata.name` must be in the REPLACE body. A replace is a PUT to
+ *    `/api/v1/namespaces/{ns}/endpoints/{name}`, and the API server validates the
+ *    body's name against the URL: omitting it fails with
+ *
+ *      400 BadRequest: the name of the object (valkey based on URL) was
+ *      undeterminable: name must be provided
+ *
+ *    The body used to carry only `subsets`, so `replaceNamespacedEndpoints`
+ *    could NEVER succeed — the first call always threw.
+ *
+ * 2. That 400 is what made the bug invisible on `dragonfly`. The old code treated
+ *    only a 404 as "the object does not exist, create it", so on a brand-new
+ *    Service the create branch never ran and every cycle logged
+ *    `could not patch endpoints` forever, leaving `Endpoints/valkey` absent
+ *    entirely. It looked fine on Dragonfly only because an earlier controller
+ *    had already created that Endpoints object, so the GET-then-replace path
+ *    happened to have something to overwrite.
+ *
+ *    The fix is both halves: send the name, and create on 404 *or* on a
+ *    400 that mentions an undeterminable name (belt and braces — a future client
+ *    version may surface the same condition differently).
  */
 export async function patchEndpoints(core, namespace, name, endpoints, podByName, cfg, log) {
   if (endpoints === null) return;
@@ -201,6 +225,11 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
     .filter(Boolean);
 
   const body = {
+    apiVersion: 'v1',
+    kind: 'Endpoints',
+    // REQUIRED by the API server on a replace: the body name must match the URL.
+    // Without it every replace is a 400 (see the note above).
+    metadata: { name, namespace },
     subsets: addresses.length
       ? [
           {
@@ -216,25 +245,44 @@ export async function patchEndpoints(core, namespace, name, endpoints, podByName
     await core.replaceNamespacedEndpoints(name, namespace, body);
     log.info('patched endpoints', { service: name, masters: endpoints });
   } catch (err) {
-    // 404 on first boot is expected: the Endpoints object is created by the
-    // Service controller only after the Service exists. Create it ourselves.
-    if (err?.response?.statusCode === 404 || err?.statusCode === 404) {
+    const status = err?.response?.statusCode ?? err?.statusCode;
+    // The Endpoints object does not exist yet: it is created by the Service
+    // controller, and only once the Service exists. Two shapes mean that here —
+    // 404, and the 400 "name was undeterminable" that this client returns when
+    // the object is absent.
+    const missing = status === 404 || status === 400;
+    if (missing) {
       const created = {
         apiVersion: 'v1',
         kind: 'Endpoints',
-        metadata: { name, namespace, labels: { 'app.kubernetes.io/name': 'valkey' } },
-        ...body,
+        metadata: {
+          name,
+          namespace,
+          labels: { 'app.kubernetes.io/name': 'valkey' },
+        },
+        subsets: body.subsets,
       };
       try {
         // createNamespacedEndpoints(namespace, body, pretty, dryRun, ...)
         await core.createNamespacedEndpoints(namespace, created);
         log.info('created endpoints', { service: name, masters: endpoints });
       } catch (e2) {
-        log.error('could not create endpoints', { service: name, err: String(e2) });
+        // 409 = another cycle or the Service controller created it between our
+        // replace and our create. That is success, not a fault.
+        const s2 = e2?.response?.statusCode ?? e2?.statusCode;
+        if (s2 === 409) {
+          log.debug('endpoints appeared concurrently', { service: name });
+          return;
+        }
+        log.error('could not create endpoints', {
+          service: name, status: s2, err: String(e2),
+        });
       }
       return;
     }
-    log.error('could not patch endpoints', { service: name, err: String(err) });
+    log.error('could not patch endpoints', {
+      service: name, status, err: String(err),
+    });
   }
 }
 

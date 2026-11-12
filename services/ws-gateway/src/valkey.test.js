@@ -262,3 +262,40 @@ test('an empty journal read returns an entry per requested key', async () => {
   assert.equal(out.length, 2);
   for (const row of out) assert.deepEqual(row.entries, []);
 });
+
+// ------------------------------------------------------------------- API surface
+test('every method index.js calls exists on the reader', () => {
+  // THE BUG THIS PINS. The Valkey rewrite replaced the whole client class, and
+  // `ping()` was dropped while `index.js` kept calling `reader.ping()`. Every
+  // other method worked, so the gateway looked healthy — but the DB-health probe
+  // threw `TypeError: reader.ping is not a function` every 10s and the UI's
+  // database chip could never turn red. That removed the only signal that the
+  // gateway's reads had failed, which is precisely the signal an outage needs.
+  //
+  // A list of call sites rather than a reflection trick: adding a method to the
+  // gateway without adding it here is the review point, and the assertion is
+  // against the real prototype.
+  const used = [
+    'ackAlert', 'appendJournal', 'closeAlert', 'deleteEvent', 'isSubscribed',
+    'ping', 'publish', 'quit', 'readAcks', 'readAlert', 'readAllEvents',
+    'readClosedAlerts', 'readEvent', 'readEvents', 'readIndex', 'readIndexRange',
+    'readJournals', 'readOpenAlerts', 'subscribe',
+  ];
+  const r = new ValkeyReader(cfg, log);
+  const missing = used.filter((m) => typeof r[m] !== 'function');
+  assert.deepEqual(missing, [], `reader is missing: ${missing.join(', ')}`);
+});
+
+test('ping reports down instead of throwing when the datastore is unreachable', () => {
+  // The probe runs on a timer. A throw here becomes an unhandled rejection every
+  // interval for the whole duration of an outage.
+  const r = new ValkeyReader(cfg, log);
+  r.connect = async () => { throw new Error('ECONNREFUSED'); };
+  return r.ping().then((up) => assert.equal(up, false));
+});
+
+test('ping reports up when the socket answers', async () => {
+  const r = new ValkeyReader(cfg, log);
+  r.connect = async () => ({ async ping() { return 'PONG'; } });
+  assert.equal(await r.ping(), true);
+});

@@ -102,6 +102,17 @@ test('patchEndpoints uses the positional replace signature', async () => {
   assert.equal(namespace, 'fire-watch-lab');
   assert.equal(body.subsets[0].addresses[0].ip, '10.0.0.7');
   assert.equal(body.subsets[0].ports[0].port, 6379);
+  // THE BUG THIS PINS. A REPLACE is a PUT whose body must carry the object name,
+  // because the API server validates it against the URL. Omitting it fails with
+  //  400 BadRequest: the name of the object (valkey based on URL) was
+  //                  undeterminable: name must be provided
+  // so every replace failed and the Endpoints object was never created for a new
+  // Service. It went unnoticed on `dragonfly` only because an earlier controller
+  // had already created that object.
+  assert.equal(body.metadata.name, 'valkey', 'the replace body MUST name the object');
+  assert.equal(body.metadata.namespace, 'fire-watch-lab');
+  assert.equal(body.apiVersion, 'v1');
+  assert.equal(body.kind, 'Endpoints');
 });
 
 test('an empty endpoint list is published as no subsets (write guard)', async () => {
@@ -143,6 +154,67 @@ test('a 404 on replace creates the Endpoints positionally', async () => {
   assert.equal(created.length, 1);
   assert.equal(created[0][0], 'fire-watch-lab', 'namespace is positional arg 0');
   assert.equal(created[0][1].kind, 'Endpoints');
+});
+
+test('a 400 "name undeterminable" on replace also creates the Endpoints', async () => {
+  // What the client actually returns for a missing object. The old code only
+  // handled 404, so on a brand-new Service the create branch never ran and every
+  // cycle logged `could not patch endpoints` forever with no `Endpoints` object
+  // in the namespace at all.
+  const created = [];
+  const badRequest = new Error('HTTP request failed');
+  badRequest.statusCode = 400;
+  badRequest.body = {
+    message: 'the name of the object (valkey based on URL) was undeterminable: name must be provided',
+  };
+  const core = {
+    async replaceNamespacedEndpoints() { throw badRequest; },
+    async createNamespacedEndpoints(...args) {
+      created.push(args);
+      return { response: { statusCode: 201 }, body: {} };
+    },
+  };
+
+  const pods = new Map([['valkey-0', pod('valkey-0', '10.0.0.8')]]);
+  await patchEndpoints(core, 'fire-watch-lab', 'valkey', ['valkey-0'], pods, { valkeyPort: 6379 }, silentLog);
+
+  assert.equal(created.length, 1, 'the create branch must run');
+  assert.equal(created[0][1].metadata.name, 'valkey');
+  assert.equal(created[0][1].subsets[0].addresses[0].ip, '10.0.0.8');
+});
+
+test('a 409 on create is treated as success, not as a fault', async () => {
+  // The Service controller or the other bridge replica can create the object
+  // between our replace and our create. That is the desired end state.
+  const conflict = new Error('already exists');
+  conflict.statusCode = 409;
+  const core = {
+    async replaceNamespacedEndpoints() {
+      const e = new Error('not found');
+      e.statusCode = 404;
+      throw e;
+    },
+    async createNamespacedEndpoints() { throw conflict; },
+  };
+
+  await patchEndpoints(core, 'ns', 'valkey', [], new Map(), { valkeyPort: 6379 }, silentLog);
+  // Nothing to assert beyond "it did not throw": the observable behaviour is that
+  // the reconcile loop continues instead of logging a fault every 5s.
+});
+
+test('a 403 is NOT treated as a missing object', async () => {
+  // A permissions error must not be papered over by a create attempt that will
+  // fail identically — that would hide an RBAC mistake behind retries.
+  let created = false;
+  const forbidden = new Error('forbidden');
+  forbidden.statusCode = 403;
+  const core = {
+    async replaceNamespacedEndpoints() { throw forbidden; },
+    async createNamespacedEndpoints() { created = true; },
+  };
+
+  await patchEndpoints(core, 'ns', 'valkey', [], new Map(), { valkeyPort: 6379 }, silentLog);
+  assert.equal(created, false, 'a 403 must be logged, not retried as a create');
 });
 
 test('setWritableLabel uses the positional patch signature', async () => {

@@ -493,7 +493,14 @@ export function applyAlert(map, { key, applied, event, row }) {
       // Never downgrade a known severity to undefined because a later frame had
       // nothing to read it from.
       severity: event?.severity ?? row?.severity ?? prev?.severity,
-      firstSeen: prev?.firstSeen ?? row?.firstSeen ?? event?.brokerTs ?? Date.now(),
+      // The gateway's row calls these `firstOccurrence` / `lastOccurrence` (that is
+      // the field set the wire has always used for a row), so BOTH spellings are
+      // accepted here. Reading only `firstSeen` silently ignored the server's value
+      // and fell through to `Date.now()`, which put "First occurrence" at the moment
+      // the browser received the frame — different on every reload.
+      firstSeen: prev?.firstSeen
+        ?? row?.firstOccurrence ?? row?.firstSeen
+        ?? event?.brokerTs ?? Date.now(),
     // A repeat IS an occurrence, so lastSeen moves — and it must move FORWARD.
     //
     // THE BUG THIS FIXES. One arrival produces TWO frames: `op: event` (carrying
@@ -516,12 +523,21 @@ export function applyAlert(map, { key, applied, event, row }) {
     // after the previous one".
     lastSeen: (() => {
       const prevSeen = prev?.lastSeen ?? 0;
-      const candidates = [event?.brokerTs, row?.lastSeen].filter((t) => Number.isFinite(t) && t > 0);
+      const candidates = [event?.brokerTs, row?.lastOccurrence, row?.lastSeen]
+        .filter((t) => Number.isFinite(t) && t > 0);
       if (candidates.length > 0) return Math.max(prevSeen, ...candidates);
       // No timestamp in the frame: advance past whatever we have, using the wall
       // clock only when it is actually ahead.
       return Math.max(prevSeen + 1, Date.now());
     })(),
+      // The fold's own number when the frame carries it, because a client-side
+      // increment can drift. It does NOT double-count: `row.count` is read after
+      // the fold applied this arrival, so it already includes it.
+      //
+      // Measured on the cluster: three identical events showed Count 6, because one
+      // arrival produced two frames and BOTH incremented. Preferring the server's
+      // authoritative number removes that class of bug outright — two increments
+      // can disagree, one number cannot.
       count: row?.count ?? ((prev?.count ?? 0) + 1),
       // The latest applied event is the record worth inspecting: right-clicking
       // an alert row must show the enriched fields of the occurrence that put

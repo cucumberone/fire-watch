@@ -380,3 +380,21 @@ test('a threshold of 1 reports the first failure', () => {
   assert.equal(s.up, false);
   assert.equal(s.changed, true);
 });
+
+test('alertFrame forwards brokerTs even when a row is attached', () => {
+  // THE BUG THIS PINS. The gateway used to call `alertFrame(key, applied)` for the
+  // plain occurrence frame, dropping the broker timestamp the worker had published.
+  // The client pairs this frame with the `op: event` frame for the SAME delivery and
+  // folds it once; with no timestamp it could not match them, so one arrival was
+  // counted twice — three identical events showed Count 6 on the board.
+  const row = { key: 'k', count: 3, lastOccurrence: 5000 };
+  const f = JSON.parse(alertFrame('k', 1, row, 5000));
+  assert.equal(f.brokerTs, 5000, 'the arrival identity must survive');
+  assert.deepEqual(f.row, row);
+});
+
+test('alertFrame omits brokerTs only when the caller has none', () => {
+  const f = JSON.parse(alertFrame('k', 1, null, undefined));
+  assert.equal('brokerTs' in f, false);
+  assert.equal('row' in f, false);
+});

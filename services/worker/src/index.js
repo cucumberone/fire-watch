@@ -170,7 +170,21 @@ async function handleMessage(msg) {
       if (applied === 1 || applied === 3) {
         // The wire key is the bare record key, not `source:type`. The client joins
         // on it directly, so the frame carries exactly what the row is keyed by.
-        await valkey.publish(keys.channelAlerts, JSON.stringify({ key: bareKey, applied }));
+        //
+        // `brokerTs` is carried for ONE reason: a single arrival produces TWO
+        // frames on TWO channels — `op: event` above and this one — and both reach
+        // the same browser. The client must treat them as one delivery, and the
+        // only field the two frames share is the broker timestamp.
+        //
+        // WITHOUT IT THE COUNT DOUBLED. Measured on the cluster: three arrivals
+        // showed Count 6. The client's pairing guard compares this frame's
+        // `brokerTs` against the one the `op: event` frame recorded; with the field
+        // absent it saw `undefined` twice, matched nothing, and folded the same
+        // arrival twice — once per frame.
+        await valkey.publish(
+          keys.channelAlerts,
+          JSON.stringify({ key: bareKey, applied, brokerTs }),
+        );
       }
     } catch (err) {
       // The event is durable already. A missed pub/sub frame is recovered by

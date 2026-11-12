@@ -1050,26 +1050,30 @@ async function handleAlertMessage(raw) {
   // If the alert is not open (already retired, or the read failed) the bare frame
   // is still sent: a client that already has the row still moves its count, and a
   // client without it simply stays as it was rather than inventing a row.
-  if (parsed.kind === 'occurrence') {
-    let row = null;
-    try {
-      row = await reader.readAlert(parsed.key);
-    } catch (err) {
-      log.warn('occurrence row read failed; sending bare frame', {
-        key: parsed.key, err: String(err),
-      });
-    }
-    // Pass the producer's arrival timestamp through so the client can pair this
-    // frame with the `op: event` frame for the SAME delivery and count it once.
-    // `row.lastSeen` is unavailable whenever the row read fails, so the timestamp
-    // cannot be inferred from the frame body alone.
-    const frame = alertFrame(parsed.key, parsed.applied, row, parsed.brokerTs);
-    for (const ws of wss.clients) {
-      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
-    }
-    return;
+  // Every remaining alert message is the plain `{key, applied, brokerTs}` frame
+  // the worker publishes for an occurrence or a retirement.
+  //
+  // There used to be a separate `kind: 'occurrence'` branch above this, from when
+  // the worker tagged its duplicate fan-out. Nothing publishes that shape any more,
+  // so it was dead code that ALSO read the row a second time. One path now serves
+  // every non-typed alert message.
+  //
+  // `brokerTs` MUST be forwarded. The client pairs this frame with the `op: event`
+  // frame for the SAME delivery and folds it once; dropping the timestamp here made
+  // that impossible, so one arrival was counted twice and Count ran at double the
+  // true number — three arrivals showed six.
+  //
+  // The row is read fresh so a client that has never seen this key can still render
+  // it: the frame carries no event of its own.
+  let row = null;
+  try {
+    row = await reader.readAlert(parsed.key);
+  } catch (err) {
+    log.warn('alert row read failed; sending bare frame', {
+      key: parsed.key, err: String(err),
+    });
   }
-  const frame = alertFrame(parsed.key, parsed.applied);
+  const frame = alertFrame(parsed.key, parsed.applied, row, parsed.brokerTs);
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
   }

@@ -771,9 +771,34 @@ function useSocket(config) {
         if (frame.applied === 1 || frame.applied === 2) {
           closedCountedRef.current.delete(alertKey);
         }
-        // Remember this arrival so the paired `op: alert` occurrence frame for the
-        // SAME delivery does not count it a second time.
-        if (evt.brokerTs) lastFoldedRef.current.set(alertKey, evt.brokerTs);
+        // ------------------------------------------------------------------
+        // ONE ARRIVAL, ONE COUNT — and this half of it was missing.
+        //
+        // A single arrival produces TWO frames: `op: event` here and `op: alert` on
+        // the alerts channel. Both reach this browser. The `op: alert` handler
+        // already dropped a frame whose `brokerTs` matched the last folded one, but
+        // THIS handler folded unconditionally and then overwrote the marker.
+        //
+        // So the count was correct only while the frames arrived `event` then
+        // `alert`. When they arrived the other way round — which happens, because
+        // they are two separate PUBLISHes on two channels — the `op: alert` frame
+        // folded first, then this one folded the same arrival again. Measured on
+        // the cluster: three identical events showed Count 6.
+        //
+        // The guard is the same test the other handler uses: same key, same broker
+        // timestamp = same delivery.
+        const arrival = Number.isFinite(evt.brokerTs) && evt.brokerTs > 0
+          ? evt.brokerTs
+          : null;
+        if (arrival && lastFoldedRef.current.get(alertKey) === arrival) {
+          // Already folded by the `op: alert` frame. The row still belongs in the
+          // live tail — that happened above — but not in the rollup a second time.
+          if (evt.brokerTs) lastTsRef.current = evt.brokerTs;
+          return;
+        }
+        // Remember this arrival so the paired `op: alert` frame for the SAME
+        // delivery does not count it a second time.
+        if (arrival) lastFoldedRef.current.set(alertKey, arrival);
         setAlerts((prev) =>
           applyAlert(prev, {
             key: alertKey,
@@ -815,13 +840,16 @@ function useSocket(config) {
           return changed ? { ...prev, events } : prev;
         });
       }
-      // A content-duplicate frame carries `row` (the alert's current state, with
-      // its newest event attached) because it has no event of its own. Without it
-      // a client that never saw the original had nothing to build a row from, so
-      // the alert stayed invisible until the next snapshot — the bug where a
-      // repeat after a CLEAR needed a browser refresh to appear.
+      // An `op: alert` frame carries `row`: the record itself, with its payload,
+      // summary and timestamps inline. It is NOT a thin rollup plus a nested
+      // `event` — one hash per condition means the row has no separate event to
+      // embed.
+      //
+      // Reading `row.event` here produced a blank row on the first repeat (no
+      // Summary, no First/Last occurrence) while Count still worked, because Count
+      // is read from `row.count`. That is the reported screenshot.
       const row = frame.row;
-      const rowEvent = row?.event ? toViewEvent(row.event) : undefined;
+      const rowEvent = row ? toViewEvent(row) : undefined;
       // ONE ARRIVAL, ONE COUNT.
       //
       // A content duplicate is published on BOTH channels: `op: event` carries the
@@ -965,18 +993,17 @@ function useSocket(config) {
       // merging: it is a windowed query, so a row it omits is outside the window,
       // not missing from this response.
       const rows = Array.isArray(frame.alerts) ? frame.alerts : [];
-      // Decode before mapping, same as the live and allEvents paths: a closed row's
-      // `event` is a stored record, so `msgc` can be compressed there too.
+      // Decode before mapping, same as every other path: a closed row carries its
+      // own `payload`, and `msgc` can be compressed there too.
+      //
+      // `row.event` is the OLD shape and no longer exists — the row IS the record.
+      // Keeping the old read left the Closed tab's Summary and timestamps blank for
+      // the same reason the Open tab's were.
       const next = [];
       for (const row of rows) {
         if (!row || typeof row.key !== 'string') continue;
-        const payload = row.event
-          ? await decodePayload(row.event.payload, gunzip, MSG_MAX_BYTES)
-          : undefined;
-        next.push({
-          ...row,
-          event: row.event ? toViewEvent({ ...row.event, payload }) : undefined,
-        });
+        const payload = await decodePayload(row.payload, gunzip, MSG_MAX_BYTES);
+        next.push({ ...row, event: toViewEvent({ ...row, payload }) });
       }
       setClosedState({
         alerts: next,
@@ -1009,17 +1036,28 @@ function useSocket(config) {
       const next = new Map();
       for (const row of frame.alerts) {
         if (!row || typeof row.key !== 'string') continue;
-        // The snapshot's event record carries brokerTs, but a row whose record
-        // has expired or was never stored still needs a Last occurrence. Fall
-        // back to the alert's own last_seen so the column is never blank.
-        const evt = row.event ? toViewEvent(row.event) : null;
+        // The row IS the record now, so it carries the fields a row renders:
+        // `summary`, `payload`, `source`, `type`, `severity`, `count`, timestamps.
+        //
+        // It used to be a thin rollup plus a nested `event` record, and this code
+        // read only `row.event` — which the gateway no longer sends, because one
+        // hash per condition means the row has no separate event to embed. The
+        // result was a fully blank row: no Summary, no First/Last occurrence, while
+        // Count (read from `row.count`) still worked. That is exactly the shape of
+        // the reported screenshot.
+        //
+        // `toViewEvent` is still the right constructor: it derives `summary` from
+        // `payload.msg`, normalises the timestamps and keeps the wire record for the
+        // inspector. It just gets the row itself instead of a nested event.
+        const payload = await decodePayload(row.payload, gunzip, MSG_MAX_BYTES);
+        const evt = toViewEvent({ ...row, payload });
         next.set(row.key, {
           key: row.key,
           severity: row.severity,
-          firstSeen: row.firstSeen,
-          lastSeen: row.lastSeen,
+          firstSeen: row.firstOccurrence ?? row.firstSeen,
+          lastSeen: row.lastOccurrence ?? row.lastSeen,
           count: row.count,
-          event: evt ?? undefined,
+          event: evt,
         });
       }
       setAlerts(next);

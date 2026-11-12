@@ -1064,3 +1064,39 @@ test('an unreported database state is unknown, not ok and not bad', () => {
   assert.equal(linkState('connected', undefined), 'unknown');
   assert.equal(linkState('idle', null), 'unknown');
 });
+
+// --------------------------------------------------- row shape and count authority
+test('applyAlert takes timestamps from a gateway row (firstOccurrence/lastOccurrence)', () => {
+  // The gateway's row is the record itself, and its timestamp fields are
+  // `firstOccurrence` / `lastOccurrence`. Reading only `firstSeen` ignored them and
+  // fell through to `Date.now()`, so "First occurrence" was the moment the browser
+  // got the frame — different on every reload.
+  const map = applyAlert(new Map(), {
+    key: 'k', applied: 1,
+    row: { severity: 'WARNING', firstOccurrence: 1000, lastOccurrence: 5000, count: 4 },
+  });
+  const row = map.get('k');
+  assert.equal(row.firstSeen, 1000);
+  assert.equal(row.lastSeen, 5000);
+  assert.equal(row.count, 4);
+});
+
+test('the server count wins over a local increment', () => {
+  // Count 6 for three arrivals was the reported bug. Preferring the fold's own
+  // number removes the whole class: two increments can disagree, one number cannot.
+  let map = new Map();
+  map = applyAlert(map, { key: 'k', applied: 1, row: { count: 1, lastSeen: 100 } });
+  // A LOCAL fold (no row) must still advance, for a frame that carries nothing.
+  map = applyAlert(map, { key: 'k', applied: 1, event: { brokerTs: 200 } });
+  assert.equal(map.get('k').count, 2);
+  // But when the server states the number, it is used verbatim — not 3.
+  map = applyAlert(map, { key: 'k', applied: 1, row: { count: 3, lastSeen: 300 } });
+  assert.equal(map.get('k').count, 3);
+});
+
+test('a row with no firstOccurrence falls back to the event broker timestamp', () => {
+  // Falling back to Date.now() is only acceptable when there is NO server value and
+  // NO event timestamp — otherwise the column drifts on every reload.
+  const map = applyAlert(new Map(), { key: 'k', applied: 1, event: { brokerTs: 777 } });
+  assert.equal(map.get('k').firstSeen, 777);
+});

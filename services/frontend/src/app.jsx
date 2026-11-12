@@ -33,6 +33,7 @@ import {
   isRetirement,
   resolveTheme,
   severityRowClass,
+  colourSeverity,
   recordEntries,
   formatClock,
   ENRICHED_FIELDS,
@@ -1040,6 +1041,21 @@ function useSocket(config) {
       });
       return;
     }
+    if (frame.op === 'closedCount') {
+      // The badge-only answer, sent on every connect so the Closed tab does not
+      // read 0 after a browser refresh. It deliberately does NOT set `loadedAt`:
+      // this says how many closures exist, not that their rows were read, so the
+      // tab still fetches on open and still shows its `stale` chip until it has.
+      //
+      // A LOWER number than the local one is accepted. The local count is
+      // optimistic — it increments on every retirement frame — while this is the
+      // server's own total, so the correction runs in both directions.
+      if (!Number.isFinite(frame.count)) return;
+      setClosedState((prev) => (
+        prev.count === frame.count ? prev : { ...prev, count: frame.count }
+      ));
+      return;
+    }
     if (frame.op === 'snapshot') {
       // The state of the world as of connect, or as of the last resync. Without
       // this the board is empty on load until something new fires, because events
@@ -1391,6 +1407,10 @@ function useSocket(config) {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ op: 'resync' }));
+        // The Closed badge is corrected on the same tick. Its local value is
+        // optimistic (incremented per retirement frame), so a frame lost across a
+        // reconnect would leave it high with no way back; one ZCOUNT bounds that.
+        ws.send(JSON.stringify({ op: 'closed', countOnly: true }));
       }
     };
     const id = setInterval(tick, ms);
@@ -1543,6 +1563,26 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Seed ONLY the Closed badge.
+   *
+   * The badge is rendered on every tab, so it must be right after a browser
+   * refresh — but the ROWS are a 7-day query that a client which never opens the
+   * tab should not pay for. Seeding the badge only when the tab was opened left it
+   * reading 0 on Open alerts until Closed was selected, which reads as "the
+   * closures were lost", not "this number is not loaded yet".
+   *
+   * `countOnly` is a ZCOUNT server-side, so this costs one integer per connection
+   * rather than a window read. `loadedAt` is deliberately NOT set: the badge is now
+   * honest, the rows still are not fetched, and the tab must keep fetching them on
+   * open (and keep showing its `stale` chip until it has).
+   */
+  const loadClosedCount = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ op: 'closed', countOnly: true }));
+  }, []);
+
+  /**
    * Ask for every event in a time window.
    *
    * A QUERY, like the Closed list, not a stream: the window is bounded, it changes
@@ -1572,7 +1612,7 @@ function useSocket(config) {
 
   return {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadClosed, closed: closedState,
+    loadClosed, loadClosedCount, closed: closedState,
     loadAllEvents, allEvents,
     journals, loadJournal, addJournalEntry,
     dbUp,
@@ -1611,15 +1651,27 @@ function Badge({ severity, label }) {
   // `Cannot read properties of undefined (reading 'toLowerCase')` inside render,
   // which unmounts the whole tree and leaves a BLANK PAGE — the failure looked
   // like a crashed app rather than one unknown row.
-  if (severity === undefined || severity === null || severity === '') {
+  if ((severity === undefined || severity === null || severity === '')
+    && (label === undefined || label === null || label === '')) {
     return <span className="sev sev-unknown">—</span>;
   }
-  // Colour comes from the INTERNAL severity (which is what the five colour classes
-  // are defined for); the text comes from the producer's own value when there is
-  // one. A producer sends CLEAR, never CLOSE — showing the mapped name would
-  // present a severity that does not exist in their vocabulary.
+  // Colour comes from the severity being DISPLAYED, not blindly from the stored
+  // one. On a closed row an operator close overwrites the stored severity with
+  // `CLOSE` while the record's payload still says `WARNING`, so a stored-only
+  // colour painted the word WARNING on a green chip — a colour that belongs to a
+  // different severity than the text beside it. `colourSeverity` maps the label a
+  // producer used back onto a colour class, and falls back to the stored value for
+  // an unrecognised label.
+  //
+  // Text is the producer's own value when there is one: a producer sends CLEAR,
+  // never CLOSE, so showing the mapped name would present a severity that does not
+  // exist in their vocabulary.
+  const colour = colourSeverity(severity, label) ?? severity;
+  if (colour === undefined || colour === null || colour === '') {
+    return <span className="sev sev-unknown">{label || '—'}</span>;
+  }
   return (
-    <span className={`sev sev-${String(severity).toLowerCase()}`}>{label || severity}</span>
+    <span className={`sev sev-${String(colour).toLowerCase()}`}>{label || severity || colour}</span>
   );
 }
 
@@ -1994,14 +2046,20 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
  * it was firing at. Reading a closed row as "this was a CLEAR alert" is the
  * correct reading — the original severity lives in the event record, reachable
  * through Information.
+ *
+ * The COLOUR class is derived from the severity being displayed, not from the
+ * stored one (`colourSeverity`): an operator close overwrites `severity` with
+ * `CLOSE` while the payload still says `WARNING`, so a stored-only class tinted the
+ * row green in row-colour mode next to an amber WARNING badge.
  */
 function ClosedRow({ row, onContextMenu }) {
+  const label = row.displaySeverity ?? row.event?.displaySeverity;
   return (
     <tr
-      className={severityRowClass(row.severity, 'retirement')}
+      className={severityRowClass(colourSeverity(row.severity, label), 'retirement')}
       onContextMenu={onContextMenu}
     >
-      <td><Badge severity={row.severity} label={row.displaySeverity ?? row.event?.displaySeverity} /></td>
+      <td><Badge severity={row.severity} label={label} /></td>
       {/* Field names follow the WIRE row, not the old alert-rollup shape: the gateway
           sends `alertClosedAt` / `firstOccurrence` / `lastOccurrence` (plus `count`).
           Reading `closedAt` / `firstSeen` / `lastSeen` matched nothing, so all three
@@ -2022,9 +2080,12 @@ function ClosedRow({ row, onContextMenu }) {
 
 function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   const acked = Boolean(ack);
+  // Colour follows what the badge shows, so the row tint and the badge cannot
+  // disagree (see colourSeverity).
+  const label = alert.displaySeverity ?? alert.event?.displaySeverity;
   return (
     <tr
-      className={`${severityRowClass(alert.severity, acked ? 'acked' : '')}${selected ? ' row-selected' : ''}`}
+      className={`${severityRowClass(colourSeverity(alert.severity, label), acked ? 'acked' : '')}${selected ? ' row-selected' : ''}`}
       onContextMenu={onContextMenu}
       onClick={onSelect}
       // Selection is pointer state, so the row is not focusable and carries no
@@ -2034,7 +2095,7 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
       // explicit affordance (see the selection bar) rather than a hidden mode.
       aria-selected={selected || undefined}
     >
-      <td><Badge severity={alert.severity} label={alert.displaySeverity ?? alert.event?.displaySeverity} /></td>
+      <td><Badge severity={alert.severity} label={label} /></td>
       {/* Order follows the live table: severity, first, last, count, summary.
           Key is last: it is a stable identifier, read once when you need it,
           not scanned down the column on every glance. */}
@@ -2074,7 +2135,11 @@ function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false })
   // record, and having a second partial one here was the mistake.
   const { summary } = evt;
   const retirement = isRetirement(evt.severity);
-  const rowClass = severityRowClass(evt.severity, retirement ? 'retirement' : '');
+  // `retirement` stays keyed to the INTERNAL severity (it drives the dimming), but
+  // the COLOUR class follows the displayed label so the row tint and the badge
+  // never disagree.
+  const rowClass = severityRowClass(colourSeverity(evt.severity, evt.displaySeverity),
+    retirement ? 'retirement' : '');
   return (
     <tr
       className={`${rowClass}${selected ? ' row-selected' : ''}`}
@@ -2171,7 +2236,7 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadClosed, closed, loadAllEvents, allEvents, dbUp,
+    loadClosed, loadClosedCount, closed, loadAllEvents, allEvents, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2270,6 +2335,18 @@ function App() {
     if (closed.loadedAt || closed.loading) return;
     loadClosed();
   }, [tab, status, closed.loadedAt, closed.loading, loadClosed]);
+
+  // Seed the Closed BADGE on every connect, whatever tab is showing.
+  //
+  // The badge is rendered on all four tabs, so a browser refresh on Open alerts
+  // that left it reading 0 while the list behind it held closures was a lie that
+  // corrected itself only when the Closed tab was selected — which reads as "the
+  // closures were lost". Same contract as All events, but a COUNT rather than the
+  // rows: one ZCOUNT server-side, and the 7-day row read stays on demand.
+  useEffect(() => {
+    if (status !== 'connected') return;
+    loadClosedCount();
+  }, [status, loadClosedCount]);
 
   // Same contract for All Events: re-fetch on an explicit range change or refresh.
   //

@@ -702,11 +702,31 @@ async function handleResync(conn, frame, send) {
  * Read-only and bounded server-side. The response is one `op: closed` frame with
  * the rows; `truncated` tells the client the limit was hit, so the UI can say so
  * instead of silently presenting a partial window as complete.
+ *
+ * `{"op":"closed","countOnly":true}` answers with `op: closedCount` and one
+ * integer instead. That exists for the tab BADGE, which is visible from every tab
+ * and therefore has to be right after a browser refresh — while the ROWS stay on
+ * demand. Seeding the badge only when the Closed tab was opened left it reading 0
+ * on the Open alerts tab until the operator selected Closed, which looked like the
+ * closures had been lost.
  */
 async function handleClosedQuery(conn, frame, send) {
   const verdict = validateClosedQuery(frame);
   if (!verdict.ok) {
     send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  if (frame.countOnly === true) {
+    let count;
+    try {
+      count = await reader.readClosedCount({ sinceMs: verdict.sinceMs });
+    } catch (err) {
+      log.warn('closed count failed', { err: String(err) });
+      send(JSON.stringify({ op: 'error', code: 'closed_failed', message: 'could not count closed alerts' }));
+      return;
+    }
+    send(JSON.stringify({ op: 'closedCount', count, sinceMs: verdict.sinceMs }));
     return;
   }
 

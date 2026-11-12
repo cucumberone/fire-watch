@@ -412,19 +412,60 @@ So the badge splits its two jobs:
 
 | | Source | Why |
 |---|---|---|
-| **Colour** | internal `severity` | the five colour classes are defined for these |
+| **Colour** | the severity being DISPLAYED (`colourSeverity`) | colour is the primary signal, so it must agree with the word next to it |
 | **Text** | `payload.EVT_Severity` | what the producer actually reported |
 
 `toViewEvent` puts the producer value on `displaySeverity`, falling back to the
 internal one for a record that carries no `EVT_*` payload (a legacy or internal
 producer). A `CLEAR` therefore renders as a green **CLEAR** badge on a dimmed
-retirement row: colour and styling still come from the internal `CLOSE`, so
-nothing about the retirement behaviour changes.
+retirement row: `CLEAR` maps onto the retirement colour, so nothing about the
+retirement behaviour changes.
+
+**The colour is NOT taken from the stored `severity` blindly.** That was the bug:
+`colourSeverity(stored, displayed)` maps the displayed label back onto a colour
+class, because the two sources can disagree on a CLOSED row.
+
+An operator close sets `severity: CLOSE` on the record and **leaves `payload`
+alone**, so the badge said **WARNING** in **green** — a colour belonging to a
+different severity than the word beside it, on the one table where an operator is
+reading the badge to decide how bad the incident was. The same happened to a
+re-read row carrying an older event whose payload was still `MAJOR`.
+
+The mapping mirrors `SEVERITY_MAP` in `services/http-ingress/src/normalise.js`:
+
+| displayed | colour |
+|---|---|
+| `FATAL` | `FATAL` (black) |
+| `CRITICAL`, `MAJOR` | `CRITICAL` |
+| `WARNING`, `MINOR`, `INDETERMINATE` | `WARNING` |
+| `INFORMATION` | `HARMLESS` |
+| `CLEAR`, `HARMLESS`, `CLOSE` | `CLOSE` (green) |
+
+An unrecognised label (a producer inventing its own value, an empty label, a
+legacy record) falls back to the stored severity, which is what the colour classes
+were defined for. Genuine retirements are unaffected: `CLEAR` and `HARMLESS` both
+land on green.
 
 Deliberately **not** renamed in the data: `severity` on the wire, in the fold and
 in the alert hash stays internal. Only the label an operator reads is translated —
 renaming the stored value would break every comparison in `event-fold.lua` and
 `SEVERITY_RANK`.
+
+#### A retirement row is dimmed, but NOT its severity badge
+
+`tr.retirement td { opacity:.55 }` marks an ended episode, and it deliberately does
+not apply to the first cell (`tr.retirement td:first-child { opacity:1 }`).
+
+Opacity is multiplicative and cannot be undone by a child, so the badge has to be
+exempted at the cell. Dimming it was the wrong trade: at 55 % an amber `WARNING`
+reads as grey/unknown, which is the one thing the badge exists to prevent. The row
+is still visibly retired through its timestamps, summary and key — the cells where
+nobody is reading colour.
+
+Column 1 is Severity in **every** table (`ALERT_COLS`, `CLOSED_COLS`,
+`EVENT_COLS`, `ALL_EVENT_COLS` all begin with it), so this is one rule in
+`build.js` rather than a class sprinkled across three row components. Adding a
+table whose first column is not Severity means revisiting it.
 
 ### 5.2 Whole-row colouring
 
@@ -817,6 +858,28 @@ frozen until the tab was opened, because the badge was reporting "rows I happen 
 have fetched" rather than "closures that have happened". A fetch resets `count` to
 what the server actually holds, which also corrects drift and the case where a
 `truncated` page caps `alerts`.
+
+#### The badge is seeded on connect, like All events
+
+The badge is rendered on **all four tabs**, so it has to be right after a browser
+refresh on Open alerts — but the 7-day row read stays on demand. The two needs are
+satisfied separately:
+
+| | when | cost |
+|---|---|---|
+| the **badge** | a `{"op":"closed","countOnly":true}` on every connect, and on each resync tick | one `ZCOUNT` over `idx:event:closed` |
+| the **rows** | on first open of the tab, and on `refresh` | the windowed row read |
+
+The answer is `{"op":"closedCount","count":N,"sinceMs":…}`. It deliberately does
+**not** set `loadedAt`: it says how many closures exist, not that their rows were
+read, so the tab still fetches on open and still shows its `stale` chip until it
+has.
+
+Without this, a refresh on Open alerts left the badge at 0 while storage held
+closures, and it only corrected itself once Closed was selected — which reads as
+"the closures were lost", not "this number is not loaded yet". The local count is
+optimistic (it increments on every retirement frame), so the `ZCOUNT` also
+corrects drift **downwards** after a frame is lost across a reconnect.
 
 Because the rows lag the count, the pane says so explicitly with a `stale` chip
 when `loadedAt` is null. Without it the chip and the list disagree and both read

@@ -453,6 +453,25 @@ export class ValkeyReader {
   }
 
   /**
+   * Count the recently retired records WITHOUT reading them.
+   *
+   * Exists for exactly one reason: the Closed tab's BADGE. The tab's rows are a
+   * query fetched on demand — a client that never opens the tab should not pay for
+   * a 7-day read — but the badge is visible on every tab, so it has to be right
+   * after a browser refresh. Seeding it only when the tab was opened is the bug
+   * this fixes: the badge read 0 on the Open alerts tab after a reload, then
+   * corrected itself the moment the Closed tab was selected.
+   *
+   * ZCOUNT, not ZRANGE: the badge needs one integer, and counting the window is
+   * cheap while building its rows is not. Same `sinceMs` bound as the row read, so
+   * the two cannot disagree about which window they describe.
+   */
+  async readClosedCount({ sinceMs = 0 } = {}) {
+    const c = await this.connect();
+    return c.zcount('idx:event:closed', `(${Math.max(0, sinceMs)}`, '+inf');
+  }
+
+  /**
    * Read ONE record, or null.
    *
    * Exists for the occurrence fan-out: the worker publishes `{kind:'occurrence', key}`

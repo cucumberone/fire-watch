@@ -429,6 +429,53 @@ export function isRetirement(severity) {
 }
 
 /**
+ * A producer's own severity -> the INTERNAL severity whose colour it should use.
+ *
+ * Mirrors `SEVERITY_MAP` in `services/http-ingress/src/normalise.js`. It exists
+ * because the badge's text and its colour come from different places, and the two
+ * can disagree on a CLOSED row:
+ *
+ *   an operator close overwrites `severity` with `CLOSE` but leaves `payload`
+ *   untouched, so the badge said **WARNING** in **green** — a colour that belongs
+ *   to a different severity than the word next to it. Same shape when a re-read
+ *   row carries an older event whose payload is still `MAJOR`.
+ *
+ * Colour is the primary signal in this table, so it follows whatever severity is
+ * actually displayed. A genuine retirement still lands on green: `CLEAR` and
+ * `HARMLESS` both map to `CLOSE`, which is the documented retirement colour.
+ */
+const DISPLAY_TO_COLOUR = {
+  FATAL: 'FATAL',
+  CRITICAL: 'CRITICAL',
+  MAJOR: 'CRITICAL',
+  MINOR: 'WARNING',
+  WARNING: 'WARNING',
+  INDETERMINATE: 'WARNING',
+  INFORMATION: 'HARMLESS',
+  HARMLESS: 'CLOSE',
+  CLEAR: 'CLOSE',
+  CLOSE: 'CLOSE',
+};
+
+/**
+ * The severity whose COLOUR a badge/row should use.
+ *
+ * `internal` is the stored severity (what the fold and the indexes use); `display`
+ * is the label the operator reads. When the label is a known producer value the
+ * colour follows it, so the badge can never show the word `WARNING` on a green
+ * chip. Anything unrecognised (an empty label, a producer inventing its own value,
+ * a legacy record) falls back to the internal severity, which is what the colour
+ * classes were defined for.
+ *
+ * @param {string} internal  stored severity: FATAL | CRITICAL | WARNING | HARMLESS | CLOSE
+ * @param {string} [display] the label rendered in the badge
+ */
+export function colourSeverity(internal, display) {
+  const key = typeof display === 'string' ? display.trim().toUpperCase() : '';
+  return DISPLAY_TO_COLOUR[key] || internal;
+}
+
+/**
  * Resolve the colour scheme actually in effect.
  *
  * `preference` is the user's stored choice ('auto' | 'light' | 'dark');

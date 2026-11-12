@@ -218,7 +218,21 @@ body.resizing * { cursor:col-resize !important; }
    top. Without this, scrolling a row into view (keyboard focus, anchor jump)
    lands it underneath the header where it cannot be clicked. */
 tbody tr { scroll-margin-top: 2.2rem; }
+/* A retirement row is dimmed as a whole — "this episode is over" is worth showing
+   at a glance — but NOT its severity badge.
+
+   Opacity is multiplicative and cannot be undone by a child, so the badge's own
+   cell has to stay at 1. Dimming it was the wrong trade: the five severity colours
+   are the primary signal in this table, and a 55%-opacity amber WARNING badge on a
+   grey row reads as "unknown/grey" rather than "this was a warning that has now
+   cleared". The dimming still marks the row through the timestamp, summary and key
+   cells, which is where the operator is not reading colour.
+
+   Column 1 is Severity in EVERY table (ALERT_COLS, CLOSED_COLS, EVENT_COLS,
+   ALL_EVENT_COLS all begin with it), so this is one rule rather than a class
+   sprinkled over three row components. */
 tr.retirement td { opacity:.55; }
+tr.retirement td:first-child { opacity:1; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.8rem; }
 .nowrap { white-space:nowrap; }
 .dim { color:var(--dim); }

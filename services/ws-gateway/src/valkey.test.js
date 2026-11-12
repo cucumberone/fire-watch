@@ -151,6 +151,25 @@ test('readClosedAlerts reads the closed index, newest first', async () => {
   assert.equal(rows[0].alertClosedBy, 'alice');
 });
 
+test('readClosedCount answers the badge with a ZCOUNT, not the rows', async () => {
+  // The badge is visible from every tab, so it has to be right after a refresh —
+  // but the ROWS stay on demand. Counting must therefore cost one ZCOUNT and read
+  // no hashes at all.
+  let hmgetCalls = 0;
+  const client = {
+    async zcount(key, min, max) {
+      assert.equal(key, 'idx:event:closed');
+      assert.equal(min, '(1000');
+      assert.equal(max, '+inf');
+      return 7;
+    },
+    async hmget() { hmgetCalls += 1; return []; },
+  };
+  const count = await readerWith(client).readClosedCount({ sinceMs: 1000 });
+  assert.equal(count, 7);
+  assert.equal(hmgetCalls, 0, 'a count must not read a single record');
+});
+
 test('readEvent does not require the record to be open', async () => {
   // The delete path uses it: an operator may delete a CLOSED record, and readAlert
   // would return null for it, making the delete report "no such event".
@@ -348,8 +367,8 @@ test('every method index.js calls exists on the reader', () => {
   const used = [
     'ackAlert', 'appendJournal', 'closeAlert', 'deleteEvent', 'isSubscribed',
     'ping', 'publish', 'quit', 'readAcks', 'readAlert', 'readAllEvents',
-    'readClosedAlerts', 'readEvent', 'readEvents', 'readIndex', 'readIndexRange',
-    'readJournals', 'readOpenAlerts', 'subscribe',
+    'readClosedAlerts', 'readClosedCount', 'readEvent', 'readEvents', 'readIndex',
+    'readIndexRange', 'readJournals', 'readOpenAlerts', 'subscribe',
   ];
   const r = new ValkeyReader(cfg, log);
   const missing = used.filter((m) => typeof r[m] !== 'function');

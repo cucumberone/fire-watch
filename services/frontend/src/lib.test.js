@@ -18,6 +18,7 @@ import {
   isRetirement,
   resolveTheme,
   severityRowClass,
+  colourSeverity,
   toViewEvent,
   recordEntries,
   formatClock,
@@ -906,6 +907,42 @@ test('retirement styling still keys off the internal severity', () => {
     payload: { msg: 'cleared', EVT_Severity: 'CLEAR' },
   });
   assert.equal(isRetirement(v.severity), true, 'row still dims as a retirement');
+});
+
+// ------------------------------------------- badge colour follows the badge text
+test('colourSeverity gives a closed WARNING row an amber colour', () => {
+  // THE REPORTED BUG. An operator close writes `severity: CLOSE` on the record but
+  // leaves the payload alone, so the badge said WARNING — in GREEN, because the
+  // colour was taken from the internal CLOSE. Colour is the primary signal here, so
+  // it must agree with the word beside it.
+  assert.equal(colourSeverity('CLOSE', 'WARNING'), 'WARNING');
+  assert.equal(colourSeverity('CLOSE', 'MAJOR'), 'CRITICAL');
+  assert.equal(colourSeverity('CLOSE', 'MINOR'), 'WARNING');
+  assert.equal(colourSeverity('CLOSE', 'FATAL'), 'FATAL');
+  assert.equal(colourSeverity('CLOSE', 'INDETERMINATE'), 'WARNING');
+});
+
+test('a genuine clear still renders green', () => {
+  // The retirement colour is not lost by this change: CLEAR and HARMLESS both map
+  // onto CLOSE, which is the documented retirement colour (docs/frontend.md §5.1).
+  assert.equal(colourSeverity('CLOSE', 'CLEAR'), 'CLOSE');
+  assert.equal(colourSeverity('CLOSE', 'HARMLESS'), 'CLOSE');
+  assert.equal(colourSeverity('HARMLESS', 'INFORMATION'), 'HARMLESS');
+  assert.equal(colourSeverity('CLOSE', 'CLOSE'), 'CLOSE');
+});
+
+test('colourSeverity falls back to the stored severity for an unknown label', () => {
+  // A producer inventing its own value, a legacy record and an absent label must
+  // all keep the internal colour rather than losing it.
+  assert.equal(colourSeverity('CRITICAL', 'PANIC'), 'CRITICAL');
+  assert.equal(colourSeverity('WARNING', ''), 'WARNING');
+  assert.equal(colourSeverity('WARNING', undefined), 'WARNING');
+  assert.equal(colourSeverity('WARNING'), 'WARNING');
+});
+
+test('colourSeverity is case- and whitespace-insensitive in the label', () => {
+  assert.equal(colourSeverity('CLOSE', ' warning '), 'WARNING');
+  assert.equal(colourSeverity('CLOSE', 'clear'), 'CLOSE');
 });
 
 // ------------------------------------------- Closed-tab filtering (pure logic)

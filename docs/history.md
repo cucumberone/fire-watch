@@ -17,23 +17,32 @@ fact about the individual arrivals:
 | how bad is it now? | yes | no (it has no state) |
 | how many times did it fire in total? | yes (`count`) | yes, by counting rows |
 | **when** did it fire? | only the last time | **every time** |
-| did the broker deliver this twice? | no — the duplicate never reaches the record | **yes**, as a `rejected` row |
+| did the broker deliver this twice? | no — the duplicate never reaches the record | **yes**, as two rows |
 | what did the source send at 02:14? | only if nothing arrived after | **yes** |
 | how many arrivals in this hour? | no | **yes** |
 
-So each accepted arrival writes a second, independent hash. Roughly doubles
-storage — accepted, and bounded by a shorter retention, see §4.
+So every delivery writes a second, independent hash — forked BEFORE the fold, so
+nothing it does can suppress a row. Roughly doubles storage, which was accepted, and
+it is bounded by a shorter retention (§4).
 
 ## 2. Shape
 
 ```text
-hist:<bareKey>|<arrivalId>   hash  ONE delivery. Immutable, no state.
-idx:history                  zset  "<bareKey>|<arrivalId>" -> broker timestamp
+hist:<deliveryId>   hash  ONE delivery. Immutable, no state.
+idx:history         zset  <deliveryId> -> broker timestamp
 ```
 
-The member is **compound** on purpose. The two zsets answer different questions
-(`idx:event:all` is per condition, `idx:history` is per arrival), and two
-conditions receiving the same message id must not share an audit hash.
+`<deliveryId>` is a **UUID minted per delivery** (`newDeliveryId()`), not derived
+from the message id and not scoped to the condition. Two consequences, both
+required:
+
+- two deliveries of the SAME message (a redelivery) are two rows, which is the
+  whole reason the fork happens before dedup;
+- a condition that fires 400 times keeps 400 rows instead of overwriting itself
+  down to one.
+
+The CONDITION key lives inside the hash as the `key` field. Putting it in the key
+name would reintroduce exactly that overwrite.
 
 ### 2.1 Fields
 
@@ -42,8 +51,11 @@ so the two cannot drift:
 
 | Field | Note |
 |---|---|
-| `source`, `type`, `msg`, `payload`, `severity`, `displaySeverity`, `brokerTs` | exactly what the record gets |
-| `applied` | the fold's verdict for THIS arrival |
+| `key` | the CONDITION this delivery belongs to (`<32 hex>`) |
+| `id` | the producer's message id — repeated across rows when a message is redelivered |
+| `source`, `type`, `msg`, `payload`, `severity`, `displaySeverity` | what arrived |
+| `brokerTs` | when WE received it |
+| `ts` | when the source claims it fired |
 
 Deliberately **absent**: `count`, `firstSeen`, `lastSeen`, `state`, `ackedBy`,
 `closedBy`, `closedAt`. Every one of those describes the condition at read time.
@@ -52,48 +64,60 @@ stale the moment the next arrival lands — and an operator reading `count: 1` o
 audit row of a condition with `count: 400` would have no way to know which number
 lied.
 
-`applied` is what makes the trail readable:
+There is deliberately **no `applied` field**. The fork happens before the fold, so
+at write time no verdict exists — and inventing one would mean the trail could only
+describe what the dedup accepted, which is the limitation this design removes. The
+verdict is a property of the CONDITION and lives on the record; the State column on
+Live events / All events is where it is read.
 
-| Value | Chip | Meaning |
-|---|---|---|
-| `1` | `counted` | folded in: `count` moved, `lastSeen` moved |
-| `3` | `closed` | retired the condition |
-| `0` | `rejected` | stale or a redelivery — the record refused it, nothing changed |
+## 3. It is written BEFORE the fold, not inside it
 
-`0` is **not** an error and is not coloured as one. At-least-once delivery makes a
-redelivery normal; painting it red would send an operator chasing the broker
-during a healthy incident.
+`recordDelivery()` in `services/worker/src/store.js`, called from the worker's
+message handler **before** `persistEvent()` runs the fold.
 
-## 3. It is written inside the fold
+An earlier version wrote the audit row inside `event-fold.lua`, atomically with the
+state. That was wrong for this requirement, and wrong in a way that was easy to miss:
+the fold is the dedup, so a row written inside it could only ever describe the
+arrivals the fold **accepted** (plus redeliveries its watermark happened to
+recognise). The one question an audit trail exists to answer —
 
-`k8s/base/20-event-fold-config.yaml`, steps 1c and the two exits. Not by a second
-round trip from the worker.
+> what did the broker actually hand us, and how many times?
 
-The reason is the one failure an audit trail cannot have:
+— was still unanswerable for anything the guard dropped.
 
-> a log written separately can be **skipped** — by a crashed worker, a timeout, a
-> rolling restart — leaving the record updated and its audit entry missing, with
-> nothing to detect it.
+So the fork is first and unconditional. The fold then runs and knows nothing about
+it. Consequences, all intended:
 
-Inside the script both happen or neither does. The same argument the indexes
-already rely on.
+| | |
+|---|---|
+| every accepted message produces exactly one row | including the ones the fold will reject |
+| a delivery never overwrites another | the id is unique per delivery |
+| the write still precedes the ack | a crash after processing but before recording would leave a hole in the log |
 
-It is written **before** the ordering guard can reject the arrival. A redelivery is
-still an arrival, and "did the broker deliver this twice" is exactly what the
-trail is for. The guard then only decides whether the RECORD changes.
+It is one `MULTI` of `HSET` + `PEXPIRE` + `ZADD`, so the row and its index member
+cannot disagree. A per-command error inside the `MULTI` is checked and re-thrown,
+because ioredis reports those in the result tuples rather than throwing — swallowing
+them would leave an index member with no hash behind it, rendering as an empty row.
+
+### 3.1 What is lost by moving it out of the script
+
+One thing: the row and the record are no longer written in the same atomic step, so
+a crash between them leaves a recorded delivery whose record was never updated. That
+is the correct trade — a gap in the log is worse than a gap in the cache, and the
+broker will redeliver the message anyway (producing a second audit row, which is
+accurate).
 
 ## 4. Retention — 3 days, on its own clock
 
 `FW_HISTORY_TTL`, default `259200` (3 days), against the record's 7.
 
 History is one hash per **delivery**, so at the documented 500/s storm peak three
-days of it outweighs a week of records. A shorter window is what keeps the size
-predictable while still covering "what happened during the incident this
-morning".
+days of it outweighs a week of records. A shorter window keeps the size predictable
+while still covering "what happened during the incident this morning".
 
 Two mechanisms, both needed:
 
-- `PEXPIRE` on each `hist:` hash, set inside the fold
+- `PEXPIRE` on each `hist:` hash, in the same `MULTI` as the write
 - `ZREM rangebyscore idx:history` in `maybePruneIndex`, on the **history** cutoff
   rather than the record's — pruning it with the record cutoff would keep three
   days of members alive for seven, a zset of a million members with no hashes
@@ -110,11 +134,10 @@ would promise rows that cannot exist.
 |---|---|
 | Severity | the arrival's own severity, coloured the same way as everywhere else (`colourSeverity`) |
 | **Received** | the broker timestamp — when *we* saw it, not when the source claims it fired |
-| **Result** | the verdict chip from §2.1 |
-| **Summary**, **Key** | the arrival's summary, and the condition it belongs to |
+| **Summary**, **Key** | the arrival's summary, and the condition it belongs to (`Key` carries the producer message id as a tooltip) |
 
 No State column and no Count: an arrival has no state, and a per-arrival count
-would be a constant 1.
+would be a constant 1. No Result column either — see §2.1.
 
 **The rows cannot be acked, closed or deleted** — those act on the CONDITION, and
 that lives on the other tabs. The one action offered is the inspector, because
@@ -166,9 +189,8 @@ held 3 of 40.
 - **no ordering guarantee beyond the timestamp** — `brokerTs` comes from the
   ingress, so two arrivals in the same millisecond sort by zset member, which is
   arbitrary. They are the same instant; nothing downstream depends on their order.
-- **no dedup of a redelivery into one row** — a redelivery reuses `(key, id)`, so
-  it overwrites its own audit hash rather than adding one. The row then records
-  `applied: 0`, which is the honest answer: the arrival was seen and changed
-  nothing.
+- **no dedup at all** — a redelivery is a SECOND ROW, and that is deliberate. The
+  trail records what the broker handed us; whether the fold counted it is a
+  different question, answered by the condition's `count`.
 - **not part of the resize/selection machinery** — no selection, no bulk actions.
   An audit row is a fact, not a target.

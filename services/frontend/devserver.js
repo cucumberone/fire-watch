@@ -536,11 +536,11 @@ wss.on('connection', async (ws) => {
       return;
     }
 
-    // ---- op: history — the per-ARRIVAL audit trail, mirroring handleHistoryQuery.
+    // ---- op: history — the per-DELIVERY audit trail, mirroring handleHistoryQuery.
     //
     // Built from the mock's own log so it agrees with the live stream. Each stored
-    // event is ONE arrival here; the real worker writes one `hist:` hash per
-    // delivery, and `applied` carries the fold's verdict for it.
+    // event is ONE delivery here, exactly as the real worker writes one `hist:`
+    // hash per message BEFORE the fold runs.
     if (frameIn.op === 'history') {
       const RANGE_MS = { '15m': 900e3, '1h': 3600e3, '6h': 6 * 3600e3,
                          '24h': 24 * 3600e3, '3d': 3 * 86400e3 };
@@ -553,9 +553,13 @@ wss.on('connection', async (ws) => {
         .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
       const rows = (frameIn.key ? all.filter((e) => e.key === frameIn.key) : all)
         .slice(0, limit)
-        .map((e) => ({
+        .map((e, i) => ({
+          // One row per DELIVERY. The mock's log is keyed by message id, so two
+          // entries with the same id would be a redelivery in the real system; the
+          // suffix keeps them distinct here, exactly as a UUID does for the worker.
+          deliveryId: `${e.id}-${i}`,
           id: e.id,
-          arrivalId: e.id,
+          arrivalId: `${e.id}-${i}`,
           key: e.key,
           source: e.source,
           type: e.type,
@@ -564,11 +568,10 @@ wss.on('connection', async (ws) => {
           summary: e.payload?.msg ?? '',
           payload: e.payload ?? {},
           brokerTs: e.brokerTs,
-          // The mock has no fold, so derive a plausible verdict: a CLOSE retires,
-          // anything else counts. Deterministically marking some rows rejected is
-          // deliberate — it is the only state that is otherwise unreachable in the
-          // harness, and a chip nobody can see is a chip nobody checks.
-          applied: e.severity === 'CLOSE' ? 3 : ((e.brokerTs ?? 0) % 7 === 0 ? 0 : 1),
+          ts: e.ts ?? null,
+          // No `applied`: the real trail is written BEFORE the fold, so no verdict
+          // exists at that point. Inventing one here would make the harness show a
+          // column production cannot fill.
         }));
       ws.send(JSON.stringify({
         op: 'history',

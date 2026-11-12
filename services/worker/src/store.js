@@ -29,6 +29,7 @@
  * three workers racing on the same condition converge instead of clobbering.
  */
 import { readFileSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { isGzip } from './event.js';
 import { bareKeyFor, summaryOf } from './keygen.js';
 import { keys } from './config.js';
@@ -101,6 +102,74 @@ function recordFields({ evt, storedPayload, brokerTs }) {
 }
 
 /**
+ * Fork EVERY delivery into the audit trail, before any dedup runs.
+ *
+ * This is deliberately NOT part of the fold.
+ *
+ * The fold is the dedup: it decides whether an arrival counts, retires, or is
+ * dropped as stale. Writing inside it meant the trail could only describe the
+ * arrivals the fold ACCEPTED (plus redeliveries it happened to recognise) — so the
+ * one question an audit trail exists to answer, "what did the broker actually hand
+ * us, and how many times", was still unanswerable.
+ *
+ * So the fork happens FIRST, unconditionally, and the fold runs afterwards and
+ * knows nothing about it. Consequences, all intended:
+ *
+ *   - every accepted message produces exactly one row, including the ones the fold
+ *     will reject as stale or redelivered;
+ *   - a delivery is never overwritten by a later one, because the id is unique per
+ *     DELIVERY (a UUID) rather than derived from the message id;
+ *   - `applied` is NOT here. Before the fold there is no verdict to record. The tab
+ *     shows the arrival; the verdict is a property of the condition and lives on
+ *     the record (docs/history.md §2).
+ *
+ * Cost is one HSET + one ZADD + one PEXPIRE per delivery, pipelined — which is
+ * exactly the storage doubling that was accepted when this was requested.
+ *
+ * @param {number} deliveryId  unique per delivery; becomes the index member
+ */
+export async function recordDelivery({
+  valkey, evt, storedPayload, brokerTs, bareKey, deliveryId, cfg, log,
+}) {
+  const key = keys.history(deliveryId);
+  const ttlMs = cfg.historyTtl * 1000;
+  const fields = [
+    'key', bareKey,
+    'id', String(evt.id ?? ''),
+    'source', String(evt.source ?? ''),
+    'type', String(evt.type ?? ''),
+    'severity', String(evt.severity ?? ''),
+    'displaySeverity', String(evt.payload?.EVT_Severity ?? evt.severity ?? ''),
+    'msg', summaryOf(evt),
+    'brokerTs', String(brokerTs),
+    'ts', String(evt.ts ?? ''),
+    'payload', JSON.stringify(storedPayload ?? {}),
+  ];
+
+  const wrote = await valkey.write((c) => c
+    .multi()
+    .hset(key, ...fields)
+    .pexpire(key, ttlMs)
+    .zadd(keys.historyIndex, brokerTs, deliveryId)
+    .exec());
+
+  // A per-command error inside a MULTI is reported in the result tuples and does
+  // NOT throw. Swallowing it would leave an index member with no hash behind it,
+  // which reads as an empty row — so it is raised here, where the caller requeues.
+  for (const [err] of wrote || []) {
+    if (err) throw err;
+  }
+
+  if (log) log.debug('delivery recorded', { deliveryId, key: bareKey });
+  return deliveryId;
+}
+
+/** A unique id for one delivery. Not derived from anything: see recordDelivery. */
+export function newDeliveryId() {
+  return `${Date.now().toString(36)}-${randomUUID()}`;
+}
+
+/**
  * Write one event: record + both timeline indexes + state fold, atomically.
  *
  * @returns {Promise<{applied:number, key:string, bareKey:string, eventKey:string}>}
@@ -110,39 +179,27 @@ export async function persistEvent({ valkey, evt, storedPayload, brokerTs, cfg, 
   const bareKey = bareKeyFor(evt);
   const eventKey = keys.event(bareKey);
   const ttlMs = cfg.eventTtl * 1000;
-  // The audit row's identity: the condition AND the arrival. Two conditions that
-  // receive the same message id must not share one history hash.
-  //
-  // A missing id falls back to the broker timestamp rather than to the empty
-  // string: an empty id would make every arrival of one condition collide on a
-  // single audit hash, so the trailing rows would overwrite each other. The ingress
-  // always mints an id, so this only covers a message that bypassed it.
-  const arrivalId = String(evt.id ?? '') || `t${brokerTs}`;
-  const historyKey = keys.history(bareKey, arrivalId);
 
   // ARGV layout must match k8s/base/20-event-fold-config.yaml exactly.
   const args = [
     String(brokerTs),       // ARGV[1] broker ts
-    arrivalId,              // ARGV[2] arrival id -> lastId / closedBy
+    String(evt.id ?? ''),   // ARGV[2] arrival id -> lastId / closedBy
     String(evt.severity),   // ARGV[3] severity
     bareKey,                // ARGV[4] index member
     String(evt.source ?? ''), // ARGV[5] device
     String(ttlMs),          // ARGV[6] ttl in ms
-    String(cfg.historyTtl * 1000), // ARGV[7] history ttl in ms
     ...recordFields({ evt, storedPayload, brokerTs }),
   ];
 
   const applied = await valkey.write((c) =>
     c.eval(
       fold.get(),
-      7,
+      5,
       eventKey,
       keys.eventAllIndex,
       keys.eventOpenIndex,
       keys.eventClosedIndex,
       keys.sourceIndex(evt.source),
-      historyKey,
-      keys.historyIndex,
       ...args,
     ),
   );

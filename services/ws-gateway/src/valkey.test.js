@@ -20,14 +20,6 @@ import assert from 'node:assert/strict';
 import { ValkeyReader, journalKey } from './valkey.js';
 
 const log = { info() {}, warn() {}, debug() {}, error() {} };
-
-// HISTORY_FIELDS order: source, type, severity, displaySeverity, msg, payload,
-// brokerTs, applied.
-const HISTORY_VALUES = [
-  'shop', 'check-001', 'CRITICAL', 'MAJOR', 'disk almost full',
-  JSON.stringify({ msg: 'disk almost full' }), '1000', '1',
-];
-const HISTORY_EMPTY = ['', '', '', '', '', '', '', ''];
 const cfg = { valkeyPassword: 'p', alertTtlMs: 1000, sentinels: [] };
 
 /** A reader whose connection is a hand-rolled client. */
@@ -39,6 +31,14 @@ function readerWith(client) {
 }
 
 const KEY = 'a'.repeat(32);
+
+// HISTORY_FIELDS order: key, id, source, type, severity, displaySeverity, msg,
+// payload, brokerTs, ts.
+const HISTORY_VALUES = [
+  KEY, 'evt-1', 'shop', 'check-001', 'CRITICAL', 'MAJOR', 'disk almost full',
+  JSON.stringify({ msg: 'disk almost full' }), '1000', '2026-11-12T00:00:00Z',
+];
+const HISTORY_EMPTY = ['', '', '', '', '', '', '', '', '', ''];
 
 /** A hash as HMGET returns it, in SNAPSHOT_FIELDS order. */
 function hashValues(over = {}) {
@@ -159,10 +159,11 @@ test('readClosedAlerts reads the closed index, newest first', async () => {
   assert.equal(rows[0].alertClosedBy, 'alice');
 });
 
-test('readHistory reads idx:history and splits the arrival member', async () => {
+test('readHistory reads idx:history, one row per DELIVERY', async () => {
   // The difference from readAllEvents is the whole point: this is one member per
-  // DELIVERY, so a condition that fired twice yields two rows.
-  const member = `${KEY}|evt-1`;
+  // DELIVERY, so a condition that fired twice yields two rows. The member is a
+  // delivery id; the CONDITION key and the producer message id live in the hash.
+  const member = 'del-1';
   const client = {
     async zrevrangebyscore(key, max, min) {
       assert.equal(key, 'idx:history');
@@ -176,7 +177,10 @@ test('readHistory reads idx:history and splits the arrival member', async () => 
       const p = {
         hmget(k, ...f) { q.push([k, f]); return p; },
         async exec() {
-          return q.map(([k]) => [null, HISTORY_VALUES]);
+          return q.map(([k]) => {
+            assert.equal(k, 'hist:del-1', 'the reader prefixes the member once');
+            return [null, HISTORY_VALUES];
+          });
         },
       };
       return p;
@@ -185,17 +189,18 @@ test('readHistory reads idx:history and splits the arrival member', async () => 
   const { rows, total } = await readerWith(client).readHistory({ sinceMs: 1000, limit: 10 });
   assert.equal(total, 9, 'the badge is the WINDOW total, not the page size');
   assert.equal(rows.length, 1);
-  assert.equal(rows[0].key, KEY, 'the condition key is recovered from the member');
-  assert.equal(rows[0].arrivalId, 'evt-1', 'and so is the arrival');
-  assert.equal(rows[0].applied, 1);
+  assert.equal(rows[0].deliveryId, 'del-1', 'the member IS the delivery id');
+  assert.equal(rows[0].key, KEY, 'the condition key comes from the hash');
+  assert.equal(rows[0].id, 'evt-1', 'so does the producer message id');
   assert.equal(rows[0].summary, 'disk almost full');
+  assert.equal(rows[0].applied, undefined, 'no verdict exists before the fold');
   assert.equal(rows[0].count, undefined, 'an audit row carries no state');
   assert.equal(rows[0].alertState, undefined, 'nor a joined alert state');
 });
 
 test('readHistory skips a member whose hash already expired', async () => {
   const client = {
-    async zrevrangebyscore() { return [`${KEY}|gone`]; },
+    async zrevrangebyscore() { return ['gone']; },
     async zcount() { return 1; },
     pipeline() {
       const p = {

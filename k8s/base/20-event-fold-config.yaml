@@ -43,9 +43,6 @@
 # KEYS[3] = idx:event:open       (zset: key -> last activity ts)
 # KEYS[4] = idx:event:closed     (zset: key -> closed_at ts)
 # KEYS[5] = idx:source:<source>  (zset: key -> last broker ts)
-# KEYS[6] = hist:<key>|<id>      (hash: ONE arrival, immutable, no state)
-# KEYS[7] = idx:history          (zset: "<key>|<id>" -> broker ts, member is BARE)
-#
 # KEYS[3..5] are what make the board survive a reload without a SCAN: an
 # unbounded `SCAN event:*` is refused everywhere in this design
 # (docs/websocket-server.md §3). They live inside this script so an index can
@@ -58,11 +55,15 @@
 # ARGV[4] = bare event key (the index member)
 # ARGV[5] = source (device)
 # ARGV[6] = ttl in ms
-# ARGV[7] = history ttl in ms (KEYS[6] PEXPIRE and the history prune)
-# ARGV[8..] = field, value, field, value ... applied on BOTH paths, because a
+# ARGV[7..] = field, value, field, value ... applied on BOTH paths, because a
 #             retirement can arrive for a condition with no stored record yet
 #
 # Returns: 0 stale/redelivery | 1 applied | 3 closed
+#
+# THE AUDIT TRAIL IS NOT HERE. Every delivery is forked into `hist:` by the worker
+# BEFORE this script runs, so the trail records what the broker handed us rather
+# than what the dedup accepted (docs/history.md §3, services/worker/src/store.js
+# recordDelivery). Nothing in this script knows or cares about it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -76,20 +77,14 @@ data:
     local sev        = ARGV[3]
     local member     = ARGV[4]
     local ttl        = tonumber(ARGV[6])
-    local hist_ttl   = tonumber(ARGV[7])
 
     -- 0. The record's own fields, as a flat pair list, parsed ONCE.
-    --
-    --    Used twice: written to the record in step 1d, and copied into the audit
-    --    row in step 1c. Sharing them is what keeps the two from drifting — an
-    --    audit entry that reported a different `msg` from the record it describes
-    --    would be worse than none.
     --
     --    Field/value pairs instead of a JSON blob because Lua cannot cheaply decode
     --    JSON, and doing it here keeps the whole update in ONE atomic step instead of
     --    an HSET followed by a round trip another worker could interleave with.
     local n = #ARGV
-    local i = 8
+    local i = 7
     local sets = {}
     while i + 1 <= n do
       sets[#sets + 1] = ARGV[i]
@@ -107,62 +102,16 @@ data:
     --    the "is this the same condition" question was answered by the KEY itself,
     --    so this guard is now about ORDER only, not identity.
     --
-    --    It no longer RETURNS early: the audit row is written first (step 1c), so
-    --    that a rejected arrival is still recorded. `verdict` carries the outcome.
-    local verdict = 1
     local wm_ts = tonumber(redis.call('HGET', KEYS[1], 'watermark') or '0')
     local wm_id = redis.call('HGET', KEYS[1], 'watermarkId') or ''
     if ts < wm_ts or (ts == wm_ts and arrival_id <= wm_id) then
-      verdict = 0
+      return 0
     end
 
     local existed = redis.call('EXISTS', KEYS[1])
     local state   = redis.call('HGET', KEYS[1], 'state') or ''
 
-    -- 1c. THE AUDIT RECORD — one hash per DELIVERY, written here so it cannot be
-    --     lost separately from the state it describes.
-    --
-    --     WHY INSIDE THE SCRIPT. `event:<key>` is updated IN PLACE: after the 400th
-    --     repeat of an incident the record looks exactly like it did after the
-    --     first, except for `count`. Anything that asks "what did we actually
-    --     receive, and when" needs a log, and a log written by a second round trip
-    --     can be skipped by a crash, a timeout or a rolling restart — leaving the
-    --     record updated and its audit entry missing, which is the one failure
-    --     mode an audit trail cannot have.
-    --
-    --     NO STATE IS COPIED. `count`, `ackedBy`, `closedBy` and `state` are
-    --     deliberately absent: they describe the CONDITION at read time and would
-    --     make the history row a second, competing source of truth. What is stored
-    --     is what arrived — payload included — plus `applied`, so the reader can
-    --     see WHY an arrival did not change anything (0 = stale/redelivered).
-    --
-    --     A REJECTED arrival is recorded too. "Did the broker deliver this twice"
-    --     is exactly the question an audit trail should answer, and the guard above
-    --     only decides whether the RECORD changes — not whether we saw it.
-    --
-    --     PEXPIRE per entry, so the trail is bounded by TIME rather than by a count.
-    --
-    --     `severity` is written explicitly, not taken from the field pairs: the
-    --     record's severity is applied separately (ARGV[3]) because the fold needs
-    --     it to branch, so it is absent from `sets`. Without it the audit row
-    --     carried no severity at all and every History badge rendered blank.
-    local hist_sets = { 'applied', '0', 'brokerTs', ARGV[1], 'severity', sev }
-    for j = 1, #sets, 2 do
-      hist_sets[#hist_sets + 1] = sets[j]
-      hist_sets[#hist_sets + 1] = sets[j + 1]
-    end
-    redis.call('HSET', KEYS[6], unpack(hist_sets))
-    redis.call('PEXPIRE', KEYS[6], hist_ttl)
-    -- The MEMBER is the bare `<key>|<id>`, not the hash name. Every other index in
-    -- this script stores a bare member and the reader adds the prefix, so storing
-    -- `hist:`-prefixed members would make the reader produce `hist:hist:...`.
-    redis.call('ZADD', KEYS[7], ts, member .. '|' .. arrival_id)
-
-    if verdict == 0 then
-      return 0
-    end
-
-    -- 1d. The record's own fields, applied to BOTH branches.
+    -- 1b. The record's own fields, applied to BOTH branches.
     --
     --    They are applied here rather than only on the occurrence path because a
     --    retirement can arrive for a condition this worker has never seen: an
@@ -203,13 +152,11 @@ data:
       -- It stays in both timeline indexes: a closure is an event.
       redis.call('ZADD', KEYS[2], ts, member)
       redis.call('ZADD', KEYS[5], ts, member)
-      -- The audit row records WHY this arrival mattered: it retired the condition.
-      redis.call('HSET', KEYS[6], 'applied', '3')
       return 3
     end
 
     -- 3. OCCURRENCE — this is the dedup. A repeat updates the SAME hash.
-    --    (The payload fields were already written in step 1d.)
+    --    (The payload fields were already written in step 1b.)
     local count = tonumber(redis.call('HGET', KEYS[1], 'count') or '0')
     local episode_started = (existed == 0 or state == 'closed' or state == '')
 
@@ -247,9 +194,4 @@ data:
     redis.call('ZADD', KEYS[2], ts, member)   -- global timeline
     redis.call('ZADD', KEYS[5], ts, member)   -- per-source timeline
 
-    -- The audit row records WHY this arrival mattered: it counted as an occurrence.
-    --
-    -- `applied` is the fold's own verdict rather than something the reader infers,
-    -- so a history row can never disagree with the count it sits beside.
-    redis.call('HSET', KEYS[6], 'applied', '1')
     return 1

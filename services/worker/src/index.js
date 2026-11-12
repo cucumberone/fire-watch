@@ -26,7 +26,8 @@ import {
   brokerTsMs,
 } from './event.js';
 import { ValkeyClient } from './valkey.js';
-import { FoldScript, persistEvent, reconcileEventIndex } from './store.js';
+import { bareKeyFor } from './keygen.js';
+import { FoldScript, persistEvent, reconcileEventIndex, recordDelivery, newDeliveryId } from './store.js';
 import { AmqpConsumer } from './amqp.js';
 
 const cfg = loadConfig();
@@ -114,12 +115,34 @@ async function handleMessage(msg) {
       level: cfg.compressLevel,
     });
 
-    // ---- write + fold. Throws on transient failure -> requeue.
+    // ---- 1. FORK THE DELIVERY into the audit trail, BEFORE any dedup.
     //
-    // ONE call now covers the record, both timeline indexes and the state rollup.
+    // This is the raw log: one row per message we were handed, written
+    // unconditionally and never revisited. It happens before the fold on purpose,
+    // or the trail could only describe the arrivals the fold ACCEPTED — which is
+    // the one thing an audit trail must not do.
+    //
+    // It also has to succeed before the ack: a delivery that was processed but not
+    // recorded is a hole in the log, and holes are what an audit trail exists to
+    // rule out. A failure here requeues, exactly like a failed record write.
+    const deliveryId = newDeliveryId();
+    await recordDelivery({
+      valkey,
+      evt,
+      storedPayload,
+      brokerTs,
+      bareKey: bareKeyFor(evt),
+      deliveryId,
+      cfg,
+      log,
+    });
+
+    // ---- 2. write + fold. Throws on transient failure -> requeue.
+    //
+    // ONE call covers the record, both timeline indexes and the state rollup.
     // `applied` is the fold's verdict (docs/event-lifecycle.md §5.2):
     //
-    //   0  stale or redelivered  -> nothing moved
+    //   0  stale or redelivered  -> nothing moved (but the fork above stands)
     //   1  occurrence            -> count++, lastSeen moved
     //   3  retired               -> the condition is closed
     const { applied, bareKey } = await persistEvent({

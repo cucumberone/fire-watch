@@ -125,22 +125,25 @@ export const keys = {
   sourceIndex: (source) => `idx:source:${source}`,
 
   /**
-   * One audit record per DELIVERY — the immutable history.
+   * One record per DELIVERY, written BEFORE the fold — the raw audit log.
    *
-   * `hist:<record key>|<arrival id>` is a hash of the facts as they arrived: id,
-   * device, type, severity, summary, payload, broker timestamp and the fold's
-   * verdict. It carries NO state: no count, no ack, no closedBy. That is the point
-   * — a condition's record is updated in place, so the only way to see that it
-   * fired 400 times in an hour is a log written once per delivery.
+   * The id is UNIQUE PER DELIVERY, not derived from the message id. Two reasons:
    *
-   * The member is compound (`<bareKey>|<id>`) rather than the bare id because the
-   * two zsets answer different questions: the record index is keyed by CONDITION,
-   * this one by ARRIVAL, and two conditions receiving the same message id must not
-   * overwrite each other's audit row.
+   *   1. Every delivery gets a row. The write happens before the fold, so it cannot
+   *      depend on a verdict the fold has not produced yet; nothing downstream may
+   *      collapse or overwrite it.
+   *   2. A redelivery (the same message arriving twice) is two rows. That is the
+   *      point of a pre-dedup fork: the trail records what the broker actually
+   *      handed us, so "did this arrive twice" is answerable.
+   *
+   * The CONDITION key travels inside the hash as a `key` field, not in the key
+   * name. Putting it in the name would mean two conditions could collide on one
+   * audit hash whenever their delivery ids coincided, and a condition that fires
+   * 400 times would overwrite itself down to a single row.
    */
-  history: (bareKey, arrivalId) => `hist:${bareKey}|${arrivalId}`,
+  history: (deliveryId) => `hist:${deliveryId}`,
 
-  /** History index: `<bareKey>|<id>` -> broker timestamp. Backs the History tab. */
+  /** History index: delivery id -> broker timestamp. Backs the History tab. */
   historyIndex: 'idx:history',
 
   channelEvents: 'fw:ch:events',

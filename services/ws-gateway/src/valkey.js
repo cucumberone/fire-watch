@@ -50,7 +50,7 @@ const SNAPSHOT_FIELDS = [
 ];
 
 /**
- * Fields of an AUDIT row (`hist:<key>|<id>`).
+ * Fields of an AUDIT row (`hist:<deliveryId>`).
  *
  * Deliberately a different, smaller set than SNAPSHOT_FIELDS, and the omissions are
  * the design: no `count`, no `firstSeen`/`lastSeen`, no `state`, no ack, no
@@ -58,12 +58,13 @@ const SNAPSHOT_FIELDS = [
  * DELIVERY. Reading them here would either be blank (nothing writes them) or, worse,
  * a stale copy competing with the record it belongs to.
  *
- * `applied` is the fold's verdict (0 rejected, 1 occurrence, 3 retirement), which is
- * what makes a history row explain WHY it did or did not change anything.
+ * There is no `applied` either, and that is the whole point of forking before the
+ * fold: at the moment this row is written no verdict exists. The row records what
+ * arrived, not what the dedup decided about it.
  */
 const HISTORY_FIELDS = [
-  'source', 'type', 'severity', 'displaySeverity', 'msg', 'payload',
-  'brokerTs', 'applied',
+  'key', 'id', 'source', 'type', 'severity', 'displaySeverity', 'msg', 'payload',
+  'brokerTs', 'ts',
 ];
 
 const SNAPSHOT_LUA = `
@@ -425,15 +426,18 @@ export class ValkeyReader {
       const v = at(name);
       return v === '' ? null : Number(v);
     };
-    const bar = member.indexOf('|');
-    const key = bar === -1 ? member : member.slice(0, bar);
-    const arrivalId = bar === -1 ? '' : member.slice(bar + 1);
     return {
-      // `id` is the ARRIVAL, not the record: two rows for one condition must be
-      // distinguishable, and the live tail already identifies a row this way.
-      id: arrivalId,
-      arrivalId,
-      key,
+      // `deliveryId` is the index member: unique per DELIVERY, so the same message
+      // arriving twice yields two distinct rows.
+      deliveryId: member,
+      // `id` is the PRODUCER's message id, from the hash. It is deliberately not
+      // unique across rows — a redelivery repeats it, and that is exactly what the
+      // trail is meant to show.
+      id: at('id'),
+      arrivalId: member,
+      // The CONDITION this delivery belongs to. Read from the hash, not the key
+      // name: a condition that fires 400 times must not overwrite its own trail.
+      key: at('key'),
       source: at('source'),
       type: at('type'),
       severity: at('severity'),
@@ -441,10 +445,10 @@ export class ValkeyReader {
       summary: at('msg'),
       payload: safeParse(at('payload')) || {},
       brokerTs: num('brokerTs'),
-      applied: num('applied'),
-      // The alert STATE is deliberately absent — the audit row has none. The
-      // client joins it from the alert map it already holds, so a history row
-      // shows today's state without the trail storing a second copy of it.
+      ts: at('ts') || null,
+      // NO `applied`. The trail is written BEFORE the fold, so no verdict exists at
+      // that moment (docs/history.md §2). The verdict is a property of the
+      // condition and lives on the record, where the State column reads it.
     };
   }
 

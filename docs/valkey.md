@@ -89,9 +89,13 @@ is still what a rebuild reads ([history.md](history.md) §6,
 [persistence-and-durability.md](persistence-and-durability.md) §4).
 
 ```text
-hist:<bareKey>|<arrivalId>   hash  ONE delivery, immutable, no state
-idx:history                  zset  "<bareKey>|<arrivalId>" -> broker timestamp
+hist:<deliveryId>   hash  ONE delivery, immutable, no state
+idx:history         zset  <deliveryId> -> broker timestamp
 ```
+
+The id is a per-delivery UUID, and the CONDITION key travels inside the hash — so a
+condition that fires 400 times keeps 400 rows rather than overwriting one, and a
+redelivery is two rows rather than one.
 
 Both expire on `FW_HISTORY_TTL`, and the index is pruned on that cutoff — not the
 record's — so three days of members cannot outlive the hashes behind them.

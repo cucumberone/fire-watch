@@ -103,12 +103,15 @@ const ALL_EVENT_COLS = ['Severity', 'State', 'First occurrence', 'Last occurrenc
 //
 // No State column, and no Count. An audit row describes an ARRIVAL, not a
 // condition: `state` belongs to the record (which may have moved on since), and a
-// per-arrival count would be a constant 1. What replaces them is `Result` — the
-// fold's verdict for this delivery — which is the fact that makes a trail readable:
-// it distinguishes "this incremented the count" from "this was rejected as a
-// redelivery" from "this retired the alert".
-const HISTORY_COLS = ['Severity', 'Received', 'Result', 'Summary', 'Key'];
-const HISTORY_DEFAULT_W = [96, 172, 96, 380, 240];
+// per-arrival count would be a constant 1.
+//
+// No `Result` column either, and that is the point of writing the fork BEFORE the
+// fold: at the moment the row is written no verdict exists, so the trail records
+// what the broker handed us rather than what the dedup decided. A `CLOSE` that the
+// watermark rejects still appears here — which is exactly how "did it arrive twice"
+// becomes answerable.
+const HISTORY_COLS = ['Severity', 'Received', 'Summary', 'Key'];
+const HISTORY_DEFAULT_W = [96, 172, 380, 240];
 
 /**
  * Default widths, in px, for every real column.
@@ -1969,53 +1972,14 @@ function ScrollTable({ cols, head, rows, bodyClass }) {
 }
 
 /**
- * The fold's verdict for ONE arrival, as a chip.
+ * One row in the History tab: a single DELIVERY.
  *
- * This is what makes an audit trail readable rather than a wall of identical
- * rows. The same condition reported five times produces five rows that look
- * alike; this column says which of them actually moved the count.
- *
- *   1  occurrence — counted, `lastSeen` moved
- *   3  retirement — closed the condition
- *   0  rejected   — stale or a redelivery; the record refused it
- *
- * `0` is deliberately NOT styled as an error. A redelivery is normal operation
- * (at-least-once delivery), and colouring it red would send an operator chasing
- * the broker during a perfectly healthy incident. It is rendered as a quiet
- * outline, which reads as "seen, no effect".
- */
-function ResultChip({ applied }) {
-  if (applied === 3) {
-    return (
-      <Chip label="closed" size="small" color="success" variant="outlined"
-            title="This arrival RETIRED the condition" />
-    );
-  }
-  if (applied === 0) {
-    return (
-      <Chip label="rejected" size="small" variant="outlined"
-            title="Stale or a redelivery: the record refused this arrival, nothing changed"
-            sx={{ opacity: 0.7 }} />
-    );
-  }
-  if (applied === 1) {
-    return (
-      <Chip label="counted" size="small" color="primary" variant="outlined"
-            title="Counted as an occurrence: the count moved and so did last occurrence" />
-    );
-  }
-  // A row written by an older worker carries no verdict. Saying so beats guessing.
-  return <Chip label="—" size="small" variant="outlined" sx={{ opacity: 0.5 }} />;
-}
-
-/**
- * One row in the History tab: a single ARRIVAL.
- *
- * Shares nothing with EventRow beyond the badge, because the facts differ. An audit
- * row has no Count (it is one delivery), no State (that belongs to the record, which
- * may have moved on since), and its meaningful timestamp is when the broker received
- * it. What it adds is `Result` — the fold's verdict — and the record key, so an
- * operator can go from "this arrived" to "this is the condition it belongs to".
+ * Distinct from EventRow because the facts are different. A delivery has no Count
+ * (it is one message), no State and no verdict — the trail is forked BEFORE the
+ * fold runs, so at write time nothing has been decided about it. What it does carry
+ * is the condition it belongs to (`key`), the producer's message id, and the broker
+ * timestamp, which is when WE received it rather than when the source claims it
+ * fired.
  */
 function HistoryRow({ evt, onContextMenu }) {
   const label = evt.displaySeverity ?? evt.severity;
@@ -2025,12 +1989,16 @@ function HistoryRow({ evt, onContextMenu }) {
       onContextMenu={onContextMenu}
     >
       <td><Badge severity={evt.severity} label={label} /></td>
+      {/* When WE received it. `evt.ts` (the source's own claim) is in the
+          inspector: the two can disagree, and the broker timestamp is the one
+          that decides ordering. */}
       <td className="mono">{formatClock(evt.brokerTs)}</td>
-      <td><ResultChip applied={evt.applied} /></td>
       <td className="summary">
         {evt.summary || <span className="dim">—</span>}
       </td>
-      <td className="mono nowrap">{evt.key}</td>
+      <td className="mono nowrap" title={evt.id ? `message id ${evt.id}` : undefined}>
+        {evt.key}
+      </td>
       <td />
     </tr>
   );
@@ -3097,9 +3065,9 @@ function App() {
                 )}
                 rows={historyRows.map((evt, i) => (
                   <HistoryRow
-                    // Arrival-scoped key: one condition can appear many times, and
-                    // a record key alone would collapse those rows.
-                    key={`${evt.key}|${evt.arrivalId}|${i}`}
+                    // The DELIVERY id: unique per row, so a condition that fired
+                    // twice cannot collapse into one rendered row.
+                    key={evt.deliveryId || `${evt.key}|${i}`}
                     evt={evt}
                     // Read-only: an audit row cannot be acked, closed or deleted —
                     // those act on the CONDITION, which lives on the other tabs.
@@ -3108,7 +3076,7 @@ function App() {
                     onContextMenu={(ev) => openInspector(
                       ev,
                       evt.wire ?? evt,
-                      `${evt.source || 'event'} · ${evt.arrivalId || 'arrival'}`,
+                      `${evt.source || 'event'} · ${evt.id || 'delivery'}`,
                       [],
                       evt.key || null,
                     )}

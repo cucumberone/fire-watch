@@ -34,6 +34,7 @@ import {
   validateDelete,
   validateClosedQuery,
   validateAllEventsQuery,
+  operatorCloseEvent,
   validateHistoryQuery,
   normaliseAck,
   ackFrame,
@@ -448,93 +449,121 @@ async function handleClose(conn, frame, send) {
     return;
   }
 
-  // Bare key, no prefix: valkey.js adds `event:` exactly once.
   const bareKey = verdict.key;
-  let result;
+
+  // ---- 1. Read the condition this operator is closing.
+  //
+  // Needed BEFORE any write, because the event we inject has to carry the
+  // condition's own device and summary: the record key is
+  // `sha256(device + 0x1f + summary)[0:32]`, so echoing those two fields is what
+  // makes the closure land on the SAME key instead of creating a second condition
+  // (docs/event-lifecycle.md §11). The key itself is an opaque hash — the values
+  // are not recoverable from it.
+  let record;
   try {
-    result = await reader.closeAlert(bareKey, verdict.by, Date.now(), cfg.alertTtlMs);
+    record = await reader.readEvent(bareKey);
   } catch (err) {
-    log.error('close write failed', { key: verdict.key, err: String(err) });
+    log.error('close read failed', { key: bareKey, err: String(err) });
     send(JSON.stringify({
-      op: 'error',
-      code: 'close_failed',
-      message: 'could not close the alert, retry',
+      op: 'error', code: 'close_failed', message: 'could not close the alert, retry',
     }));
     return;
   }
-
-  if (result.status === 'missing') {
+  if (!record || record.unparseable) {
     // Same rule as ack: never create a hash just to close it, or a phantom row
     // with no severity and no count appears on every board.
     send(JSON.stringify({
-      op: 'error',
-      code: 'no_such_alert',
-      message: 'that alert no longer exists',
+      op: 'error', code: 'no_such_alert', message: 'that alert no longer exists',
     }));
     return;
   }
 
-  if (result.status === 'already') {
-    // Two operators clicked Close. The first write wins and the second learns who
-    // actually closed it, rather than overwriting the author and timestamp. The
-    // client still gets a close frame so its row disappears.
-    log.debug('alert already closed', { key: verdict.key, by: result.by });
-    send(closeFrame(verdict.key));
+  const nowMs = Date.now();
+
+  // ---- 2. Inject it as a REAL EVENT.
+  //
+  // The closure travels the ordinary pipeline — validated, compressed, folded,
+  // forked into the audit trail — rather than being a special-cased state flip.
+  // That is the whole request: an operator close must be indistinguishable
+  // downstream from a source-sent retirement.
+  //
+  // `severity: 'CLOSE'` is the INTERNAL retirement value, which the worker accepts
+  // on the envelope (`SEVERITIES` in services/worker/src/event.js). `CLEAR` is the
+  // producer-side spelling that the ingress maps onto it; we bypass the ingress, so
+  // we send the internal value directly.
+  //
+  // `EVT_Severity: 'CLOSED'` is only the DISPLAY label: it is what the badge
+  // renders, and it is deliberately distinct from a source `CLEAR` so an operator
+  // can see at a glance that a human ended this one rather than the monitoring.
+  const closeEvent = operatorCloseEvent(record, verdict.by, nowMs,
+    `operator-close-${bareKey}-${nowMs}`);
+  const injected = await audit.publishIngestEvent(closeEvent);
+
+  if (!injected) {
+    // ---- 2b. Fallback: retire the record directly.
+    //
+    // Only reached when the broker is unavailable or the ingest path is not
+    // configured. The UI still has to be able to close an alert during a broker
+    // outage — the alternative is an operator unable to end an incident — so the
+    // direct write stays. It is the OLD path, kept narrow on purpose, and it is
+    // logged so a close that produced no event is never silent.
+    log.warn('closing by direct write: no event could be injected', {
+      key: bareKey, by: verdict.by,
+    });
+    let result;
+    try {
+      result = await reader.closeAlert(bareKey, verdict.by, nowMs, cfg.alertTtlMs);
+    } catch (err) {
+      log.error('close write failed', { key: bareKey, err: String(err) });
+      send(JSON.stringify({
+        op: 'error', code: 'close_failed', message: 'could not close the alert, retry',
+      }));
+      return;
+    }
+    if (result.status === 'missing') {
+      send(JSON.stringify({
+        op: 'error', code: 'no_such_alert', message: 'that alert no longer exists',
+      }));
+      return;
+    }
+    send(closeFrame(bareKey));
+    await broadcastClose(bareKey);
     return;
   }
 
-  // Confirm to the originator, then fan out to the other pods.
-  send(closeFrame(verdict.key));
-
-  // The close wrote a real CLEAR event record, so broadcast it like any other
-  // event: the live tail shows the closure next to the CLEAR a source would have
-  // sent, and it appears in the retention window with an author. `applied: 3`
-  // matches what the fold returns for a retirement, so clients treat it
-  // identically.
+  // ---- 3. Confirm immediately, then fan out.
   //
-  // A fan-out failure is logged but not fatal: the record is already durable in
-  // Dragonfly and `op: closed` is a query, so it will show there regardless.
-  if (result.eventId) {
-    try {
-      await reader.publish(cfg.channelEvents, JSON.stringify({
-        event: {
-          id: result.eventId,
-          source: verdict.key.slice(0, Math.max(0, verdict.key.indexOf(':'))),
-          type: verdict.key.slice(verdict.key.indexOf(':') + 1),
-          severity: 'CLOSE',
-          ts: new Date(result.at).toISOString(),
-          brokerTs: result.at,
-          operatorClose: true,
-          payload: {
-            msg: `Closed by ${result.by}`,
-            EVT_Severity: 'CLEAR',
-            EVT_Agent: result.by,
-          },
-        },
-        applied: 3,
-      }));
-    } catch (err) {
-      log.error('close event broadcast failed after a durable write', {
-        key: verdict.key, id: result.eventId, err: String(err),
-      });
-    }
-  }
+  // The event is durable in the broker at this point but the worker has not folded
+  // it yet, so the row would linger for a round trip. The local frame settles the
+  // originator now; the worker's own `applied: 3` fan-out arrives moments later and
+  // is idempotent (applyAlert deletes a row it already removed).
+  send(closeFrame(bareKey));
+  await broadcastClose(bareKey);
 
+  log.info('operator close injected as an event', {
+    key: bareKey, by: verdict.by, id: closeEvent.id,
+  });
+}
+
+/**
+ * Tell every pod that a condition was closed.
+ *
+ * Tagged with THIS pod so the subscriber skips the originator, which was already
+ * sent a `closeFrame` above — without the tag the originator got the frame twice,
+ * which once made a closure badge count one closure twice.
+ *
+ * A failure is logged, not fatal: the write is durable, so the worst case is that
+ * another pod's clients keep the row until they reload.
+ */
+async function broadcastClose(bareKey) {
   try {
     await reader.publish(cfg.channelAlerts, JSON.stringify({
       kind: 'close',
-      // Tagged with this pod so the subscriber can skip re-sending it to clients
-      // this pod ALREADY confirmed above. Without the tag the originator got the
-      // frame twice: once from `send(closeFrame(...))` and once from its own
-      // pub/sub echo, which once made a closure badge count one closure
-      // twice.
       origin: POD_NAME,
-      key: verdict.key,
+      key: bareKey,
     }));
   } catch (err) {
-    // The write is durable already; other pods will simply not see the frame and
-    // their clients keep the row until they reload. Loud, because it diverges.
-    log.error('close broadcast failed after a durable write', { key: verdict.key, err: String(err) });
+    log.error('close broadcast failed after a durable close', { key: bareKey, err: String(err) });
   }
 }
 

@@ -99,6 +99,22 @@ export function loadConfig() {
     amqpAuditExchange: optional('AMQP_AUDIT_EXCHANGE', ''),
     amqpAuditKey: optional('AMQP_AUDIT_KEY', ''),
 
+    // The INGEST path, used only by an operator close.
+    //
+    // A manual close injects a real event into the same exchange the producers
+    // use, rather than writing the hash directly. That way it is processed by the
+    // ordinary worker pipeline — validated, compressed, folded, forked into the
+    // audit trail — and correlates onto the SAME condition key as the alert it
+    // closes. Writing the hash from the gateway would create a second code path
+    // that can drift from the fold, which is how a "closed" row ends up looking
+    // different depending on who closed it (docs/event-lifecycle.md §11).
+    //
+    // Optional, like the audit pair: without a broker the close still retires the
+    // record (the direct write remains the fallback), it just does not produce an
+    // event.
+    amqpExchange: optional('AMQP_EXCHANGE', ''),
+    amqpRoutingKey: optional('AMQP_ROUTING_KEY', ''),
+
     port: int('FW_PORT', 8080),
     logLevel: optional('FW_LOG_LEVEL', 'info'),
   };

@@ -1136,3 +1136,28 @@ test('a row with no firstOccurrence falls back to the event broker timestamp', (
   const map = applyAlert(new Map(), { key: 'k', applied: 1, event: { brokerTs: 777 } });
   assert.equal(map.get('k').firstSeen, 777);
 });
+
+// ---------------------------------- an OPERATOR close carries the label CLOSED
+test('an operator close is displayed as CLOSED, not as a source CLEAR', () => {
+  // The gateway injects a real event with the internal severity CLOSE and the
+  // display label CLOSED, so an operator can tell a human-ended incident from one
+  // the monitoring resolved.
+  const v = toViewEvent({
+    id: 'operator-close-1', source: 'shop', type: 'check-001', severity: 'CLOSE',
+    payload: { msg: 'disk almost full', EVT_Severity: 'CLOSED' },
+  });
+  assert.equal(v.severity, 'CLOSE', 'the stored severity stays internal');
+  assert.equal(v.displaySeverity, 'CLOSED', 'the badge says a human closed it');
+});
+
+test('CLOSED and CLEAR both read as a retirement', () => {
+  // `isRetirement` drives the dimming, so it must accept the display spelling as
+  // well as the internal one — callers hold one or the other depending on the path.
+  assert.equal(isRetirement('CLOSED'), true);
+  assert.equal(isRetirement('CLOSE'), true);
+  assert.equal(isRetirement('CLEAR'), false, 'CLEAR is a display label, not internal');
+});
+
+test('CLOSED takes the retirement colour, not the unknown colour', () => {
+  assert.equal(colourSeverity('CLOSE', 'CLOSED'), 'CLOSE');
+});

@@ -152,6 +152,46 @@ export function validateClose(frame) {
 }
 
 /**
+ * Build the EVENT an operator close injects.
+ *
+ * Pure and exported so the property that makes this work can be asserted without a
+ * broker: `source` and `payload.msg` are echoed VERBATIM from the record being
+ * closed, and those are exactly the two fields the record key is derived from —
+ * `sha256(source + 0x1f + payload.msg)[0:32]` (services/worker/src/keygen.js). A
+ * close that re-derived either one would open a SECOND condition instead of
+ * retiring the one the operator pointed at.
+ *
+ * @param {object} record  the stored record: `{ source, type, summary }`
+ * @param {string} by      the operator's name
+ * @param {number} nowMs   timestamp, also the event id's uniqueness
+ * @param {string} [eventId]
+ */
+export function operatorCloseEvent(record, by, nowMs, eventId = `operator-close-${record?.source}-${nowMs}`) {
+  const source = String(record?.source ?? '');
+  const summary = String(record?.summary ?? '');
+  return {
+    id: eventId,
+    source,
+    type: String(record?.type ?? ''),
+    // The INTERNAL retirement value: this bypasses the ingress, so it sends what
+    // the ingress would have produced for a producer CLEAR.
+    severity: 'CLOSE',
+    ts: new Date(nowMs).toISOString(),
+    payload: {
+      // `msg` is the summary the KEY is built from. Never reword it.
+      msg: summary,
+      // The DISPLAY label only. Deliberately distinct from a source `CLEAR`, so an
+      // operator can see that a human ended this one.
+      EVT_Severity: 'CLOSED',
+      EVT_Device: source,
+      EVT_Summary: summary,
+      EVT_Agent: by,
+      EVT_ClosedBy: by,
+    },
+  };
+}
+
+/**
  * Frame telling clients a record is retired.
  *
  * Reuses `op: alert` with `applied: 3`, which is exactly what a CLOSE event from a

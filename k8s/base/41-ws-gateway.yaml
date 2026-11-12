@@ -84,6 +84,13 @@ spec:
             - { name: AMQP_PORT,           value: "5672" }
             - { name: AMQP_AUDIT_EXCHANGE, value: fx.audit }
             - { name: AMQP_AUDIT_KEY,      value: event.audit }
+            # The INGEST path. Used only by an operator close, which injects a
+            # real event so the worker folds it like any other — instead of the
+            # gateway writing the hash through a second, drift-prone code path.
+            # Same exchange the producers use, so the queue topology, DLX and
+            # audit copy are unchanged (docs/event-lifecycle.md §11).
+            - { name: AMQP_EXCHANGE,    value: fx.events }
+            - { name: AMQP_ROUTING_KEY, value: event.ingest }
             - name: AMQP_USER
               valueFrom:
                 configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }

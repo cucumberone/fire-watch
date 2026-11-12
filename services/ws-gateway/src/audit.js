@@ -33,6 +33,15 @@ export class AuditPublisher {
       cfg.amqpHost && cfg.amqpUser && cfg.amqpPass
       && cfg.amqpAuditExchange && cfg.amqpAuditKey,
     );
+    // The INGEST path is a separate switch: it needs the ingest exchange and
+    // routing key, which are different config values from the audit pair. Keeping
+    // them apart means an operator close can degrade on its own — the direct write
+    // still retires the record — without affecting journal durability, and vice
+    // versa.
+    this.ingestEnabled = Boolean(
+      cfg.amqpHost && cfg.amqpUser && cfg.amqpPass
+      && cfg.amqpExchange && cfg.amqpRoutingKey,
+    );
     // Imported lazily so a harness without the dependency still runs the rest of
     // the gateway. `amqplib` is loaded on first use, not at module scope.
     this.loadModule = null;
@@ -41,6 +50,11 @@ export class AuditPublisher {
   /** True when notes are actually being replicated. Surfaced at startup and in /metrics. */
   isEnabled() {
     return this.enabled;
+  }
+
+  /** True when an operator close can inject a real event. Surfaced in /metrics. */
+  isIngestEnabled() {
+    return this.ingestEnabled;
   }
 
   async connect() {
@@ -118,6 +132,61 @@ export class AuditPublisher {
         key: record.key, id: record.entry.id, err: String(err),
       });
       // Drop the channel so the next attempt reconnects instead of reusing a dead one.
+      this.channel = null;
+      return false;
+    }
+  }
+
+  /**
+   * Publish one event to the INGEST exchange, as if a producer had sent it.
+   *
+   * Used only by an operator close. The point is that the closure then travels the
+   * ordinary pipeline — validated, compressed, folded, forked into the audit trail
+   * — instead of being a second, special-cased write that can drift from it
+   * (docs/event-lifecycle.md §11).
+   *
+   * AWAITED CONFIRM, because the caller reports the close as done. A best-effort
+   * publish here would mean "closed in the UI, but the event that proves it
+   * vanished" — the same class of bug as acknowledging before the write.
+   *
+   * Returns false rather than throwing: the record has already been retired by the
+   * time this runs, so a broker outage must not turn a successful close into an
+   * error. The caller logs the miss.
+   *
+   * @param {object} event  a canonical envelope: id, source, type, severity, ts, payload
+   */
+  async publishIngestEvent(event) {
+    if (!this.ingestEnabled) return false;
+    try {
+      const channel = await this.connect();
+      const body = Buffer.from(JSON.stringify(event), 'utf8');
+      await new Promise((resolve, reject) => {
+        channel.publish(
+          this.cfg.amqpExchange,
+          this.cfg.amqpRoutingKey,
+          body,
+          {
+            persistent: true,
+            deliveryMode: 2,
+            contentType: 'application/json',
+            contentEncoding: 'identity',
+            type: event.type,
+            messageId: event.id,
+            appId: 'fire-watch-ui',
+            headers: {
+              'x-ingress-source': 'operator',
+              'x-event-source': event.source,
+              'x-event-severity': event.severity,
+            },
+          },
+          (err) => (err ? reject(err) : resolve()),
+        );
+      });
+      return true;
+    } catch (err) {
+      this.log.warn('ingest publish failed — the record is closed but no event was created', {
+        id: event.id, err: String(err),
+      });
       this.channel = null;
       return false;
     }

@@ -423,9 +423,16 @@ export function formatClock(ms) {
  */
 export const SEVERITY_RANK = { FATAL: 0, CRITICAL: 1, WARNING: 2, HARMLESS: 3, CLOSE: 4 };
 
-/** Retirement signals: these end an alert episode rather than starting one. */
+/**
+ * Retirement signals: these end an alert episode rather than starting one.
+ *
+ * `CLOSED` is included because it is the DISPLAY label an operator close carries.
+ * The stored severity is still `CLOSE` (the fold only knows the internal scale), so
+ * this accepts both spellings rather than making every caller aware of which side
+ * of the pipeline it is holding.
+ */
 export function isRetirement(severity) {
-  return severity === 'CLOSE' || severity === 'HARMLESS';
+  return severity === 'CLOSE' || severity === 'HARMLESS' || severity === 'CLOSED';
 }
 
 /**
@@ -455,6 +462,10 @@ const DISPLAY_TO_COLOUR = {
   HARMLESS: 'CLOSE',
   CLEAR: 'CLOSE',
   CLOSE: 'CLOSE',
+  // An OPERATOR close. The gateway injects it with the internal `CLOSE` severity
+  // but the display label `CLOSED`, so an operator can tell a human-ended incident
+  // from a source-sent CLEAR at a glance. Same green as every other retirement.
+  CLOSED: 'CLOSE',
 };
 
 /**

@@ -422,6 +422,61 @@ deliveries are read from the WAL.
 All five are implemented. The third and fourth are what prevent a healthy 1 000 evt/min
 stream from looking like an outage.
 
+## 8.2 An operator close IS an event
+
+Closing an alert from the UI does not flip a state flag. The gateway **injects a
+real event** into the ingest exchange, and the worker processes it through the
+ordinary pipeline — validate, compress, fold, audit fork.
+
+Why it is done that way:
+
+| | |
+|---|---|
+| **One code path** | A closure a human made and a closure a source reported go through the same fold. A second, special-cased write is a second definition of "closed", and the two drift. |
+| **It correlates for free** | The injected event echoes the record's own `source` and `payload.msg`, so it hashes onto the SAME condition key ([valkey.md](valkey.md) §2). No key is passed between the two writes, so nothing can disagree about which alert was retired. |
+| **It is a real record** | The closure appears in All events, in History (as its own delivery), in the audit trail, and in `q.audit.events` — so "who ended this, and when" is answerable from storage rather than from a transient frame. |
+| **Durability** | The event is broker-confirmed before the operator is told it worked. |
+
+### 8.2.1 The two fields that must not be reworded
+
+The record key is
+
+```text
+event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>
+```
+
+so the injected event must carry the closed record's `source` and `payload.msg`
+**verbatim**. Re-deriving either one — trimming it, re-casing it, prefixing it with
+"Closed:" so it reads nicely — would hash to a DIFFERENT key and open a second
+condition instead of retiring the one the operator clicked. `operatorCloseEvent()`
+in `services/ws-gateway/src/ack.js` is the only place that builds this event, and
+its tests assert the echo.
+
+### 8.2.2 `CLOSE` on the wire, `CLOSED` on the badge
+
+| Field | Value | Why |
+|---|---|---|
+| `severity` | `CLOSE` | the internal retirement value; the worker only accepts this scale |
+| `payload.EVT_Severity` | `CLOSED` | the DISPLAY label only |
+
+`CLOSED` is deliberately distinct from the `CLEAR` a producer sends, so an operator
+can tell at a glance that a human ended the incident rather than the monitoring.
+`isRetirement()` and `colourSeverity()` accept both spellings, because a caller
+holds whichever one its path produced.
+
+### 8.2.3 Broker unavailable — the fallback
+
+If the ingest publish fails, the gateway falls back to the direct write
+(`closeAlert`), which retires the record without producing an event. That exists
+because an operator must be able to end an incident during a broker outage; the
+alternative is a board full of alerts nobody can clear.
+
+It is the narrow, older path, it is logged at `warn` when taken, and it is the only
+case where a close leaves no event behind. `fw_journal_audit_enabled` reports
+whether replication is working at all; a close taken through the fallback shows up
+in the gateway log rather than a metric, because it is an outage symptom rather
+than a steady state.
+
 ## 9. UI implications
 
 - The gateway forwards events as they arrive; it does not compute alert state. Rendering "this alert just closed" comes from the `severity` field of the event that closed it.

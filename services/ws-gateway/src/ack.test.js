@@ -23,6 +23,7 @@ import {
   ackFrame,
   validateHistoryQuery,
   HISTORY_RANGES,
+  operatorCloseEvent,
 } from './ack.js';
 
 const key = (c = 'a') => c.repeat(KEY_LEN);
@@ -164,4 +165,49 @@ test('history accepts an optional condition key and rejects a bad one', () => {
 test('history rejects the wrong op', () => {
   assert.equal(validateHistoryQuery({ op: 'allEvents' }).code, 'bad_op');
   assert.equal(validateHistoryQuery(null).code, 'bad_op');
+});
+
+// ------------------------------------------------- operator close AS AN EVENT
+test('the injected close event hashes back onto the SAME condition', () => {
+  // THE PROPERTY THIS WHOLE FEATURE RESTS ON. The record key is
+  // sha256(source + 0x1f + payload.msg)[0:32], so the injected event must echo
+  // `source` and `payload.msg` verbatim. Re-deriving either one would open a SECOND
+  // condition instead of retiring the one the operator clicked.
+  const record = { source: 'db-node-03', type: 'hw.psu.voltage', summary: 'PSU 2 input voltage out of range' };
+  const evt = operatorCloseEvent(record, 'alice', 1_800_000_000_000);
+
+  assert.equal(evt.source, record.source, 'the device must be identical');
+  assert.equal(evt.payload.msg, record.summary, 'and so must the summary the key hashes');
+  assert.equal(evt.payload.EVT_Device, record.source);
+  assert.equal(evt.payload.EVT_Summary, record.summary);
+});
+
+test('the injected close carries the internal severity and the CLOSED label', () => {
+  const evt = operatorCloseEvent(
+    { source: 's', type: 't', summary: 'x' }, 'bob', 1_800_000_000_000,
+  );
+  // CLOSE is what the fold retires on; CLOSED is only what the badge shows, so an
+  // operator can tell a human-ended incident from a source-sent CLEAR.
+  assert.equal(evt.severity, 'CLOSE', 'the worker only accepts the internal scale');
+  assert.equal(evt.payload.EVT_Severity, 'CLOSED');
+  assert.equal(evt.payload.EVT_ClosedBy, 'bob');
+});
+
+test('the injected close is a valid worker envelope', () => {
+  // The same required fields services/worker/src/event.js validates, checked here
+  // because a close that the worker DLQs is a closure nobody can prove happened.
+  const evt = operatorCloseEvent({ source: 's', type: 't', summary: 'x' }, 'alice', 1);
+  for (const field of ['id', 'source', 'type', 'severity']) {
+    assert.equal(typeof evt[field], 'string', field);
+    assert.ok(evt[field].length > 0, `${field} must not be empty`);
+  }
+  assert.ok(evt.id.startsWith('operator-close-'), 'the id marks the author');
+  assert.equal(typeof evt.payload, 'object');
+});
+
+test('each operator close gets its own event id', () => {
+  const r = { source: 's', type: 't', summary: 'x' };
+  const a = operatorCloseEvent(r, 'alice', 1000);
+  const b = operatorCloseEvent(r, 'alice', 2000);
+  assert.notEqual(a.id, b.id, 'two closes are two events, not one overwriting the other');
 });

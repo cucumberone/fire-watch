@@ -136,37 +136,44 @@ An already-acked alert still shows the item, disabled and labelled `Acked by <na
 ### 8.1 Close, and bulk actions
 
 The menu carries **Acknowledge**, **Close** and **Information**. Close is an
-operator-initiated retirement, and it deliberately ends in the *same state a
-CLEAR event from the source produces* — including a real event record:
+operator-initiated retirement, and it ends in the *same state a CLEAR event from
+the source produces* — because it IS an event.
 
-| Write | Why it cannot be skipped |
+**The gateway injects a real event** into the ingest exchange
+([event-lifecycle.md](event-lifecycle.md) §8.2); the worker then retires the record
+through the ordinary fold. Nothing is written directly.
+
+| What happens | Where |
 |---|---|
-| `HSET event:<key> state=closed` (+ `closedBy`, `closedAt`) | otherwise the row still reads as firing |
-| `ZREM idx:event:open` | otherwise the snapshot resurrects a closed row on every client's next page load — a phantom row nobody can clear |
-| `ZADD idx:event:closed` | otherwise **nothing can enumerate the closure** — the open index no longer holds the key |
-| `HDEL event:<key> ackedBy ackedAt` | an ack belongs to one EPISODE; a retired row must not come back still marked "acked by alice" |
-| `HSET state=closed severity=CLOSE closedBy=… closedAt=… lastId=…` | the record itself, now pointing at the close event |
-| `HDEL ackedBy ackedAt` | the ack belonged to the episode that has just ended |
+| an event with `severity: CLOSE` is published, broker-confirmed | gateway → `fx.events` |
+| it is validated, compressed, folded, forked into the audit trail | worker |
+| the fold sets `state=closed`, `severity=CLOSE`, `closedBy`, `closedAt` | worker |
+| `ZREM idx:event:open` | worker |
+| `ZADD idx:event:closed` | worker |
+| `HDEL ackedBy ackedAt` — an ack belongs to one EPISODE | worker |
+| the delivery appears in History | worker |
 
-All six happen in one Lua script, for the same reason the fold is atomic: a crash
-between the hash write and the index removal leaves exactly the phantom row above.
+Every one of those is the fold's own logic, unchanged. That is the point: there is
+no separate "operator close" write any more, so there is no second definition of
+what closed means.
 
-**Why the event record is the interesting one.** An earlier version wrote only the
-first, second and last rows — it flipped the hash and moved the indexes. The alert
-disappeared and that looked correct, but the closure existed nowhere else: no
-entry in the retention window, no summary, no author, and a gap in the audit
-trail exactly where a human made a decision. It also could not appear in the
-retired set, which enumerates from an index no part of that write maintained.
+**Correlation is automatic.** The injected event echoes the closed record's
+`source` and `payload.msg` verbatim, so it hashes onto the SAME condition key. No
+key is passed between two writes, so nothing can disagree about which alert was
+retired — the property that made the old two-write version fragile.
 
-The record is a normal event with `severity: CLOSE` and
-`payload.EVT_Severity: CLEAR`, so it flows through the same paths as a
-source-sent retirement: the badge renders `CLEAR`, the fold treats it as a
-retirement, and `EVT_Agent` names the operator because a human *is* the producer
-in this case.
+**The badge says `CLOSED`, not `CLEAR`.** `payload.EVT_Severity` is `CLOSED` for an
+operator close, so a human-ended incident is distinguishable from one the
+monitoring resolved. Both render green, both are retirements.
 
-The id is `operator-clear-{sanitised-key}-{ms}` — deterministic, so a retried
-close or two operators racing collapse onto one record instead of duplicating
-history. `SET … NX` backs that up.
+**Already-closed alerts.** A second operator clicking Close on a record that is
+already retired gets `status: 'already'` from the direct-write check, and the first
+close wins — nobody overwrites the record of who actually closed it.
+
+**Broker outage.** The publish is broker-confirmed. If it fails, the gateway falls
+back to the direct write (`closeAlert`) so an operator can still clear an incident;
+that path is logged at `warn` because it is the only case where a close leaves no
+event behind ([event-lifecycle.md](event-lifecycle.md) §8.2.3).
 
 **Already-closed alerts.** A second operator clicking Close gets
 `status: 'already'` plus the original author and timestamp. The first write wins;

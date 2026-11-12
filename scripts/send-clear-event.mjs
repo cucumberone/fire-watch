@@ -53,9 +53,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 /**
  * The retirement event, in the upstream schema.
  *
- * `EVT_Device` and `EVT_EventKey` are copied verbatim from send-same-event.mjs —
- * those two fields ARE the alert identity, so they are what makes this retire the
- * probe's alert rather than create a second, unrelated one.
+ * `EVT_Device` AND `EVT_Summary` are copied verbatim from send-same-event.mjs,
+ * because those two fields are what the record key is derived from:
+ *
+ *   event:<sha256(EVT_Device + 0x1f + EVT_Summary)[0:32]>
+ *
+ * Getting either one wrong makes the CLEAR hash to a DIFFERENT record, so it
+ * creates a second, already-closed row instead of retiring the one that is firing.
+ * `EVT_EventKey` is NOT part of the key and does not matter here, but is kept the
+ * same for clarity — it is shown in the UI.
+ *
+ * This was wrong: the summary used to read "Static probe event cleared by
+ * operator", which produced key 46208a8e… while the probe that needed retiring was
+ * at 81c8cdbb…. The script still printed `alert state: closed`, because it read
+ * back the record ITS OWN event had just created — so the check passed while the
+ * real alert stayed open. Reading the correct key is the whole point of the check.
  *
  * `EVT_Severity: 'CLEAR'` is the resolution signal. The schema has no `CLOSE`;
  * `CLEAR` is what maps onto the internal retirement severity.
@@ -69,7 +81,8 @@ const EVENT = {
   EVT_Identifier: 'static-probe-clear-0001',
   // Source severity. Maps to the internal CLOSE, which retires the alert.
   EVT_Severity: 'CLEAR',
-  EVT_Summary: 'Static probe event cleared by operator',
+  // MUST match send-same-event.mjs exactly. See the block above.
+  EVT_Summary: 'Static probe event: identical on every run',
   EVT_Details: 'The condition reported by static.probe is no longer present.',
   EVT_Agent: 'FireWatchProbe',
   EVT_AgentOwner: 'AM-000001',
@@ -200,6 +213,42 @@ if (RESET) {
   console.log(`reset: cleared record ${canonical.id} (alert state untouched)`);
 }
 
+// ------------------------------------- pre-flight: is there anything to retire?
+/**
+ * Warn BEFORE sending if this CLEAR's record is not open.
+ *
+ * A CLEAR addressed at a key with no open record still succeeds — the fold creates
+ * the record and immediately marks it closed — so the read-back afterwards happily
+ * reports `state=closed` and everything looks fine. That is exactly how a wrong
+ * `EVT_Summary` (different key) went unnoticed: the script cleared a record nobody
+ * was watching and printed a pass.
+ *
+ * Best-effort, and only a warning: an operator may legitimately send a CLEAR for a
+ * condition that lapsed, and the run should still go through. The point is to stop
+ * a silent "success" against the wrong key.
+ */
+if (pw) {
+  try {
+    const probe = `valkey-cli -p 6379 --no-auth-warning -a '${pw}' --raw zscore idx:event:open '${key}'`;
+    const out = execFileSync(
+      'kubectl',
+      ['-n', ns, 'exec', 'valkey-0', '-c', 'valkey', '--', 'sh', '-c', probe],
+      { encoding: 'utf8', timeout: 15000 },
+    ).trim();
+    if (!out) {
+      console.warn(
+        `\nwarning: no OPEN record at event:${key}.` +
+        '\n  The CLEAR will create that record and immediately close it, which looks' +
+        '\n  like success but retires nothing. If you expected the probe to be open,' +
+        '\n  run send-same-event.mjs first — and check that both scripts use the same' +
+        '\n  EVT_Device and EVT_Summary, because THOSE are what the key is built from.',
+      );
+    }
+  } catch {
+    // Unreadable is not a failure: skip the warning rather than blocking the send.
+  }
+}
+
 const res = await fetch(url, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'X-Ingest-Token': token },
@@ -234,6 +283,12 @@ if (canonical.severity !== 'CLOSE') {
  *
  * The worker is asynchronous, so the fold may not have run yet at the instant the
  * ingress answers 202. Retry briefly rather than reporting a stale `state=open`.
+ *
+ * IMPORTANT — this reads the key derived from THIS event, so it proves the record
+ * this CLEAR addressed is closed. It does NOT prove the CLEAR retired whatever you
+ * had open: if the summary differs from the probe's, this script is clearing a
+ * different condition entirely. `checkTargetWasOpen` below catches that case by
+ * looking at the index BEFORE the send.
  */
 if (!pw) {
   console.log('\nalert state: skipped (VALKEY_PASSWORD not in .env)');
@@ -267,9 +322,14 @@ if (!pw) {
       // open-index score (empty when absent). So: line0=state, line1=severity,
       // line2=open score.
       const [st, sev, openScore] = got;
-      state = { st, sev, openFlag: openScore ? '1' : '0' };
-      // `closed` plus a missing open flag is the fully settled outcome.
-      if (st === 'closed' && openFlag === '0') break;
+      state = { st, sev, openFlag: openScore ? '1' : '0', openScore };
+      // `closed` plus a missing open-index member is the fully settled outcome.
+      //
+      // `state.openFlag`, not a bare `openFlag`: the destructured name above is
+      // only in scope inside this block, and referencing the bare identifier threw
+      // a ReferenceError on the FIRST poll — which killed the script before it
+      // printed any verdict at all, so a successful CLEAR looked like a crash.
+      if (state.st === 'closed' && state.openFlag === '0') break;
     }
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -278,14 +338,14 @@ if (!pw) {
     console.log(`\nalert state: unreadable (could not exec into valkey-0)`);
   } else if (state.st === 'closed' && state.openFlag === '0') {
     console.log(
-      `\nalert state: closed (severity=${state.sev}, open flag cleared) — the alert is retired.`,
+      `\nalert state: closed (severity=${state.sev}, open index cleared) — the alert is retired.`,
     );
   } else if (state.st === 'closed') {
     console.log(
-      `\nalert state: closed but the record is still in idx:event:open (score=${state.openFlag}).\n` +
+      `\nalert state: closed but the record is still in idx:event:open (score=${state.openScore}).\n` +
       '  That is the failure docs/event-lifecycle.md §5.2 guards against: the index\n' +
       '  would hand a closed row to every new client. Check that the worker and the\n' +
-      '  alert-fold ConfigMap are rolled out together.',
+      '  event-fold ConfigMap are rolled out together.',
     );
     process.exitCode = 1;
   } else {

@@ -141,7 +141,12 @@ data:
     --     only decides whether the RECORD changes — not whether we saw it.
     --
     --     PEXPIRE per entry, so the trail is bounded by TIME rather than by a count.
-    local hist_sets = { 'applied', '0', 'brokerTs', ARGV[1] }
+    --
+    --     `severity` is written explicitly, not taken from the field pairs: the
+    --     record's severity is applied separately (ARGV[3]) because the fold needs
+    --     it to branch, so it is absent from `sets`. Without it the audit row
+    --     carried no severity at all and every History badge rendered blank.
+    local hist_sets = { 'applied', '0', 'brokerTs', ARGV[1], 'severity', sev }
     for j = 1, #sets, 2 do
       hist_sets[#hist_sets + 1] = sets[j]
       hist_sets[#hist_sets + 1] = sets[j + 1]

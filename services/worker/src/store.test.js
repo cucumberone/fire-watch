@@ -61,7 +61,9 @@ function makeValkey() {
           // twice" is a question the trail must be able to answer.
           const fields = {};
           for (let i = 7; i + 1 < argv.length; i += 2) fields[argv[i]] = argv[i + 1];
-          hashSet(historyKey, { applied: '0', brokerTs: argv[0], ...fields });
+          hashSet(historyKey, {
+            applied: '0', brokerTs: argv[0], severity: sev, ...fields,
+          });
 
           const wmTs = Number(hashGet(recordKey, 'watermark') ?? 0);
           const wmId = String(hashGet(recordKey, 'watermarkId') ?? '');
@@ -231,6 +233,8 @@ test('the first delivery writes one record, both timelines and one fold call', a
   const a = valkey.store.get(auditKey);
   assert.ok(a, 'one audit hash per delivery');
   assert.equal(a.get('applied'), '1', 'the fold verdict is recorded on the audit row');
+  assert.equal(a.get('severity'), 'CRITICAL',
+    'the audit row carries a severity, or every History badge renders blank');
   assert.equal(a.get('msg'), 'disk almost full', 'the audit row carries the arrival payload');
   assert.equal(a.get('count'), undefined, 'NO state is copied into the audit row');
 

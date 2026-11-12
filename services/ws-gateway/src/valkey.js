@@ -17,6 +17,7 @@
  * it in two places is how the two would drift.
  */
 import Redis from 'ioredis';
+import { COLUMNS_KEY } from './columns.js';
 
 /**
  * The open-event snapshot's hash read, as one server-side script.
@@ -916,6 +917,57 @@ export class ValkeyReader {
    * on each append so a journal expires with the record it belongs to instead of
    * outliving it as an orphan list.
    */
+  /**
+   * Read the global column configuration hash.
+   *
+   * Returns the RAW stored map (possibly empty). Merging it onto the defaults is
+   * `mergeColumns` in columns.js, kept separate so the pure policy stays testable
+   * without a database — and so an empty hash can mean "everything default" rather
+   * than "nothing configured".
+   *
+   * NO TTL. This is configuration, not data: letting it expire would silently
+   * revert every column name to its default on some later day, which would look
+   * like a lost edit rather than a missing key.
+   */
+  async readColumns() {
+    const c = await this.connect();
+    const raw = await c.hgetall(COLUMNS_KEY);
+    const out = {};
+    for (const [key, value] of Object.entries(raw || {})) {
+      // One corrupt field must not take the whole configuration down: skipping it
+      // falls back to that key's default, which is visible and harmless.
+      const parsed = safeParse(value);
+      if (parsed && typeof parsed === 'object') out[key] = parsed;
+    }
+    return out;
+  }
+
+  /**
+   * Replace the column configuration.
+   *
+   * DEL then HSET, in one MULTI: a config is a snapshot, not a log, so a key that
+   * is no longer sent must disappear rather than linger. Without the DEL, removing a
+   * schema key later would leave its old entry in the hash for ever.
+   *
+   * The hash is written whole each time. It is a handful of fields, so the read-
+   * modify-write cost is irrelevant next to the guarantee that the stored value is
+   * exactly what the last operator submitted.
+   */
+  async writeColumns(columns) {
+    const c = await this.connect();
+    const fields = [];
+    for (const [key, value] of Object.entries(columns || {})) {
+      fields.push(key, JSON.stringify(value));
+    }
+    const pipe = c.multi().del(COLUMNS_KEY);
+    if (fields.length > 0) pipe.hset(COLUMNS_KEY, ...fields);
+    const res = await pipe.exec();
+    for (const [err] of res || []) {
+      if (err) throw err;
+    }
+    return true;
+  }
+
   async appendJournal(bareKey, entry, ttlMs, maxEntries) {
     const key = journalKey(bareKey);
     for (let attempt = 0; attempt < 2; attempt += 1) {

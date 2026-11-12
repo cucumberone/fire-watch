@@ -43,6 +43,7 @@ This repo sets up an event server.
 - [Valkey](docs/valkey.md) — master + 2 replicas, `min-replicas-to-write`, AOF, the `event:<key>` record model, the Lua fold, sizing
 - [Redis Sentinel](docs/redis-sentinel.md) — failover, `sentinel-bridge`, split-brain walkthrough
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
+- [Configuration](docs/configuration.md) — the left nav and Data to columns: global mapping of `EVT_*` keys to column names, `config:columns` in Valkey, locked core columns
 - [History](docs/history.md) — the per-delivery audit trail: `hist:` + `idx:history`, 3-day retention, why it is written inside the fold, `op: history`, the History tab
 - [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
 - [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, windowed event queries, HPA

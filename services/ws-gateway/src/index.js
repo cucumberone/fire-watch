@@ -49,6 +49,12 @@ import {
   journalListFrame,
 } from './journal.js';
 import { AuditPublisher } from './audit.js';
+import {
+  COLUMN_DEFAULTS,
+  mergeColumns,
+  validateSetColumns,
+  columnsFrame,
+} from './columns.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
@@ -245,6 +251,16 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'history') {
       await handleHistoryQuery(conn, frame, send);
+      return;
+    }
+
+    if (frame.op === 'columns') {
+      await handleColumnsRead(send);
+      return;
+    }
+
+    if (frame.op === 'setColumns') {
+      await handleSetColumns(frame, send);
       return;
     }
 
@@ -813,6 +829,84 @@ async function handleClosedQuery(conn, frame, send) {
  * Read-only, bounded server-side, and capped at the audit retention — offering a
  * window longer than the TTL would promise rows that cannot exist.
  */
+/**
+ * `{"op":"columns"}` — the global data-to-columns configuration.
+ *
+ * Answers with the DEFAULTS MERGED over whatever is stored, so a client never has
+ * to know what a default is. An empty hash is a valid answer meaning "all defaults",
+ * which is what makes this safe to deploy onto a running system.
+ */
+async function handleColumnsRead(send) {
+  let stored;
+  try {
+    stored = await reader.readColumns();
+  } catch (err) {
+    log.warn('columns read failed', { err: String(err) });
+    // The defaults are a complete, correct answer — a board rendered with the
+    // built-in column names is the pre-feature behaviour, not a broken one. So this
+    // degrades instead of erroring: an operator during an outage needs the table,
+    // not a configuration panel.
+    send(columnsFrame(mergeColumns({})));
+    return;
+  }
+  send(columnsFrame(mergeColumns(stored)));
+}
+
+/**
+ * `{"op":"setColumns","columns":{"EVT_Agent":{"label":"Tool","asColumn":true}, …}}`
+ * — replace the global configuration.
+ *
+ * GLOBAL on purpose: a per-user override would let two operators look at the same
+ * incident and see different columns, with no way to tell whose view was intended.
+ *
+ * Broadcasts to everyone after a successful write, so a change is visible on every
+ * open board without a reload — the same reason close and ack fan out.
+ */
+async function handleSetColumns(frame, send) {
+  const verdict = validateSetColumns(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  // Merged BEFORE the write, so an entry for a key this frame did not mention keeps
+  // its stored value rather than being reset. The picker sends every row it shows,
+  // but a hand-written frame (or an older client) must not wipe the rest.
+  let next;
+  try {
+    const stored = await reader.readColumns();
+    next = mergeColumns({ ...stored, ...verdict.columns });
+    await reader.writeColumns(next);
+  } catch (err) {
+    log.error('columns write failed', { by: verdict.by, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'columns_failed',
+      message: 'could not save the configuration, retry',
+    }));
+    return;
+  }
+
+  log.info('column configuration updated', {
+    by: verdict.by, keys: Object.keys(verdict.columns),
+  });
+
+  // The originator gets the authoritative merged result (so its form re-renders from
+  // what was actually stored, not from what it sent), and every other client gets it
+  // by broadcast.
+  send(columnsFrame(next));
+  try {
+    await reader.publish(cfg.channelAlerts, JSON.stringify({
+      kind: 'columns',
+      origin: POD_NAME,
+      columns: next,
+    }));
+  } catch (err) {
+    // The write is durable; other pods simply keep their old copy until they reload.
+    log.error('columns broadcast failed after a durable write', { err: String(err) });
+  }
+}
+
 async function handleHistoryQuery(conn, frame, send) {
   const verdict = validateHistoryQuery(frame);
   if (!verdict.ok) {
@@ -1121,6 +1215,18 @@ async function handleAlertMessage(raw) {
     // made the request, so re-delivering it here would double-send.
     if (!shouldFanOut(parsed, POD_NAME)) return;
     const frame = ackFrame(parsed.key, parsed.ack);
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
+  // A column-configuration change. Broadcast-only: the writing pod already answered
+  // the originating client with the merged result, so it skips its own echo for the
+  // same reason ack and close do.
+  if (parsed.kind === 'columns') {
+    if (!shouldFanOut(parsed, POD_NAME)) return;
+    const frame = columnsFrame(parsed.columns || {});
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

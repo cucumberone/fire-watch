@@ -577,6 +577,18 @@ The server side stayed: `idx:event:closed` is still maintained by the fold and
 `op: closed` still answers, because the index is what makes "what is closed" a
 bounded read rather than a SCAN (`docs/websocket-server.md` §3.5).
 
+A **left navigation rail** sits beside all of this, holding two areas: **Board** (the
+tabs above) and **Configuration → Data to columns**. The rail is collapsible and the
+choice is remembered; collapsed it keeps its icons and `aria-label`s so it stays
+usable rather than becoming a mystery strip. Configuration pages are NOT tabs: they
+are a different kind of screen, and putting "Data to columns" beside "Open alerts"
+would imply it is another way of looking at events
+([configuration.md](configuration.md)).
+
+The events tables render their enrichment columns from the **global**
+`data-to-columns` configuration rather than a fixed list, so a renamed or hidden field
+applies to every user at once ([configuration.md](configuration.md) §6).
+
 Badges come from `tabBadgeCount(tabId, counts)` in `lib.js`, which switches
 explicitly per tab and **throws on an unknown id**. A tab opts out with
 `badge: false` in `TABS` — **History** does, because its count would be the page

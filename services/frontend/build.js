@@ -248,6 +248,52 @@ tbody tr { scroll-margin-top: 2.2rem; }
    three row components. */
 tr.retirement td { opacity:.55; }
 tr.retirement td:first-child { opacity:1; }
+/* Left navigation rail.
+
+   A fixed-width column in the flex row below the header, NOT an overlay: the board
+   must reflow next to it rather than being covered by it, because a nav that hides
+   the thing you are reading is a dialog, not navigation.
+
+   Collapsed it keeps its icons and shrinks to 44px, which is still a comfortable
+   pointer target (Apple's floor is 44pt). The width transition is skipped under
+   prefers-reduced-motion. */
+.navrail { flex:0 0 auto; width:196px; display:flex; flex-direction:column; gap:.15rem;
+           padding:.5rem .4rem; border-right:1px solid var(--line);
+           background:var(--pre-bg); overflow:hidden; }
+.navrail.collapsed { width:52px; }
+@media (prefers-reduced-motion: no-preference) {
+  .navrail { transition:width .16s ease; }
+}
+.navgroup { font-size:.62rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+            color:var(--dim); padding:.6rem .5rem .2rem; }
+.navitem { display:flex; align-items:center; gap:.5rem; width:100%; padding:.4rem .5rem;
+           font:inherit; font-size:.8rem; text-align:left; color:var(--fg);
+           background:none; border:0; border-radius:.25rem; cursor:pointer;
+           white-space:nowrap; }
+.navitem.icononly { justify-content:center; padding:.4rem 0; }
+.navitem:hover { background:var(--line); }
+.navitem.on { background:var(--accent); color:#fff; }
+.navitem.on svg { stroke:#fff; }
+.navitem:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.navtoggle { align-self:flex-end; font:inherit; font-size:.8rem; line-height:1;
+             padding:.25rem .45rem; color:var(--dim); background:none; border:0;
+             cursor:pointer; border-radius:.25rem; }
+.navtoggle:hover { background:var(--line); color:var(--fg); }
+.navtoggle:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+
+/* The data-to-columns form.
+
+   A plain table, not a grid of MUI controls: the three columns are strictly aligned
+   and an operator is reading ACROSS a row ("this key is called that, and is
+   visible"), which is what a table is for. */
+.cfgtbl { border-collapse:collapse; width:100%; max-width:900px; }
+.cfgtbl th { text-align:left; font-size:.72rem; text-transform:uppercase;
+             letter-spacing:.05em; color:var(--dim); padding:.35rem .6rem;
+             border-bottom:1px solid var(--line); }
+.cfgtbl td { padding:.28rem .6rem; border-bottom:1px solid var(--line); vertical-align:middle; }
+.cfgtbl tr.locked td { opacity:.6; }
+.cfgtbl td.mono { font-size:.76rem; }
+
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.8rem; }
 .nowrap { white-space:nowrap; }
 .dim { color:var(--dim); }

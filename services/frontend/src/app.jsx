@@ -13,7 +13,7 @@ import {
   ThemeProvider, createTheme, CssBaseline,
   AppBar, Toolbar, Tabs, Tab, TextField, MenuItem, Select, FormControl,
   InputLabel, Button, IconButton, Tooltip, Chip, Box, Stack, Typography,
-  Paper, Alert as MuiAlert, CircularProgress,
+  Paper, Alert as MuiAlert, CircularProgress, Checkbox,
 } from '@mui/material';
 import {
   DarkMode as DarkModeIcon,
@@ -37,11 +37,15 @@ import {
   recordEntries,
   formatClock,
   ENRICHED_FIELDS,
+  configuredColumns,
   SEVERITY_RANK,
   isUnsupportedOpError,
   filterEvents,
   eventSeverities,
   tabBadgeCount,
+  COLUMN_KEYS,
+  COLUMN_DEFAULTS,
+  mergeColumns,
   linkState,
   insertAllEvent,
   allEventRowKey,
@@ -151,6 +155,9 @@ const OPERATOR_KEY = 'fw:operator';
 // Which tab was last open. A workspace preference: an operator who works from
 // Live events should not be reset to Alerts every reload.
 const TAB_KEY = 'fw:tab';
+// Whether the left navigation is expanded. A workspace preference like the tab: an
+// operator who works with it open should not have to reopen it every reload.
+const NAV_KEY = 'fw:nav';
 const TABS = [
   { id: 'alerts', label: 'Open alerts' },
   { id: 'events', label: 'Live events' },
@@ -680,6 +687,12 @@ function useSocket(config) {
   // first and "no notes yet" for the second.
   const [journals, setJournals] = useState(new Map());
   const [notice, setNotice] = useState(null);
+  // The GLOBAL data-to-columns configuration.
+  //
+  // Defaults are applied immediately, so the board renders correctly before the
+  // first reply — the pre-feature column names — and an unreachable gateway degrades
+  // to that rather than to an empty table.
+  const [columns, setColumns] = useState(() => mergeColumns({}));
 
   // The All Events tab's data: a windowed server query over the raw event log.
   // Held here so switching tabs does not re-fetch, and keyed by the range so
@@ -1053,6 +1066,12 @@ function useSocket(config) {
       }));
       return;
     }
+    if (frame.op === 'columns') {
+      // The global configuration, from a read or from another pod's broadcast.
+      // Merged onto the defaults so a partial store cannot blank a column.
+      setColumns(mergeColumns(frame.columns));
+      return;
+    }
     if (frame.op === 'snapshot') {
       // The state of the world as of connect, or as of the last resync. Without
       // this the board is empty on load until something new fires, because events
@@ -1286,6 +1305,11 @@ function useSocket(config) {
       if (knownKeysRef.current.length > 0) {
         ws.send(JSON.stringify({ op: 'alerts', keys: knownKeysRef.current.slice(0, MAX_ACK_KEYS) }));
       }
+
+      // Read the column configuration on every connect: another operator may have
+      // renamed a column while this tab was disconnected, and the gateway has no
+      // per-client replay.
+      ws.send(JSON.stringify({ op: 'columns' }));
 
       // A reconnect follows a window in which frames were definitely missed, so
       // the board is resynced straight away rather than waiting for the next
@@ -1552,6 +1576,35 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Read the global column configuration.
+   *
+   * On connect, and again on every reconnect: the gateway is the source of truth and
+   * another operator may have renamed a column while this tab was disconnected.
+   */
+  const loadColumns = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ op: 'columns' }));
+  }, []);
+
+  /**
+   * Save the global column configuration.
+   *
+   * The SERVER decides the result: it merges what was sent over what is stored and
+   * echoes the merged map back, which replaces the local copy. Applying the request
+   * optimistically here would let the form show a value the server rejected.
+   */
+  const saveColumns = useCallback((next, by) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — column configuration not saved');
+      return false;
+    }
+    ws.send(JSON.stringify({ op: 'setColumns', columns: next, by }));
+    return true;
+  }, []);
+
+  /**
    * Ask for the AUDIT trail in a time window.
    *
    * Same shape as `loadAllEvents` — a bounded, on-demand query rather than a
@@ -1589,6 +1642,7 @@ function useSocket(config) {
     status, events, alerts, acks, notice, bulk, deleteEvent,
     loadAllEvents, allEvents,
     loadHistory, setHistoryQuery, history,
+    columns, loadColumns, saveColumns,
     journals, loadJournal, addJournalEntry,
     dbUp,
   };
@@ -2082,7 +2136,7 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
   );
 }
 
-function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false }) {
+function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false, cols = ENRICHED_FIELDS }) {
   // `evt` is a view event: `summary`, `msgCompleteString`, the occurrence fields
   // and the worker-enriched fields are already mapped by toViewEvent().
   //
@@ -2141,7 +2195,7 @@ function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false })
       <td className="summary">
         {summary || <span className="dim">—</span>}
       </td>
-      {ENRICHED_FIELDS.map((f) => (
+      {cols.map((f) => (
         <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
       ))}
       {/* Spacer cell, matching the spacer column in the header. */}
@@ -2199,11 +2253,217 @@ function AlertStateChip({ state, closedAt }) {
   );
 }
 
+/**
+ * Two icons for the navigation rail.
+ *
+ * Inline SVG for the same reason as the rest: no extra request, no font flash,
+ * `currentColor` so the theme handles it, and no emoji that renders differently per
+ * platform.
+ */
+const NAV_ICON_PROPS = {
+  viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
+  strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true', focusable: 'false',
+};
+
+function BoardIcon() {
+  return (
+    <svg {...NAV_ICON_PROPS} width="18" height="18">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M9 9v11" />
+    </svg>
+  );
+}
+
+function ColumnsIcon() {
+  return (
+    <svg {...NAV_ICON_PROPS} width="18" height="18">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16M15 4v16" />
+    </svg>
+  );
+}
+
+/**
+ * The left navigation rail.
+ *
+ * Two areas, not two tabs: the board and the configuration pages are different KINDS
+ * of screen, so putting "Data to columns" in the tab strip beside "Open alerts" would
+ * imply it is another way of looking at events.
+ *
+ * Collapsible, and the choice is remembered. A rail is only worth its width when you
+ * are using it; on a laptop the board should get the pixels back. Collapsed, the icons
+ * keep their `aria-label` and tooltips, so the rail is still usable — a collapsed nav
+ * that becomes a mystery strip is worse than no collapse at all.
+ */
+function NavRail({ open, onToggle, area, onSelect }) {
+  const item = (id, label, Icon) => (
+    <Tooltip key={id} title={open ? '' : label} placement="right">
+      <button
+        type="button"
+        className={`navitem${area === id ? ' on' : ''}${open ? '' : ' icononly'}`}
+        onClick={() => onSelect(id)}
+        aria-current={area === id ? 'page' : undefined}
+        aria-label={label}
+      >
+        <Icon />
+        {open ? <span>{label}</span> : null}
+      </button>
+    </Tooltip>
+  );
+
+  return (
+    <nav className={`navrail${open ? '' : ' collapsed'}`} aria-label="Sections">
+      <button
+        type="button"
+        className="navtoggle"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-label={open ? 'Collapse navigation' : 'Expand navigation'}
+        title={open ? 'Collapse navigation' : 'Expand navigation'}
+      >
+        <span aria-hidden="true">{open ? '«' : '»'}</span>
+      </button>
+
+      {item('board', 'Board', BoardIcon)}
+      {/* The first configuration PAGE. If more are added they nest under a
+          "Configuration" heading; with one, a heading would be a label above a
+          single item. */}
+      {open ? <div className="navgroup">Configuration</div> : null}
+      {item('columns', 'Data to columns', ColumnsIcon)}
+    </nav>
+  );
+}
+
+/**
+ * Configuration → Data to columns.
+ *
+ * Maps each `EVT_*` key the ingress accepts onto the name it is shown under, and
+ * whether it gets a column of its own or only appears in the Information panel.
+ *
+ * GLOBAL. The save goes to the gateway, which stores it in Valkey and broadcasts it,
+ * so every operator and every pod sees one configuration. That is the requirement:
+ * two people looking at the same incident must not be looking at different columns.
+ *
+ * Editing is LOCAL until Save. A form that wrote on every keystroke would broadcast a
+ * rename to every open board mid-word, and a mistyped header would flash up on
+ * someone else's screen during an incident.
+ */
+function ColumnConfigPanel({ columns, onSave, operatorName }) {
+  // Draft = what the form shows. Reset from the server's copy whenever it changes
+  // identity, so a broadcast from another operator (or this save's echo) replaces
+  // the draft rather than being ignored.
+  const [draft, setDraft] = useState(() => mergeColumns(columns));
+  const serverJson = JSON.stringify(columns);
+  useEffect(() => { setDraft(mergeColumns(columns)); }, [serverJson]);
+
+  // Only the CONFIGURABLE rows are editable. The locked ones are shown so the list
+  // reads as the complete mapping rather than as "some of the schema", but their
+  // name and visibility belong to the table's own rendering.
+  const editable = COLUMN_KEYS.filter((k) => !draft[k]?.locked);
+
+  const dirty = useMemo(
+    () => JSON.stringify(pickEditable(draft)) !== JSON.stringify(pickEditable(mergeColumns(columns))),
+    [serverJson, JSON.stringify(pickEditable(draft))],
+  );
+
+  const set = (key, patch) => setDraft((prev) => ({
+    ...prev,
+    [key]: { ...prev[key], ...patch },
+  }));
+
+  const save = () => {
+    // Send ONLY the editable rows. The locked ones are the table's, not the form's,
+    // and sending them would let this panel overwrite a flag it does not own.
+    onSave(pickEditable(draft), operatorName || undefined);
+  };
+
+  return (
+    <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
+        <Typography variant="h2">Data to columns</Typography>
+        <Box sx={{ flex: 1 }} />
+        <Button variant="outlined" size="small" disabled={!dirty} onClick={() => setDraft(mergeColumns(columns))}>
+          Reset
+        </Button>
+        <Button variant="contained" size="small" disabled={!dirty} onClick={save}>
+          Save for everyone
+        </Button>
+      </Stack>
+
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, maxWidth: 760 }}>
+        These settings are shared by every user of this Fire-Watch. A field marked
+        &ldquo;column&rdquo; gets a table column; uncheck it to keep the value
+        available only under <em>Information</em>. Severity and Summary are rendered
+        by the table itself and cannot be hidden.
+      </Typography>
+
+      {dirty ? (
+        <MuiAlert severity="info" sx={{ mb: 1.5 }}>
+          Unsaved changes. Nothing is shared until you press Save.
+        </MuiAlert>
+      ) : null}
+
+      <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+        <table className="cfgtbl">
+          <thead>
+            <tr>
+              <th>Ingest key</th>
+              <th>Column name</th>
+              <th>Visible as column</th>
+            </tr>
+          </thead>
+          <tbody>
+            {COLUMN_KEYS.map((key) => {
+              const row = draft[key];
+              return (
+                <tr key={key} className={row.locked ? 'locked' : ''}>
+                  <td className="mono">{key}</td>
+                  <td>
+                    <TextField
+                      value={row.label}
+                      size="small"
+                      onChange={(e) => set(key, { label: e.target.value })}
+                      disabled={row.locked}
+                      inputProps={{ 'aria-label': `Column name for ${key}`, maxLength: 40 }}
+                      sx={{ width: 260 }}
+                    />
+                  </td>
+                  <td>
+                    <Checkbox
+                      checked={row.asColumn}
+                      onChange={(e) => set(key, { asColumn: e.target.checked })}
+                      disabled={row.locked}
+                      inputProps={{ 'aria-label': `Show ${key} as a column` }}
+                    />
+                    {row.locked ? <span className="dim"> always shown</span> : null}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Box>
+    </Box>
+  );
+}
+
+/** The rows the form owns: everything that is not locked by the table. */
+function pickEditable(map) {
+  const out = {};
+  for (const key of COLUMN_KEYS) {
+    const row = map[key];
+    if (!row || row.locked) continue;
+    out[key] = { label: row.label, asColumn: row.asColumn };
+  }
+  return out;
+}
+
 function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadAllEvents, allEvents, loadHistory, setHistoryQuery, history, dbUp,
+    loadAllEvents, allEvents, loadHistory, setHistoryQuery, history,
+    columns, loadColumns, saveColumns, dbUp,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2223,6 +2483,22 @@ function App() {
   // the table sits beside a "showing 50 of 0" notice forever.
   const historyReqRef = useRef(null);
   const allEventsReqRef = useRef(null);
+  // Which AREA is showing: the live board, or a configuration page.
+  //
+  // Separate from `tab`, which selects the board's view. Conflating them would put
+  // "Data to columns" in the tab strip beside "Open alerts", implying it is another
+  // way of looking at events.
+  const [area, setArea] = useState('board');
+  // Collapsed by default on a narrow window: the board is the point, and a nav rail
+  // eating 200px of a laptop screen to show two items is a bad trade.
+  const [navOpen, setNavOpen] = useState(() => readPref(NAV_KEY, '1') !== '0');
+  const toggleNav = useCallback(() => {
+    setNavOpen((prev) => {
+      writePref(NAV_KEY, prev ? '0' : '1');
+      return !prev;
+    });
+  }, []);
+
   // Pause freezes the RENDER, not the socket. The socket keeps draining and the
   // buffer keeps accumulating, so resuming shows everything that arrived while
   // paused instead of silently skipping a window of events.
@@ -2381,6 +2657,11 @@ function App() {
   // re-render every styled component on every socket frame.
   const theme = useMemo(() => buildTheme(darkMode ? 'dark' : 'light'), [darkMode]);
 
+  // The enriched columns every events table renders, already filtered and renamed
+  // by the global configuration. Derived once per configuration change rather than
+  // per row: two tables and their headers all read the same list.
+  const eventColumns = useMemo(() => configuredColumns(columns), [columns]);
+
   const sortedAlerts = useMemo(
     () => [...alerts.values()].sort(
       (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
@@ -2534,6 +2815,30 @@ function App() {
           </Tabs>
         </AppBar>
 
+      {/* Everything below the header sits in one row: the navigation rail on the
+          left, the selected area on the right. The rail is OUTSIDE the areas so
+          switching between the board and a configuration page does not rebuild it. */}
+      <Box sx={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
+
+      <NavRail
+        open={navOpen}
+        onToggle={toggleNav}
+        area={area}
+        onSelect={setArea}
+      />
+
+      <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+
+      {area === 'columns' ? (
+        <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                   p: 2, pt: 1.5 }}>
+          <ColumnConfigPanel columns={columns} onSave={saveColumns} operatorName={operatorName} />
+        </Box>
+      ) : null}
+
+      {area === 'board' ? (
+      <>
+
       {tab === 'alerts' ? (
       <Box role="tabpanel" id="panel-alerts" aria-labelledby="tab-alerts"
            sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
@@ -2681,7 +2986,7 @@ function App() {
                     {EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${eventWidthOf(i)}px` }} />
                     ))}
-                    {ENRICHED_FIELDS.map((f) => (
+                    {eventColumns.map((f) => (
                       <col key={f.key} />
                     ))}
                     {/* Spacer, same reasoning as the alert table. */}
@@ -2700,7 +3005,7 @@ function App() {
                         {label}
                       </ResizableTh>
                     ))}
-                    {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                    {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
                     {/* Spacer header, aligned with the spacer col. */}
                     <th />
                   </>
@@ -2729,6 +3034,7 @@ function App() {
                       // there drifted apart in the first place.
                       key={allEventRowKey(e)}
                       evt={liveState === e.alertState ? e : { ...e, alertState: liveState }}
+                      cols={eventColumns}
                       // No onContextMenu: the live tail is a DIAGNOSTIC view, not a
                       // working surface. Every action on it — ack, close, delete,
                       // journal — belongs to the alert or the stored record, and the
@@ -2880,7 +3186,7 @@ function App() {
                     {ALL_EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${allWidthOf(i)}px` }} />
                     ))}
-                    {ENRICHED_FIELDS.map((f) => <col key={f.key} />)}
+                    {eventColumns.map((f) => <col key={f.key} />)}
                     <col />
                   </>
                 )}
@@ -2896,7 +3202,7 @@ function App() {
                         {label}
                       </ResizableTh>
                     ))}
-                    {ENRICHED_FIELDS.map((f) => <th key={f.key}>{f.label}</th>)}
+                    {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
                     <th />
                   </>
                 )}
@@ -2976,6 +3282,7 @@ function App() {
                       evt={enriched}
                       selected={isSelected}
                       onSelect={(ev) => eventsSel.selectRow(rowKey, ev)}
+                      cols={eventColumns}
                       showCount
                       onContextMenu={(ev) => openInspector(
                         ev,
@@ -3218,6 +3525,9 @@ function App() {
         )}
       </Box>
       ) : null}
+
+      </> ) : null}
+      </Box>
       </Box>
 
       <RecordInspector
@@ -3242,6 +3552,7 @@ function App() {
           : null}
         onClose={closeInspector}
       />
+      </Box>
     </ThemeProvider>
   );
 }

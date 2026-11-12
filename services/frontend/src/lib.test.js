@@ -4,6 +4,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import {
   resolveWsUrl,
@@ -23,6 +24,10 @@ import {
   recordEntries,
   formatClock,
   ENRICHED_FIELDS,
+  COLUMN_DEFAULTS,
+  COLUMN_KEYS,
+  mergeColumns,
+  visibleColumns,
   WIRE_FIELD,
   SEVERITY_RANK,
   isUnsupportedOpError,
@@ -1192,4 +1197,88 @@ test('a DELETED row keeps the severity it HAD, in the payload', () => {
     },
   });
   assert.equal(v.payload.EVT_WasSeverity, 'MAJOR');
+});
+
+// ------------------------------------------------ data-to-columns configuration
+test('the column list matches the ingest schema exactly', () => {
+  // The configuration must not offer a key the schema does not define, and must not
+  // miss one it does — otherwise a key added to the contract would silently have no
+  // rename and no visibility toggle.
+  const schema = JSON.parse(
+    readFileSync(new URL('../../../schemas/event-ingest.schema.json', import.meta.url), 'utf8'),
+  );
+  const schemaKeys = Object.keys(schema.properties).filter((k) => k.startsWith('EVT_')).sort();
+  assert.deepEqual([...COLUMN_KEYS].sort(), schemaKeys);
+});
+
+test('mergeColumns fills in the defaults for anything not stored', () => {
+  // An empty store is "all defaults", not "no columns" — that is what makes this
+  // safe to deploy onto a running system.
+  const merged = mergeColumns({});
+  assert.equal(merged.EVT_Agent.label, 'Agent');
+  assert.equal(merged.EVT_Agent.asColumn, true);
+  assert.equal(merged.EVT_Identifier.asColumn, false);
+});
+
+test('mergeColumns applies a stored rename and visibility', () => {
+  const merged = mergeColumns({
+    EVT_Agent: { label: 'Tool', asColumn: false },
+    EVT_URL: { label: 'Link', asColumn: true },
+  });
+  assert.equal(merged.EVT_Agent.label, 'Tool');
+  assert.equal(merged.EVT_Agent.asColumn, false);
+  assert.equal(merged.EVT_URL.label, 'Link');
+  assert.equal(merged.EVT_URL.asColumn, true);
+  // Untouched keys keep their defaults.
+  assert.equal(merged.EVT_Device.label, 'Device');
+});
+
+test('mergeColumns cannot UNLOCK a core column', () => {
+  // `locked` describes what the table can render, not a preference, so a stored
+  // value must not be able to hide the severity badge or the summary cell.
+  const merged = mergeColumns({
+    EVT_Severity: { label: 'Sev', asColumn: false, locked: false },
+  });
+  assert.equal(merged.EVT_Severity.locked, true, 'stored locked must be ignored');
+});
+
+test('mergeColumns ignores keys that are not in the schema', () => {
+  const merged = mergeColumns({ EVT_Nonsense: { label: 'x', asColumn: true } });
+  assert.equal(merged.EVT_Nonsense, undefined);
+});
+
+test('mergeColumns tolerates junk without throwing', () => {
+  assert.deepEqual(Object.keys(mergeColumns(null)), COLUMN_KEYS);
+  assert.deepEqual(Object.keys(mergeColumns('nope')), COLUMN_KEYS);
+  const weird = mergeColumns({ EVT_Agent: null, EVT_URL: 'x' });
+  assert.equal(weird.EVT_Agent.label, 'Agent', 'a null entry falls back to default');
+});
+
+test('mergeColumns ignores a blank rename', () => {
+  // An empty header is unusable, and applying it would look like the column vanished.
+  const merged = mergeColumns({ EVT_Agent: { label: '   ', asColumn: true } });
+  assert.equal(merged.EVT_Agent.label, 'Agent');
+});
+
+test('visibleColumns keeps locked ones and honours the rest', () => {
+  const cols = visibleColumns({
+    EVT_Agent: { label: 'Tool', asColumn: false },
+    EVT_Identifier: { label: 'ID', asColumn: true },
+  });
+  const keys = cols.map((c) => c.key);
+  assert.ok(keys.includes('EVT_Severity'), 'locked columns are always rendered');
+  assert.ok(keys.includes('EVT_Summary'), 'including the summary cell');
+  assert.ok(!keys.includes('EVT_Agent'), 'a hidden column is dropped');
+  assert.ok(keys.includes('EVT_Identifier'), 'a promoted one is added');
+  assert.equal(cols.find((c) => c.key === 'EVT_Identifier').label, 'ID');
+});
+
+test('visibleColumns preserves schema order, not storage order', () => {
+  // Stored hashes come back in arbitrary order; a table whose columns reshuffle
+  // between reloads would be maddening.
+  const cols = visibleColumns({});
+  assert.deepEqual(cols.map((c) => c.key), COLUMN_KEYS.filter((k) => {
+    const d = COLUMN_DEFAULTS.find((c) => c.key === k);
+    return d.asColumn || d.locked;
+  }));
 });

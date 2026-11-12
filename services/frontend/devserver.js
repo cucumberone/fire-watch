@@ -202,6 +202,15 @@ function mockOpenAlerts() {
 const closedMock = new Map();
 
 /**
+ * The global column configuration, as the harness stores it.
+ *
+ * EMPTY by default, which is the interesting case: the client must render the
+ * built-in column names when nothing has been saved, so an empty store is a valid
+ * answer rather than a missing one.
+ */
+const columnConfig = {};
+
+/**
  * Every event the mock has produced, keyed by id.
  *
  * The real worker writes each accepted event to a global timeline; the mock keeps
@@ -585,6 +594,28 @@ wss.on('connection', async (ws) => {
         sinceMs: since,
         untilMs: now,
       }));
+      return;
+    }
+
+    // ---- op: columns / setColumns — the global data-to-columns configuration.
+    //
+    // Held in a module-level map so a change survives a reconnect in the harness,
+    // exactly as the real one survives in Valkey. Seeded EMPTY on purpose: an empty
+    // store is "all defaults", which is the state a fresh install is in, and it is
+    // the case the merge logic exists for.
+    if (frameIn.op === 'columns') {
+      ws.send(JSON.stringify({ op: 'columns', columns: columnConfig }));
+      return;
+    }
+    if (frameIn.op === 'setColumns') {
+      // Mirror the gateway: merge over what is stored, then ECHO the merged map —
+      // the client re-renders from the reply, not from what it sent.
+      Object.assign(columnConfig, frameIn.columns || {});
+      for (const client of wss.clients) {
+        if (client.readyState === client.OPEN) {
+          client.send(JSON.stringify({ op: 'columns', columns: columnConfig }));
+        }
+      }
       return;
     }
 

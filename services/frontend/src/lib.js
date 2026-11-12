@@ -114,6 +114,79 @@ export const WIRE_FIELD = { summary: 'msg', msgCompleteString: 'msgc' };
  * PascalCase. Matching is explicit rather than case-insensitive so a genuine
  * `cif` (some unrelated field) can never be mistaken for the enriched one.
  */
+/**
+ * The ingest-schema keys whose COLUMN is configurable, and their defaults.
+ *
+ * Mirrors `COLUMN_DEFAULTS` in services/ws-gateway/src/columns.js. The gateway is
+ * authoritative — it validates and stores — but the form has to render BEFORE the
+ * first reply arrives, and it must not offer a key the server would reject. A test
+ * asserts the two lists match, so this cannot drift silently.
+ *
+ * `locked` means the table renders that value itself (the severity badge, the
+ * summary cell) and this configuration therefore cannot hide it.
+ */
+export const COLUMN_DEFAULTS = [
+  { key: 'EVT_Severity', label: 'Severity', asColumn: true, locked: true },
+  { key: 'EVT_Summary', label: 'Summary', asColumn: true, locked: true },
+  { key: 'EVT_Device', label: 'Device', asColumn: true },
+  { key: 'EVT_EventKey', label: 'Event key', asColumn: true },
+  { key: 'EVT_Agent', label: 'Agent', asColumn: true },
+  { key: 'EVT_AgentOwner', label: 'Agent owner', asColumn: true },
+  { key: 'EVT_Environment', label: 'Environment', asColumn: true },
+  { key: 'EVT_Identifier', label: 'Identifier', asColumn: false },
+  { key: 'EVT_Details', label: 'Details', asColumn: false },
+  { key: 'EVT_URL', label: 'URL', asColumn: false },
+];
+
+/** Configurable keys in presentation order. */
+export const COLUMN_KEYS = COLUMN_DEFAULTS.map((c) => c.key);
+
+/** Defaults as a map, the shape the wire carries. */
+export function defaultColumns() {
+  const out = {};
+  for (const c of COLUMN_DEFAULTS) {
+    out[c.key] = { label: c.label, asColumn: c.asColumn, locked: Boolean(c.locked) };
+  }
+  return out;
+}
+
+/**
+ * Merge a stored configuration onto the defaults, for the same reason the gateway
+ * does: a key with no stored value keeps its default, so an empty store means "all
+ * defaults" rather than "no columns", and a key added to the schema later appears
+ * automatically.
+ *
+ * `locked` always comes from the DEFAULTS. A stored `locked: false` must not be able
+ * to turn a core column into a hiding one — that flag describes what the table can
+ * render, not a preference.
+ */
+export function mergeColumns(stored) {
+  const out = defaultColumns();
+  if (!stored || typeof stored !== 'object') return out;
+  for (const [key, value] of Object.entries(stored)) {
+    if (!out[key] || !value || typeof value !== 'object') continue;
+    if (typeof value.label === 'string' && value.label.trim() !== '') {
+      out[key].label = value.label.trim();
+    }
+    if (typeof value.asColumn === 'boolean') out[key].asColumn = value.asColumn;
+  }
+  return out;
+}
+
+/**
+ * The columns a table should render, in schema order.
+ *
+ * Only the ones flagged `asColumn`. Locked entries are always included — the tables
+ * render Severity and Summary themselves, so hiding them would silently drop a
+ * column the configuration has no control over.
+ */
+export function visibleColumns(columns) {
+  const merged = mergeColumns(columns);
+  return COLUMN_KEYS
+    .filter((k) => merged[k].asColumn || merged[k].locked)
+    .map((k) => ({ key: k, label: merged[k].label, locked: merged[k].locked }));
+}
+
 export const ENRICHED_FIELDS = [
   { key: 'device', label: 'Device', wire: ['EVT_Device', 'device'] },
   { key: 'agent', label: 'Agent', wire: ['EVT_Agent', 'agent'] },
@@ -121,6 +194,43 @@ export const ENRICHED_FIELDS = [
   { key: 'eventKey', label: 'Event key', wire: ['EVT_EventKey', 'eventKey'] },
   { key: 'environment', label: 'Environment', wire: ['EVT_Environment', 'environment'] },
 ];
+
+/**
+ * The configuration key behind each enriched view field.
+ *
+ * `ENRICHED_FIELDS` predates this feature and is keyed by the VIEW name (`device`),
+ * while the configuration is keyed by the WIRE name (`EVT_Device`) — because that is
+ * what an operator is mapping. This is the bridge, in one place, so the two
+ * vocabularies cannot drift apart field by field.
+ */
+export const ENRICHED_WIRE_KEY = {
+  device: 'EVT_Device',
+  agent: 'EVT_Agent',
+  agentOwner: 'EVT_AgentOwner',
+  eventKey: 'EVT_EventKey',
+  environment: 'EVT_Environment',
+};
+
+/**
+ * The enriched columns a table should render, with the CONFIGURED label.
+ *
+ * Only fields that (a) have a configuration row and (b) are flagged `asColumn`.
+ * `EVT_Identifier`, `EVT_Details` and `EVT_URL` are not enriched view fields, so
+ * promoting one to a column is stored but not yet rendered — they have no
+ * `toViewEvent` accessor. That is a deliberate limit rather than a bug: adding a
+ * column means adding a field to the view shape, not just flipping a flag.
+ */
+export function configuredColumns(columns) {
+  const merged = mergeColumns(columns);
+  const out = [];
+  for (const f of ENRICHED_FIELDS) {
+    const wireKey = ENRICHED_WIRE_KEY[f.key];
+    const cfg = wireKey ? merged[wireKey] : null;
+    if (!cfg || !cfg.asColumn) continue;
+    out.push({ ...f, label: cfg.label });
+  }
+  return out;
+}
 
 /** gzip marker, matching services/worker/src/event.js. */
 const GZ_MARK = '__gz';

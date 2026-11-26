@@ -1497,10 +1497,12 @@ test('Open alerts has no Key column, and every table stays column/cell aligned',
   assert.deepEqual(alertCols, ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack']);
 
   const alertRow = appSrc.slice(appSrc.indexOf('function AlertRow'), appSrc.indexOf('function EventRow'));
-  // Severity is a Badge, then 4 formatted/numbered/scalar cells, the ack cell and the
-  // trailing spacer. Count the <td>s the row renders.
+  // Severity is a Badge, then 4 formatted/numbered/scalar cells, the ack cell, the
+  // configured enriched columns (a `cols.map` cell) and the trailing spacer.
   const alertTds = (alertRow.match(/<td[\s>]/g) ?? []).length;
-  assert.equal(alertTds, alertCols.length + 1, 'one <td> per header label, plus the spacer');
+  assert.equal(alertTds, alertCols.length + 2,
+    'one <td> per header label, one for the cols.map cell, plus the spacer');
+  assert.match(alertRow, /cols\.map\(\(f\) => \(/, 'the alert row renders the configured columns');
   assert.ok(!/alert\.key/.test(alertRow), 'the alert row must not render alert.key any more');
 
   // The other two tables keep their Key-free lists and their own widths.
@@ -1657,4 +1659,27 @@ test('a click on the ALREADY-SELECTED tab also leaves the configuration page', (
   );
   assert.match(clickBody, /setArea\('board'\)/, 'a re-click must also show the board');
   assert.match(clickBody, /setTabNonce/, 'and still re-read the query-backed tab');
+});
+
+test('Open alerts renders the configured columns, not just the fixed ones', () => {
+  // Ticking a key under Data to columns changed nothing on Open alerts: that table
+  // rendered ALERT_COLS and nothing else, so `eventColumns` only reached the two event
+  // tables. Reported as "EventKey is not shown as a column in Open Alerts even though
+  // it is selected under Data to columns".
+  const alertsTable = appSrc.slice(
+    appSrc.indexOf("name=\"Open alerts\""),
+    appSrc.indexOf("name=\"Live events\""),
+  );
+  assert.match(alertsTable, /eventColumns\.map\(\(f\) => <th key=\{f\.key\}>\{f\.label\}<\/th>\)/,
+    'the alert header must render the configured columns');
+  assert.match(alertsTable, /eventColumns\.map\(\(f\) => <col key=\{f\.key\} \/>\)/,
+    'and a col for each, so the header and body stay aligned');
+  assert.match(alertsTable, /cols=\{eventColumns\}/, 'the row must be told which columns to render');
+
+  // The values come off `alert.event`, because the rollup only carries
+  // severity/first/last/count. Falling back to the alert itself covers a row whose
+  // event has not arrived yet.
+  const alertRow = appSrc.slice(appSrc.indexOf('function AlertRow'), appSrc.indexOf('function EventRow'));
+  assert.match(alertRow, /const source = alert\.event \?\? alert;/);
+  assert.match(alertRow, /\{source\[f\.key\] \|\| '—'\}/);
 });

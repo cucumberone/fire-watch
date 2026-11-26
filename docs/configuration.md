@@ -84,15 +84,22 @@ the form can never show a value the server rejected.
 
 | Key | Has a view field? | Renders as a column? |
 |---|---|---|
-| `EVT_Device`, `EVT_Agent`, `EVT_AgentOwner`, `EVT_EventKey`, `EVT_Environment` | yes | **yes** — Live events and All events, with the configured label |
+| `EVT_Device`, `EVT_Agent`, `EVT_AgentOwner`, `EVT_EventKey`, `EVT_Environment` | yes | **yes** — Open alerts, Live events and All events, with the configured label |
 | `EVT_Identifier`, `EVT_Details`, `EVT_URL` | no | stored, not yet rendered |
-| `EVT_Severity`, `EVT_Summary` | yes | always, locked |
+| `EVT_Severity`, `EVT_Summary` | always | always, locked |
 
 The bottom three have no `toViewEvent` accessor, so promoting one to a column is
 stored but has no visible effect. That is a deliberate limit rather than an oversight:
 adding a column means adding the field to the view shape, which is a code change, not
 a flag. `configuredColumns()` in `lib.js` is the single place that filter lives, so
 extending it is one edit.
+
+**Open alerts renders them too, from the alert's event.** It used to render only the
+fixed columns, so ticking a key here changed nothing — and the two tables disagreed
+about whether the configuration was in effect. The values come off `alert.event`
+(the view event the rollup carries), because the alert itself only holds
+severity/first/last/count; `alert.event ?? alert` keeps a row readable while the event
+is still in flight.
 
 ## 7. Unhiding is not "hidden from Information"
 

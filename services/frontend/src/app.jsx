@@ -2196,11 +2196,19 @@ function HistoryRow({ evt, onContextMenu }) {
   );
 }
 
-function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
+function AlertRow({ alert, ack, selected, onSelect, onContextMenu, cols = [] }) {
   const acked = Boolean(ack);
   // Colour follows what the badge shows, so the row tint and the badge cannot
   // disagree (see colourSeverity).
   const label = alert.displaySeverity ?? alert.event?.displaySeverity;
+  // The enriched values live on the alert's EVENT, not on the rollup: the alert
+  // carries severity/first/last/count, and `event` is the view event that
+  // `toViewEvent` produced (device, agent, agentOwner, eventKey, environment).
+  //
+  // Falling back to the alert itself covers a row whose event has not arrived —
+  // `applyAlert` can build a rollup from an `op: alert` frame alone, and an
+  // enriched column should read `—` there rather than throw.
+  const source = alert.event ?? alert;
   return (
     <tr
       className={`${severityRowClass(colourSeverity(alert.severity, label), acked ? 'acked' : '')}${selected ? ' row-selected' : ''}`}
@@ -2230,6 +2238,13 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
           ? <span className="acked-tag" title={`${ack.by} at ${formatClock(ack.at)}`}>acked · {ack.by}</span>
           : <span className="dim">—</span>}
       </td>
+      {/* The configured enriched columns, same list and same values as the two
+          event tables. This table used to render none of them, so ticking a key
+          under Data to columns changed nothing here — the alert row simply had no
+          such column. */}
+      {cols.map((f) => (
+        <td key={f.key} className="mono dim nowrap">{source[f.key] || '—'}</td>
+      ))}
       {/* Spacer cell, matching the spacer column in the header. */}
       <td />
     </tr>
@@ -3332,6 +3347,11 @@ function App() {
                   {ALERT_COLS.map((c, i) => (
                     <col key={c} style={{ width: `${alertWidthOf(i)}px` }} />
                   ))}
+                  {/* The configured enriched columns, after the fixed ones — the
+                      same order the event tables use, so the three tables read
+                      alike. Unstyled cols: their width comes from the header
+                      content, which is a short label. */}
+                  {eventColumns.map((f) => <col key={f.key} />)}
                   {/* Spacer: absorbs leftover width so the table still fills the
                       pane, instead of stretching the real columns. */}
                   <col />
@@ -3349,6 +3369,7 @@ function App() {
                       {label}
                     </ResizableTh>
                   ))}
+                  {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
                   {/* Spacer header, aligned with the spacer col. */}
                   <th />
                 </>
@@ -3370,6 +3391,7 @@ function App() {
                     alert={a}
                     ack={ack}
                     selected={isSelected}
+                    cols={eventColumns}
                     onSelect={(e) => alertsSel.selectRow(a.key, e)}
                     onContextMenu={(e) => openInspector(
                       e,

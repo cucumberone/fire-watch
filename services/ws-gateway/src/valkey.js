@@ -47,7 +47,7 @@ import { INPUT_SCHEMA_KEY, SCHEMA_FIELD, IDENTIFIER_KEYS_FIELD } from './ingestS
  */
 const SNAPSHOT_FIELDS = [
   'severity', 'displaySeverity', 'source', 'type', 'msg', 'payload',
-  'brokerTs', 'lastTs', 'firstSeen', 'lastSeen', 'count', 'lastId',
+  'brokerTs', 'lastTs', 'firstSeen', 'lastSeen', 'count', 'lastId', 'eventId',
   'state', 'closedAt', 'closedBy', 'ackedBy', 'ackedAt',
 ];
 
@@ -321,6 +321,10 @@ export class ValkeyReader {
       lastOccurrence: num('lastSeen'),
       count: num('count'),
       lastId: at('lastId') || null,
+      // The producer's own message id. Distinct from `lastId`, which is the stream
+      // entry id of the newest applied delivery: a message may be redelivered and a
+      // producer may reuse its id, so the two answer different questions.
+      eventId: at('eventId') || null,
       ackedBy: at('ackedBy') || null,
       ackedAt: num('ackedAt'),
       alertState: at('state') || null,

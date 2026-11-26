@@ -1299,7 +1299,12 @@ function handleEventMessage(raw) {
   // The key includes brokerTs and `applied`, so a redelivery (identical frame) is
   // still dropped while a distinct arrival is shown. The client de-duplicates on
   // id alone for the ROW list, so the row list is unaffected either way.
-  const frameKey = `${event.id}|${event.brokerTs ?? ''}|${applied ?? ''}`;
+  //
+  // `deliveryId` is preferred over `brokerTs` when both frames carry it: it is the
+  // stream entry id, which is unique per delivery, while a millisecond timestamp
+  // cannot separate two arrivals inside one millisecond.
+  const delivery = event.deliveryId ?? event.brokerTs ?? '';
+  const frameKey = `${event.id}|${delivery}|${applied ?? ''}`;
   if (!recent.add(frameKey)) return;
 
   const frame = eventFrame(event, applied);
@@ -1450,7 +1455,7 @@ async function handleAlertMessage(raw) {
       key: parsed.key, err: String(err),
     });
   }
-  const frame = alertFrame(parsed.key, parsed.applied, row, parsed.brokerTs);
+  const frame = alertFrame(parsed.key, parsed.applied, row, parsed.brokerTs, parsed.deliveryId);
   for (const ws of wss.clients) {
     if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
   }

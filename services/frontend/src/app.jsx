@@ -769,9 +769,27 @@ function useSocket(config) {
   // reach this client and both used to fold into the alert map, so a single repeat
   // incremented Count twice — measured 1 -> 2 -> 3 -> 2 across one arrival's frames.
   //
-  // The pair is identified by the arrival's broker timestamp (an `op: alert` frame
-  // without one cannot be paired, and folds as before). Value is the brokerTs.
+  // The pair is identified by the delivery id — the stream entry id, exactly unique
+  // per delivery — falling back to the broker timestamp for a frame from an older
+  // worker that does not carry one. A timestamp alone cannot separate two arrivals
+  // inside the same millisecond, which is why the id is preferred.
   const lastFoldedRef = useRef(new Map());
+
+  /**
+   * The identity of ONE delivery, as both frames spell it.
+   *
+   * `deliveryId` is exact: the stream entry id, unique for every entry ever added.
+   * `brokerTs` is the millisecond only, so it is the fallback for older workers and
+   * for frames produced outside the stream (an operator close). `null` means the
+   * frame cannot be paired at all, and the caller folds it as before.
+   */
+  const arrivalOf = (frame) => {
+    if (typeof frame?.deliveryId === 'string' && frame.deliveryId !== '') {
+      return `d:${frame.deliveryId}`;
+    }
+    const ts = Number.isFinite(frame?.brokerTs) && frame.brokerTs > 0 ? frame.brokerTs : null;
+    return ts === null ? null : `t:${ts}`;
+  };
 
   const ingest = useCallback(async (frame) => {
     if (frame.op === 'event' && frame.event) {
@@ -847,11 +865,9 @@ function useSocket(config) {
         // folded first, then this one folded the same arrival again. Measured on
         // the cluster: three identical events showed Count 6.
         //
-        // The guard is the same test the other handler uses: same key, same broker
-        // timestamp = same delivery.
-        const arrival = Number.isFinite(evt.brokerTs) && evt.brokerTs > 0
-          ? evt.brokerTs
-          : null;
+        // The guard is the same test the other handler uses: same key, same
+        // delivery.
+        const arrival = arrivalOf({ deliveryId: evt.deliveryId, brokerTs: evt.brokerTs });
         if (arrival && lastFoldedRef.current.get(alertKey) === arrival) {
           // Already folded by the `op: alert` frame. The row still belongs in the
           // live tail — that happened above — but not in the rollup a second time.
@@ -940,12 +956,14 @@ function useSocket(config) {
       // rollup. Both reach this client, so folding both incremented Count twice for
       // a single repeat — measured 1 -> 2 -> 3 -> 2 as the two frames interleaved.
       //
-      // `brokerTs` is the arrival identity both frames share. It is preferred over
-      // `row.lastSeen` because the gateway may fail to read the row, and then the
-      // row supplies nothing at all.
-      const arrival = Number.isFinite(frame.brokerTs) && frame.brokerTs > 0
-        ? frame.brokerTs
-        : (row?.lastSeen ?? null);
+      // The pairing key is the delivery id when the frame carries one: it is the
+      // stream entry id, unique per delivery. `brokerTs` is the fallback — it is the
+      // millisecond only, so it cannot separate two arrivals inside one millisecond,
+      // but it is what an older worker sends. `row.lastSeen` is the last resort
+      // because the gateway may fail to read the row, and then the row supplies
+      // nothing at all.
+      const arrival = arrivalOf(frame)
+        ?? (row?.lastSeen ? `t:${row.lastSeen}` : null);
       if (arrival && lastFoldedRef.current.get(frame.key) === arrival) {
         return;
       }

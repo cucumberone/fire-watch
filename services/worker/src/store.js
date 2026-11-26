@@ -29,7 +29,6 @@
  * three workers racing on the same condition converge instead of clobbering.
  */
 import { readFileSync, statSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import { isGzip } from './event.js';
 import { bareKeyFor, summaryOf } from './keygen.js';
 import { keys } from './config.js';
@@ -86,7 +85,7 @@ export class FoldScript {
  * known ahead of time, and exploding it would let a producer mint arbitrary hash
  * fields.
  */
-function recordFields({ evt, storedPayload, brokerTs }) {
+function recordFields({ evt, storedPayload, brokerTs, eventId }) {
   const pairs = [
     'source', String(evt.source ?? ''),
     'type', String(evt.type ?? ''),
@@ -96,6 +95,13 @@ function recordFields({ evt, storedPayload, brokerTs }) {
     'displaySeverity', String(evt.payload?.EVT_Severity ?? evt.severity ?? ''),
     'brokerTs', String(brokerTs),
     'lastTs', String(evt.ts ?? ''),
+    // The producer's message id, kept for correlation with the source system.
+    //
+    // SEPARATE from `lastId`, which is now the stream entry id. They answer
+    // different questions — "which message does the producer think this is" versus
+    // "which delivery is this" — and the producer's id is not unique: it repeats on
+    // a redelivery and a sloppy shipper may reuse it.
+    'eventId', String(eventId ?? ''),
     'payload', JSON.stringify(storedPayload ?? {}),
   ];
   return pairs;
@@ -126,16 +132,18 @@ function recordFields({ evt, storedPayload, brokerTs }) {
  * Cost is one HSET + one ZADD + one PEXPIRE per delivery, pipelined — which is
  * exactly the storage doubling that was accepted when this was requested.
  *
- * @param {number} deliveryId  unique per delivery; becomes the index member
+ * @param {string} deliveryId  UNIQUE per delivery. The stream entry id, which the
+ *   master assigned at XADD — so it needs no minting here and cannot repeat for two
+ *   different entries. Becomes the `hist:` key and the index member.
  */
 export async function recordDelivery({
-  valkey, evt, storedPayload, brokerTs, bareKey, deliveryId, cfg, log,
+  valkey, evt, storedPayload, brokerTs, bareKey, deliveryId, eventId, cfg, log,
 }) {
   const key = keys.history(deliveryId);
   const ttlMs = cfg.historyTtl * 1000;
   const fields = [
     'key', bareKey,
-    'id', String(evt.id ?? ''),
+    'id', String(eventId ?? evt.id ?? ''),
     'source', String(evt.source ?? ''),
     'type', String(evt.type ?? ''),
     'severity', String(evt.severity ?? ''),
@@ -164,18 +172,40 @@ export async function recordDelivery({
   return deliveryId;
 }
 
-/** A unique id for one delivery. Not derived from anything: see recordDelivery. */
-export function newDeliveryId() {
-  return `${Date.now().toString(36)}-${randomUUID()}`;
+/**
+ * The delivery id for a stream entry.
+ *
+ * The entry id IS the delivery id: `<ms>-<seq>`, assigned by the master at XADD,
+ * unique for every entry ever added to the stream, and already the identity the
+ * fold uses for its ordering guard. Minting a second one (this used to be a UUID)
+ * duplicated a fact the broker had already recorded, and made the audit row's id
+ * unusable for correlating back to the stream entry it came from.
+ *
+ * Kept as a function so the contract is named in one place and a test can assert it.
+ */
+export function deliveryIdFor(entryId) {
+  return String(entryId ?? '');
 }
 
 /**
  * Write one event: record + both timeline indexes + state fold, atomically.
  *
+ * @param {object} opts
+ * @param {string} opts.entryId  the stream entry id, `<ms>-<seq>` — UNIQUE per
+ *   delivery. Passed to the fold as the arrival id, so it is both the ordering
+ *   tiebreaker and what `lastId` / `closedBy` record. Nothing else in the system
+ *   needs to mint a delivery id: the master already assigned one at XADD, and it
+ *   cannot repeat for two different entries.
+ * @param {string} [opts.eventId]  the producer's own id, stored as `eventId` for
+ *   correlation. Kept separate because it is NOT unique — a producer may reuse it,
+ *   and a redelivery of the same entry repeats it.
+ *
  * @returns {Promise<{applied:number, key:string, bareKey:string, eventKey:string}>}
  *   `applied` is the fold's verdict: 0 stale/duplicate, 1 occurrence, 3 closed.
  */
-export async function persistEvent({ valkey, evt, storedPayload, brokerTs, cfg, fold, log }) {
+export async function persistEvent({
+  valkey, evt, storedPayload, brokerTs, entryId, eventId, cfg, fold, log,
+}) {
   const bareKey = bareKeyFor(evt);
   const eventKey = keys.event(bareKey);
   const ttlMs = cfg.eventTtl * 1000;
@@ -183,12 +213,19 @@ export async function persistEvent({ valkey, evt, storedPayload, brokerTs, cfg, 
   // ARGV layout must match k8s/base/20-event-fold-config.yaml exactly.
   const args = [
     String(brokerTs),       // ARGV[1] broker ts
-    String(evt.id ?? ''),   // ARGV[2] arrival id -> lastId / closedBy
+    // ARGV[2] arrival id. The stream entry id, NOT the producer's message id.
+    //
+    // It used to be `evt.id`, which meant two events of one condition inside the
+    // same millisecond compared equal and the second was dropped as a redelivery
+    // — visible as a `count` that under-reported by one. The entry id carries a
+    // sequence number, so it is unique per delivery and ordered within a
+    // millisecond.
+    String(entryId ?? ''),  // ARGV[2] arrival id -> watermarkId / lastId / closedBy
     String(evt.severity),   // ARGV[3] severity
     bareKey,                // ARGV[4] index member
     String(evt.source ?? ''), // ARGV[5] device
     String(ttlMs),          // ARGV[6] ttl in ms
-    ...recordFields({ evt, storedPayload, brokerTs }),
+    ...recordFields({ evt, storedPayload, brokerTs, eventId: eventId ?? String(evt.id ?? '') }),
   ];
 
   const applied = await valkey.write((c) =>

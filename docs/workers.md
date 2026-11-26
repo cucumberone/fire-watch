@@ -55,7 +55,7 @@ Why there is no audit copy any more: the stream entry and the record live in the
 
 A worker failure **after** the fold write but **before** the `XACK`+`XDEL` leaves the entry pending, and it is delivered again — to this worker after `FW_RETRY_MS`, or to another via `XAUTOCLAIM`. That is safe by construction, and it is the exact scenario the design was built for:
 
-1. A redelivered entry keeps its **entry ID**, so the same `brokerTs`, and the same `evt.id`. The fold's `(ts, id)` watermark already holds that pair, so it returns `applied 0` and **nothing moves** — no count, no index change, no live frame. The entry is still `XACK`+`XDEL`'d, because an entry that can never apply must not loop forever. The `hist:` fork runs again, so a redelivery is **two history rows** — deliberately ([history.md](history.md)).
+1. A redelivered entry keeps its **entry ID**, so the same `brokerTs`, and the same entry id. The fold's `(ts, entry id)` watermark already holds that pair, so it returns `applied 0` and **nothing moves** — no count, no index change, no live frame. The entry is still `XACK`+`XDEL`'d, because an entry that can never apply must not loop forever. The `hist:` fork runs again, so a redelivery is **two history rows** — deliberately ([history.md](history.md)).
 2. The index write is idempotent (`ZADD` on a repeated member only moves its score), so a replay produces identical state.
 3. The fold is an atomic Lua script, so two workers racing on the same key converge on the highest timestamp.
 
@@ -88,7 +88,7 @@ the reason the old design needed three separate writes was that the record key (
 message id) and the rollup key (the condition) were different objects.
 
 - Every write is idempotent **by timestamp**: re-applying an event whose
-  `(brokerTs, id)` the watermark has already passed returns `0` and changes nothing
+  `(brokerTs, entry id)` the watermark has already passed returns `0` and changes nothing
   ([event-lifecycle.md](event-lifecycle.md) §5).
 - `ZADD` on an existing member only sets its score, so an index cannot gain a
   duplicate member.
@@ -120,7 +120,7 @@ reconcile. What the fold does with the arrival is:
 
 - `count` increments once per arrival;
 - `lastSeen` moves to the newest arrival's stream entry timestamp;
-- `lastId` records the newest arrival's id;
+- `lastId` records the newest arrival's **stream entry id** (`<ms>-<seq>`), so it addresses the `hist:` row for that delivery. The producer's own message id is kept separately as `eventId`, because it is not unique per delivery;
 - `firstSeen` does **not** move — it marks when this episode began.
 
 **The record does not keep per-delivery history.** It used to, under a separate
@@ -196,7 +196,7 @@ for different reasons.
 |---|---|---|
 | Problem | the same **stream entry** is delivered twice | the same **condition** is reported 1 000×/min |
 | Cause | at-least-once delivery, crash before `XACK`, `XAUTOCLAIM` | a sensor that stays faulted |
-| Mechanism | the fold's `(brokerTs, id)` ordering guard | the CONTENT KEY: a repeat hashes to the same record |
+| Mechanism | the fold's `(brokerTs, entry id)` ordering guard | the CONTENT KEY: a repeat hashes to the same record |
 | Guarantees | a redelivery changes nothing | one record per condition, `lastSeen` moving, `count` per arrival |
 | Fails if missing | a repeat is counted twice | 10 million rows in a week, unusable UI |
 

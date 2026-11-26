@@ -62,7 +62,7 @@ The two cases that used to need separate machinery collapse:
 
 | Case | Before | Now |
 |---|---|---|
-| **Transport** duplicate: the same stream entry delivered twice | `SET fw:evt:{id} NX` rejected it (the old model) | the fold's `(brokerTs, id)` watermark returns `0` |
+| **Transport** duplicate: the same stream entry delivered twice | `SET fw:evt:{id} NX` rejected it (the old model) | the fold's `(brokerTs, stream entry id)` watermark returns `0` |
 | **Content** duplicate: the same CONDITION re-reported with a new id | `SET event:{fp} NX` claimed it, then the copy was folded into the owner | it hashes to the same key, so there is no second key to create |
 
 A content duplicate can no longer *be* stored as a separate record. That removes an
@@ -73,7 +73,7 @@ is nothing left to reconcile.
 ### 2.2 What is lost — and the one place it is kept
 
 **Per-delivery history is not queryable from `event:<key>`.** The record keeps
-`count`, `firstSeen`, `lastSeen` and `lastId` (the newest arrival's id), but not the
+`count`, `firstSeen`, `lastSeen` and `lastId` (the newest delivery's stream entry id), but not the
 individual arrivals: the record is updated in place, so after 400 repeats it looks
 like it did after the first apart from those three fields.
 

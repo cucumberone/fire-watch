@@ -30,10 +30,11 @@
 #
 # `event:<key>` IS the record. There is no per-delivery key. A repeat of the same
 # (device, summary) does not create a second key: it bumps `count`, moves
-# `lastSeen`, and the arrival id is kept only as `lastId` for audit correlation.
-# That is the requested behaviour — "update LastOccurrence and drop the duplicate
-# event" — and it makes storage grow with CONDITIONS, not deliveries
-# (docs/sizing.md §1.1).
+# `lastSeen`, and the delivery's stream entry id is kept as `lastId` — which is
+# also the key of its `hist:` row, so the record points at the audit trail rather
+# than at a value nothing else uses. That is the requested behaviour — "update
+# LastOccurrence and drop the duplicate event" — and it makes storage grow with
+# CONDITIONS, not deliveries (docs/sizing.md §1.1).
 #
 # Per-delivery history is NOT lost: every delivery is forked into `hist:` before
 # this script runs (docs/history.md).
@@ -50,7 +51,8 @@
 # ZADD would otherwise leave a phantom row on every operator's screen forever.
 #
 # ARGV[1] = broker_ts_ms (the ms part of the ingest stream entry ID)
-# ARGV[2] = arrival event id (identity of THIS delivery; becomes lastId/closedBy)
+# ARGV[2] = arrival id: UNIQUE PER DELIVERY — the whole stream entry ID,
+#            `<ms>-<seq>`. Becomes lastId / closedBy and the watermark tiebreaker
 # ARGV[3] = severity
 # ARGV[4] = bare event key (the index member)
 # ARGV[5] = source (device)
@@ -92,11 +94,19 @@ data:
       i = i + 2
     end
 
-    -- 1. ORDERING GUARD: (timestamp, id), lexicographic.
+    -- 1. ORDERING GUARD: (timestamp, arrival id), lexicographic.
     --
     --    Two jobs at once:
     --      a) stop a redelivered old CLOSE from retiring a newer CRITICAL;
-    --      b) stop a genuine redelivery (same ts, same id) from being counted.
+    --      b) stop a genuine redelivery — the SAME stream entry, re-read from the
+    --         pending list — from being counted twice.
+    --
+    --    For (b) the tiebreaker has to be unique PER DELIVERY, and it is: the
+    --    caller passes the stream entry ID (`<ms>-<seq>`), which the master assigns
+    --    and which therefore cannot repeat for two different entries. Two DIFFERENT
+    --    arrivals inside the same millisecond are ordered by the sequence part
+    --    instead of being mistaken for a redelivery, which is why two events of one
+    --    condition in the same ms are both counted.
     --
     --    Note what is NOT here: a fingerprint lookup. With one hash per condition
     --    the "is this the same condition" question was answered by the KEY itself,

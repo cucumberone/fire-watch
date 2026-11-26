@@ -126,9 +126,9 @@ These prove the severity model in [event-lifecycle.md](event-lifecycle.md) survi
 | 6.1 | Arrival timestamps come from the stream | every record's `lastSeen` / `brokerTs` equals the ms part of an entry ID; producers cannot set it | `XRANGE` during a backlog vs `HGET event:<key> lastSeen` |
 | 6.2 | POST CRITICAL, then CLOSE, but make the CLOSE's fold write fail so it stays pending | alert stays open until the CLOSE is successfully applied from the PEL | `HGETALL event:<key>` watermark advances only on the applied attempt |
 | 6.3 | **The headline case:** CRITICAL (t1) → CLOSE (t2) left pending → CRITICAL (t3 > t2) committed by another worker → CLOSE re-read from the PEL | the retried CLOSE returns `applied=0`; the t3 CRITICAL **stays open** | `event:<key>` severity is still CRITICAL; the Lua script returned `0` |
-| 6.4 | POST two events in the same millisecond, one CRITICAL and one CLOSE, repeatedly | identical final state on every run | tie-break on `(ts, id)`; run 20x, compare `HGETALL` |
+| 6.4 | POST two events in the same millisecond, one CRITICAL and one CLOSE, repeatedly | identical final state on every run | tie-break on `(ts, stream entry id)`; run 20x, compare `HGETALL` |
 | 6.5 | Out of order processing: CLOSE folded after a CRITICAL whose entry ID is **higher** | the CLOSE is stale and never retires the CRITICAL | alert state CRITICAL; `applied=0` on the CLOSE |
-| 6.6 | Force the same condition to two different workers concurrently (claim race) | one fold wins, no split state | exactly one call returns non-zero; final watermark is the max `(ts, id)` |
+| 6.6 | Force the same condition to two different workers concurrently (claim race) | one fold wins, no split state | exactly one call returns non-zero; final watermark is the max `(ts, stream entry id)` |
 | 6.7 | POST the same device+summary 100× with **100 different event ids** | `count == 100`, ONE record | `ZCARD idx:event:all` grows by exactly 1; `HMGET event:<key> count` is 100 |
 | 6.8 | POST a CRITICAL, then a WARNING for the same device+summary 10 s later | `severity` becomes WARNING, `count` 2, one record | same key; the row does not split |
 | 6.9 | CRITICAL → CLOSE → CRITICAL | new episode: `count` resets to 1, `firstSeen` is the third event | `applied` sequence is 1, 3, 1 |

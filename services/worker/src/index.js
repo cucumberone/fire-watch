@@ -26,7 +26,7 @@ import {
 } from './event.js';
 import { ValkeyClient } from './valkey.js';
 import { bareKeyFor } from './keygen.js';
-import { FoldScript, persistEvent, reconcileEventIndex, recordDelivery, newDeliveryId } from './store.js';
+import { FoldScript, persistEvent, reconcileEventIndex, recordDelivery, deliveryIdFor } from './store.js';
 import { StreamConsumer } from './stream.js';
 
 const cfg = loadConfig();
@@ -131,7 +131,11 @@ async function handleEntry(entry) {
     // It also has to succeed before the XACK: a delivery that was processed but not
     // recorded is a hole in the log, and holes are what an audit trail exists to
     // rule out. A failure here is retried, exactly like a failed record write.
-    const deliveryId = newDeliveryId();
+    //
+    // The delivery id is the STREAM ENTRY ID. It is already unique per delivery —
+    // the master assigned it at XADD — so there is nothing to mint, and reusing it
+    // means an audit row can be traced back to the exact stream entry it came from.
+    const deliveryId = deliveryIdFor(entry.id);
     await recordDelivery({
       valkey,
       evt,
@@ -153,6 +157,10 @@ async function handleEntry(entry) {
     //   3  retired               -> the condition is closed
     const { applied, bareKey } = await persistEvent({
       valkey, evt, storedPayload, brokerTs, cfg, fold, log,
+      // The arrival identity for this delivery: the stream entry id. Unique per
+      // entry, ordered within a millisecond, and the same value the audit row is
+      // keyed by — so a record's `lastId` points at an addressable `hist:` row.
+      entryId: entry.id,
     });
     lastWriteOk = true;
 
@@ -187,8 +195,16 @@ async function handleEntry(entry) {
           // on it, and it can no longer be derived from `source`+`type` (the key is
           // a hash of device + summary). Without it the client would have to
           // reimplement the hash, which is how the two would drift.
-          event: { ...evt, payload: storedPayload, brokerTs, key: bareKey },
+          //
+          // `deliveryId` is the stream entry id and is carried for the same reason
+          // `brokerTs` is: one arrival produces two frames on two channels, and the
+          // client must fold it once. Unlike a timestamp it is exactly unique, so
+          // two arrivals in the same millisecond are still told apart.
+          event: {
+            ...evt, payload: storedPayload, brokerTs, key: bareKey, deliveryId,
+          },
           applied,
+          deliveryId,
         }),
       );
       if (applied === 1 || applied === 3) {
@@ -207,7 +223,7 @@ async function handleEntry(entry) {
         // arrival twice — once per frame.
         await valkey.publish(
           keys.channelAlerts,
-          JSON.stringify({ key: bareKey, applied, brokerTs }),
+          JSON.stringify({ key: bareKey, applied, brokerTs, deliveryId }),
         );
       }
     } catch (err) {

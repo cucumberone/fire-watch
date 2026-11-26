@@ -105,13 +105,43 @@ The bug is applying the CLOSE by *processing* order instead of by *arrival times
 Note the same hazard exists without any failure at all: with **3 consumers in one group, entries of a batch are processed concurrently and batches on different workers race**. Two events appended 10 ms apart can be folded in the opposite order. Stream-assigned timestamps are what make the fold order-independent.
 ## 5. The fix: monotonic watermark per alert key
 
-Every event carries an **arrival timestamp** (`brokerTs`, from the stream entry ID). The alert state for a given key is only advanced by an event whose timestamp is strictly newer than the last applied one.
+Every event carries an **arrival identity**: `brokerTs` (the ms part of the stream
+entry ID), then the entry ID itself as the tiebreaker. The alert state for a given key
+is only advanced by an event whose arrival identity is strictly newer than the last
+applied one.
+
+### 5.0 The arrival id is the STREAM ENTRY ID
+
+The tiebreaker used to be the producer's message id, and that was wrong in one
+specific way: **the producer's id is not unique per delivery.** Two events of one
+condition inside the same millisecond compared equal at the same watermark timestamp,
+so the second was dropped as a redelivery and `count` under-reported by one. A
+producer that reuses its id hits the same wall at any timestamp.
+
+The entry id has neither problem. It is `<ms>-<seq>`, assigned by the master at
+`XADD`, unique for every entry ever added to the stream, and it orders
+lexicographically within a millisecond because the sequence is the suffix:
+
+| Situation | `ts` | arrival id | Verdict |
+|---|---|---|---|
+| first delivery | `7000` | `7000-0` | applied — new watermark |
+| second arrival, same ms | `7000` | `7000-1` | applied — `7000-1` > `7000-0` |
+| the SAME entry re-read from the PEL | `7000` | `7000-1` | **dropped** — equal, so a redelivery |
+| stale arrival | `6000` | `6000-4` | dropped — older timestamp |
+
+Same value, three uses: the fold's tiebreaker, `lastId`/`closedBy` on the record, and
+the `hist:` key of the audit row. That last one is why an audit row can be found from
+the record — `lastId` addresses it directly, which a minted UUID could not.
+
+Nothing has to be minted for this. `deliveryIdFor(entryId)` in
+[`services/worker/src/store.js`](../services/worker/src/store.js) exists only to name
+the contract in one place.
 
 ### 5.1 Keys
 
 | Key | Type | Contents | TTL |
 |---|---|---|---|
-| `event:<32 hex>` | hash | the WHOLE record: payload fields, `state`, `severity`, `count`, `firstSeen`, `lastSeen`, `lastId`, ack/closure fields, `watermark` | 7d (rolling) |
+| `event:<32 hex>` | hash | the WHOLE record: payload fields, `state`, `severity`, `count`, `firstSeen`, `lastSeen`, `lastId`, `eventId`, ack/closure fields, `watermark` | 7d (rolling) |
 | `idx:event:open` | zset | member = bare key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN event:*` ([websocket-server.md](websocket-server.md) §3.1) | members removed by the fold on retirement |
 | `idx:event:all` | zset | member = bare key, score = **arrival** timestamp ms (`brokerTs`). The global timeline, written in the same step as the per-device index so it can never be missing a record that index has. Backs the All Events tab, which cannot be answered from `idx:source:*` without a SCAN | 7d, via the worker's index prune |
 | `idx:event:closed` | zset | member = bare key, score = `closedAt` ms. The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two. Removed again when a condition re-opens ([frontend.md](frontend.md) §5.6) | 7d, via the worker's index prune |
@@ -138,9 +168,10 @@ hashes to the same address and there is nothing to detect ([valkey.md](valkey.md
 | `lastSeen` | arrival ts (`brokerTs`) of the **most recent** applied event — the "last occurrence" |
 | `count` | events applied in the current episode. Every applied event counts; a redelivery never gets here (the watermark drops it, §5.4.1) |
 | `ackedBy`, `ackedAt` | operator who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
-| `lastId` | event id of the most recent applied arrival |
-| `closedBy`, `closedAt` | the CLOSE/HARMLESS that retired the episode |
-| `watermark`, `watermarkId` | ordering guard (§5.2) |
+| `lastId` | **stream entry id** of the most recent applied arrival — `<ms>-<seq>`, so it resolves to the `hist:` row for that delivery |
+| `eventId` | the PRODUCER's own message id, kept for correlation. Not unique: it repeats on a redelivery, and a shipper may reuse it |
+| `closedBy`, `closedAt` | the CLOSE/HARMLESS that retired the episode. `closedBy` is the stream entry id, for the same reason as `lastId` |
+| `watermark`, `watermarkId` | ordering guard (§5.2). `watermarkId` is the stream entry id |
 
 A CLOSE and the CRITICAL it retires share one key when they share device **and**
 summary, which is exactly the intent: retiring is a state change on the record, not a
@@ -158,7 +189,8 @@ its shape.
 -- KEYS[1] = event:<key>         the record
 -- KEYS[2] = idx:event:all       KEYS[3] = idx:event:open
 -- KEYS[4] = idx:event:closed    KEYS[5] = idx:source:<device>
--- ARGV[1] = broker_ts_ms   ARGV[2] = arrival id   ARGV[3] = severity
+-- ARGV[1] = broker_ts_ms   ARGV[2] = stream entry id (unique per delivery)
+-- ARGV[3] = severity
 -- ARGV[4] = bare key (index member)   ARGV[5] = device   ARGV[6] = ttl ms
 -- ARGV[7..] = field, value, field, value …  the record's own fields
 
@@ -237,7 +269,12 @@ redelivery of the same message (and is dropped). See §5.4.3.
 
 ### 5.3 Tie-break within the same millisecond
 
-Two events can share a millisecond (their entry IDs differ only in `<seq>`), and concurrent workers give no ordering guarantee between them. The fold needs a deterministic winner so all workers agree, which is why the watermark is the **pair** `(broker_ts_ms, event_id)` compared lexicographically (lines 6–9 above).
+Two events can share a millisecond (their entry IDs differ only in `<seq>`), and
+concurrent workers give no ordering guarantee between them. The fold needs a
+deterministic winner so all workers agree, which is why the watermark is the **pair**
+`(broker_ts_ms, stream entry id)` compared lexicographically (lines 6–9 above). The
+sequence suffix is what makes two same-millisecond arrivals *ordered* rather than
+*equal* — the bug that made `count` under-report by one.
 
 Without the tie-break, a CRITICAL and a CLOSE stamped in the same millisecond could resolve differently on different workers depending on delivery order — a race that appears only under load and is nearly impossible to reproduce afterwards.
 
@@ -252,7 +289,7 @@ machinery, because the record is keyed by the condition.
 |---|---|---|
 | Question | "is this the same *message* again?" | "is this the same *condition*, reported again?" |
 | Cause | at-least-once delivery, worker crash before `XACK`, `XAUTOCLAIM` | a producer re-reporting the same alarm with a fresh id |
-| Identity | `(brokerTs, id)` | the record KEY (§5.4.2) |
+| Identity | `(brokerTs, stream entry id)` | the record KEY (§5.4.2) |
 | Detection | the fold's ordering guard returns `0` | the arrival hashes to an EXISTING key, so there is no second record to write |
 | Result | **nothing at all happens** | `count` +1 and `lastSeen` moves **on the same hash** |
 
@@ -261,7 +298,7 @@ machinery, because the record is keyed by the condition.
 A redelivery is the same stream entry, keeping its entry ID — so its original
 `brokerTs` — and its original `evt.id`. It must be a no-op:
 
-- The fold's `(ts, id)` watermark returns `0` for anything not newer, so no field
+- The fold's `(ts, entry id)` watermark returns `0` for anything not newer, so no field
   changes.
 - `ZADD` on an existing member only sets its score, so the indexes cannot gain a
   duplicate member.
@@ -405,7 +442,7 @@ on the same state regardless of the order they are processed in.
 
 | Concern | Mechanism | Owner | Effect if missing |
 |---|---|---|---|
-| Same *stream entry* redelivered | `(ts, id)` watermark returns `0` | worker (§5.2) | a repeat is counted twice |
+| Same *stream entry* redelivered | `(ts, entry id)` watermark returns `0` | worker (§5.2) | a repeat is counted twice |
 | Same *message* re-published to the browser | gateway LRU on `id@brokerTs` | gateway ([websocket-server.md](websocket-server.md) §5) | duplicate UI rows |
 | Same *message* arriving out of order | watermark fold | worker (§5.2) | an old CLOSE retires a newer CRITICAL |
 | Same *condition* reporting repeatedly | the CONTENT KEY: a repeat hashes to the same record | worker ([valkey.md](valkey.md) §2) | it cannot happen — there is no second key |

@@ -32,14 +32,21 @@ hist:<deliveryId>   hash  ONE delivery. Immutable, no state.
 idx:history         zset  <deliveryId> -> arrival timestamp (brokerTs)
 ```
 
-`<deliveryId>` is a **UUID minted per delivery** (`newDeliveryId()`), not derived
-from the message id and not scoped to the condition. Two consequences, both
-required:
+`<deliveryId>` is the **stream entry id** — `<ms>-<seq>`, assigned by the master at
+`XADD` (`deliveryIdFor()` in [`services/worker/src/store.js`](../services/worker/src/store.js)).
+It is not derived from the message id and not scoped to the condition. Three
+consequences, all required:
 
-- two deliveries of the SAME message (a redelivery) are two rows, which is the
-  whole reason the fork happens before dedup;
+- two deliveries of the SAME message (a redelivery) are two rows, because two
+  entries are two ids — which is the whole reason the fork happens before dedup;
 - a condition that fires 400 times keeps 400 rows instead of overwriting itself
-  down to one.
+  down to one;
+- the id is the value the record stores as `lastId`, so an audit row is reachable
+  from the incident it belongs to by address rather than by a time-range scan.
+
+It used to be a minted UUID. The stream already assigns a unique id per entry, so
+minting a second one recorded a fact twice and made the audit row's own id useless
+for correlating back to the entry it came from.
 
 The CONDITION key lives inside the hash as the `key` field. Putting it in the key
 name would reintroduce exactly that overwrite.
@@ -56,6 +63,10 @@ so the two cannot drift:
 | `source`, `type`, `msg`, `payload`, `severity`, `displaySeverity` | what arrived |
 | `brokerTs` | when WE received it — the ms part of the stream entry ID |
 | `ts` | when the source claims it fired |
+
+The ROW ID is not a field: it is the key name, `hist:<stream entry id>`. Nothing
+repeats it inside the hash, because the record's `lastId` already holds it when you
+need to go the other way.
 
 Deliberately **absent**: `count`, `firstSeen`, `lastSeen`, `state`, `ackedBy`,
 `closedBy`, `closedAt`. Every one of those describes the condition at read time.
@@ -91,7 +102,7 @@ it. Consequences, all intended:
 | | |
 |---|---|
 | every accepted message produces exactly one row | including the ones the fold will reject |
-| a delivery never overwrites another | the id is unique per delivery |
+| a delivery never overwrites another | the id is the stream entry id, unique per entry |
 | the write still precedes the `XACK`+`XDEL` | a crash after processing but before recording would leave a hole in the log |
 
 It is one `MULTI` of `HSET` + `PEXPIRE` + `ZADD`, so the row and its index member

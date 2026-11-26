@@ -145,15 +145,21 @@ export function eventFrame(event, applied) {
  * frame small on the hot path (every applied event already carries its event on a
  * separate `op: event` frame).
  */
-export function alertFrame(key, applied, row, brokerTs) {
+export function alertFrame(key, applied, row, brokerTs, deliveryId) {
   // `brokerTs` identifies WHICH arrival this frame describes. A content duplicate
   // is published on both channels, so the client receives an `op: event` frame and
   // an `op: alert` frame for one delivery; the timestamp is the only field they
   // share, and without it the client cannot tell a second frame from a second
   // occurrence. It is carried even when `row` is absent, which is exactly the case
   // where `row.lastSeen` cannot supply it.
+  //
+  // `deliveryId` is the exact form of the same fact: the stream entry id, unique
+  // per delivery. A millisecond timestamp cannot separate two arrivals inside the
+  // same millisecond, so the client prefers this when it is present and falls back
+  // to `brokerTs` for a frame from an older worker during a rolling update.
   const base = { op: 'alert', key, applied };
   if (Number.isFinite(brokerTs) && brokerTs > 0) base.brokerTs = brokerTs;
+  if (typeof deliveryId === 'string' && deliveryId !== '') base.deliveryId = deliveryId;
   if (row) base.row = row;
   return JSON.stringify(base);
 }

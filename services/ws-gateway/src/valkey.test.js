@@ -54,7 +54,10 @@ function hashValues(over = {}) {
     firstSeen: '1000',
     lastSeen: '2000',
     count: '3',
-    lastId: 'evt-9',
+    // lastId is the newest DELIVERY (the stream entry id); eventId is the
+    // producer's own message id. Both are read; they are not interchangeable.
+    lastId: '1000-2',
+    eventId: 'evt-9',
     state: 'open',
     closedAt: '',
     closedBy: '',

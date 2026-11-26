@@ -20,7 +20,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   persistEvent, missingFromGlobal, reconcileEventIndex,
-  recordDelivery, newDeliveryId,
+  recordDelivery, deliveryIdFor,
 } from './store.js';
 import { eventKeyFor, bareKeyFor, isValidEventKey, summaryOf, deviceOf } from './keygen.js';
 
@@ -239,7 +239,8 @@ test('isValidEventKey accepts only the generated shape', () => {
 test('the first delivery writes one record, both timelines and one fold call', async () => {
   const valkey = makeValkey();
   const res = await persistEvent({
-    valkey, evt: silent, storedPayload: storedPayload(silent), brokerTs: 1000, cfg, fold, log,
+    valkey, evt: silent, storedPayload: storedPayload(silent), brokerTs: 1000,
+    entryId: '1000-0', cfg, fold, log,
   });
 
   assert.equal(res.applied, 1);
@@ -260,8 +261,8 @@ test('a repeat of the same condition updates the SAME record and creates no seco
   const valkey = makeValkey();
   const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
 
-  await persistEvent({ ...args, evt: silent, brokerTs: 1000 });
-  const second = await persistEvent({ ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000 });
+  await persistEvent({ ...args, evt: silent, brokerTs: 1000, entryId: '1000-0' });
+  const second = await persistEvent({ ...args, evt: { ...silent, id: 'evt-2' }, brokerTs: 2000, entryId: '2000-0' });
 
   assert.equal(second.applied, 1, 'an occurrence, not a duplicate');
 
@@ -273,17 +274,24 @@ test('a repeat of the same condition updates the SAME record and creates no seco
   assert.equal(h.get('count'), '2', 'the count moved');
   assert.equal(h.get('lastSeen'), '2000', 'last occurrence moved');
   assert.equal(h.get('firstSeen'), '1000', 'first occurrence did NOT move');
-  assert.equal(h.get('lastId'), 'evt-2', 'the newest arrival id is recorded');
+  assert.equal(h.get('lastId'), '2000-0',
+    'the newest DELIVERY is recorded — the stream entry id, not the producer id');
+  assert.equal(h.get('eventId'), 'evt-2',
+    'the producer message id is kept alongside it, for correlation');
 });
 
 test('recordDelivery forks EVERY delivery, before any dedup', async () => {
   // The point of the fork: two messages that are IDENTICAL (same id, same content)
   // still produce two rows, because the trail records what the broker handed us,
   // not what the fold accepted.
+  //
+  // The id is the STREAM ENTRY ID. Two entries are two ids by construction — the
+  // master assigns `<ms>-<seq>` and never repeats one — which is why nothing needs
+  // to be minted here.
   const valkey = makeValkey();
   const bare = bareKeyFor(silent);
-  const a = newDeliveryId();
-  const b = newDeliveryId();
+  const a = deliveryIdFor('1000-0');
+  const b = deliveryIdFor('1000-1');
 
   await recordDelivery({
     valkey, evt: silent, storedPayload: storedPayload(silent),
@@ -294,7 +302,7 @@ test('recordDelivery forks EVERY delivery, before any dedup', async () => {
     brokerTs: 1000, bareKey: bare, deliveryId: b, cfg, log,
   });
 
-  assert.notEqual(a, b, 'the id is unique per delivery');
+  assert.notEqual(a, b, 'two entries are two deliveries');
   const rows = [...valkey.store.keys()].filter((k) => k.startsWith('hist:'));
   assert.equal(rows.length, 2, 'two deliveries of the SAME message are two rows');
   assert.deepEqual(new Set(rows), new Set([`hist:${a}`, `hist:${b}`]));
@@ -310,10 +318,6 @@ test('recordDelivery forks EVERY delivery, before any dedup', async () => {
   // Both index members are the delivery ids, scored by broker timestamp.
   const indexed = valkey.calls.zadd.filter((z) => z.key === 'idx:history');
   assert.equal(indexed.length, 2);
-  // Compare as SETS. Sorting the expected array was wrong: `newDeliveryId` is
-  // `<ms36>-<uuid>`, and two ids minted in the same millisecond differ only in a
-  // random UUID, so `[a, b]` is not in sorted order half the time. That made this
-  // test fail intermittently for a reason that had nothing to do with the code.
   assert.deepEqual(new Set(indexed.map((z) => z.member)), new Set([a, b]));
 });
 
@@ -324,8 +328,8 @@ test('the fork runs for a delivery the fold will reject', async () => {
   const valkey = makeValkey();
   const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
 
-  await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000 });
-  const again = await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000 });
+  await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000, entryId: '5000-0' });
+  const again = await persistEvent({ ...args, evt: { ...silent, id: 'dup' }, brokerTs: 5000, entryId: '5000-0' });
   assert.equal(again.applied, 0, 'the fold rejects the redelivery');
 
   // The fold call happened twice; only ONE record write landed.
@@ -339,14 +343,14 @@ test('a re-fire after retirement starts a new episode with count 1', async () =>
   const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
   const key = `event:${bareKeyFor(silent)}`;
 
-  await persistEvent({ ...args, evt: silent, brokerTs: 1000 });
-  await persistEvent({ ...args, evt: { ...silent, id: 'e2' }, brokerTs: 2000 });
+  await persistEvent({ ...args, evt: silent, brokerTs: 1000, entryId: '1000-0' });
+  await persistEvent({ ...args, evt: { ...silent, id: 'e2' }, brokerTs: 2000, entryId: '2000-0' });
   assert.equal(valkey.store.get(key).get('count'), '2');
 
   await persistEvent({
-    ...args, evt: { ...silent, id: 'c1', severity: 'CLOSE' }, brokerTs: 3000,
+    ...args, evt: { ...silent, id: 'c1', severity: 'CLOSE' }, brokerTs: 3000, entryId: '3000-0',
   });
-  await persistEvent({ ...args, evt: { ...silent, id: 'e3' }, brokerTs: 4000 });
+  await persistEvent({ ...args, evt: { ...silent, id: 'e3' }, brokerTs: 4000, entryId: '4000-0' });
 
   const h = valkey.store.get(key);
   assert.equal(h.get('count'), '1', 'a new episode counts from 1, not from the old total');
@@ -359,16 +363,16 @@ test('an ack is cleared when the episode ends and kept while it continues', asyn
   const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
   const key = `event:${bareKeyFor(silent)}`;
 
-  await persistEvent({ ...args, evt: silent, brokerTs: 1000 });
+  await persistEvent({ ...args, evt: silent, brokerTs: 1000, entryId: '1000-0' });
   valkey.store.get(key).set('ackedBy', 'alice');
   valkey.store.get(key).set('ackedAt', '1500');
 
   // Still firing: the ack belongs to this episode and must survive.
-  await persistEvent({ ...args, evt: { ...silent, id: 'e2' }, brokerTs: 2000 });
+  await persistEvent({ ...args, evt: { ...silent, id: 'e2' }, brokerTs: 2000, entryId: '2000-0' });
   assert.equal(valkey.store.get(key).get('ackedBy'), 'alice', 'an ongoing episode keeps its ack');
 
   // Retired: the ack goes with the episode.
-  await persistEvent({ ...args, evt: { ...silent, id: 'c1', severity: 'CLOSE' }, brokerTs: 3000 });
+  await persistEvent({ ...args, evt: { ...silent, id: 'c1', severity: 'CLOSE' }, brokerTs: 3000, entryId: '3000-0' });
   assert.equal(valkey.store.get(key).has('ackedBy'), false, 'retirement clears the ack');
 });
 
@@ -378,24 +382,71 @@ test('an older event cannot move the record backwards', async () => {
   const valkey = makeValkey();
   const args = { valkey, storedPayload: storedPayload(silent), cfg, fold, log };
 
-  await persistEvent({ ...args, evt: silent, brokerTs: 2000 });
+  await persistEvent({ ...args, evt: silent, brokerTs: 2000, entryId: '2000-0' });
   const stale = await persistEvent({
-    ...args, evt: { ...silent, id: 'old-close', severity: 'CLOSE' }, brokerTs: 1500,
+    ...args, evt: { ...silent, id: 'old-close', severity: 'CLOSE' }, brokerTs: 1500, entryId: '1500-0',
   });
 
   assert.equal(stale.applied, 0, 'stale CLOSE dropped');
   assert.equal(valkey.store.get(`event:${bareKeyFor(silent)}`).get('state'), 'open');
 });
 
-test('a same-millisecond CLOSE with a higher id wins, deterministically', async () => {
+test('a same-millisecond CLOSE with a later entry id wins, deterministically', async () => {
+  // The tiebreaker is the STREAM ENTRY ID, which is `<ms>-<seq>`. Two entries in one
+  // millisecond share the timestamp but not the sequence, so the later one orders
+  // after the earlier one and every worker reaches the same verdict.
   const valkey = makeValkey();
   const args = { valkey, storedPayload: {}, cfg, fold, log };
 
-  await persistEvent({ ...args, evt: { ...silent, id: 'aaa' }, brokerTs: 5000 });
+  await persistEvent({ ...args, evt: { ...silent, id: 'aaa' }, brokerTs: 5000, entryId: '5000-0' });
   const close = await persistEvent({
-    ...args, evt: { ...silent, id: 'zzz', severity: 'CLOSE' }, brokerTs: 5000,
+    ...args, evt: { ...silent, id: 'zzz', severity: 'CLOSE' },
+    brokerTs: 5000, entryId: '5000-1',
   });
-  assert.equal(close.applied, 3, 'the id breaks the tie, so every worker agrees');
+  assert.equal(close.applied, 3, 'the sequence part breaks the tie, so every worker agrees');
+});
+
+test('two arrivals of one condition in the same millisecond are both counted', async () => {
+  // The regression this fixes. The arrival id used to be the PRODUCER's message id,
+  // so a producer that sent two events of one condition inside one millisecond —
+  // or one that reused an id — compared equal at the same watermark timestamp and
+  // the second was dropped as a redelivery. `count` under-reported by one.
+  //
+  // A stream entry id cannot collide: the master assigns the sequence.
+  const valkey = makeValkey();
+  const args = { valkey, storedPayload: { msg: 'disk almost full' }, cfg, fold, log };
+
+  const first = await persistEvent({ ...args, evt: silent, brokerTs: 7000, entryId: '7000-0' });
+  const second = await persistEvent({ ...args, evt: silent, brokerTs: 7000, entryId: '7000-1' });
+
+  assert.equal(first.applied, 1);
+  assert.equal(second.applied, 1, 'a second delivery in the same ms is an occurrence, not a duplicate');
+
+  const h = valkey.store.get(`event:${bareKeyFor(silent)}`);
+  assert.equal(h.get('count'), '2', 'both arrivals counted');
+  assert.equal(h.get('lastId'), '7000-1', 'lastId points at the newest entry');
+});
+
+test('a redelivery of the SAME entry is still rejected', async () => {
+  // The other half of the guard: same timestamp AND same entry id is a redelivery,
+  // which must not be counted twice.
+  const valkey = makeValkey();
+  const args = { valkey, storedPayload: { msg: 'disk almost full' }, cfg, fold, log };
+
+  await persistEvent({ ...args, evt: silent, brokerTs: 8000, entryId: '8000-0' });
+  const again = await persistEvent({ ...args, evt: silent, brokerTs: 8000, entryId: '8000-0' });
+
+  assert.equal(again.applied, 0, 'the same entry re-read from the pending list is not a new arrival');
+  assert.equal(valkey.store.get(`event:${bareKeyFor(silent)}`).get('count'), '1');
+});
+
+test('deliveryIdFor is the entry id, not a minted one', () => {
+  // Named so the contract is one place: the audit row's key and the fold's arrival
+  // id are the same value, which is what makes a record's `lastId` resolve to a
+  // `hist:` row.
+  assert.equal(deliveryIdFor('1762699200000-3'), '1762699200000-3');
+  assert.equal(deliveryIdFor(''), '');
+  assert.equal(deliveryIdFor(undefined), '');
 });
 
 // -------------------------------------------------------------- index reconcile

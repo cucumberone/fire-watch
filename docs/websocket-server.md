@@ -44,7 +44,7 @@ Server → client:
 
 ```json
 { "op": "event", "event": { "id": "...", "source": "sensor-a", "type": "telemetry.temperature", "severity": "CRITICAL", "ts": "...", "payload": {} }, "applied": 1 }
-{ "op": "snapshot", "alerts": [ { "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "source": "sensor-a", "severity": "CRITICAL", "summary": "inlet temperature above threshold", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3, "lastId": "abc", "ackedBy": null, "ackedAt": null } ] }
+{"op": "snapshot", "alerts": [ {"key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "source": "sensor-a", "severity": "CRITICAL", "summary": "inlet temperature above threshold", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3, "lastId": "1762699260000-1", "eventId": "abc", "ackedBy": null, "ackedAt": null } ] }
 { "op": "alert", "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "applied": 1, "severity": "CRITICAL", "firstSeen": 1762699200000, "lastSeen": 1762699260000, "count": 3 }
 { "op": "alert", "key": "9f2b8c1e4d7a83be5c61024ffa9d3e07", "applied": 3, "state": "closed", "closedAt": 1762699900000 }
 { "op": "hello", "server": "ws-gateway-5f7c", "backfill": 42 }
@@ -64,7 +64,7 @@ Rules:
   for `0`, so treating it as an applied event would double-count and treating it as
   a close would flicker the row.
 - `op: alert` frames carry a ROW, not the raw event. `count` counts every applied
-  arrival; a redelivery is dropped by the fold's `(ts, id)` watermark before it can
+  arrival; a redelivery is dropped by the fold's `(ts, stream entry id)` watermark before it can
   affect the count ([event-lifecycle.md](event-lifecycle.md) §5.4). Alert frames are
   emitted from `fw:ch:alerts`; a client that missed one recovers via the snapshot on
   reconnect rather than by replaying events.

@@ -2876,9 +2876,33 @@ function App() {
   // Kept as a counter rather than a boolean so two re-clicks in a row each produce a
   // new value; a boolean would fetch once and then stop.
   const [tabNonce, setTabNonce] = useState(0);
+  // Which AREA is showing: the live board, or a configuration page.
+  //
+  // Separate from `tab`, which selects the board's view. Conflating them would put
+  // "Data to columns" in the tab strip beside "Open alerts", implying it is another
+  // way of looking at events.
+  //
+  // Declared BEFORE the tab handlers, because selecting a tab has to clear it — see
+  // `setTab`. A `const` used in a callback that is defined above it is a
+  // temporal-dead-zone error at call time, not at definition time, so the ordering
+  // here is load-bearing rather than stylistic.
+  const [area, setArea] = useState('board');
+  /**
+   * Select a board tab, and make sure the BOARD is what is showing.
+   *
+   * The tab strip lives in the AppBar, so it is visible on the configuration pages
+   * too. Clicking "All events" there selected the tab and left the configuration page
+   * on screen — the strip and the content disagreed, and the click looked broken.
+   *
+   * Switching `area` here is the fix rather than hiding the tabs on those pages: the
+   * strip is the app's primary navigation, and removing it from half the screens would
+   * force an operator to find the nav rail to get back to the board, which is a longer
+   * trip than tapping the tab they can already see.
+   */
   const setTab = useCallback((id) => {
     setTabState(id);
     writePref(TAB_KEY, id);
+    setArea('board');
   }, []);
   const onTabClick = useCallback((id) => {
     // Only the query-backed tabs need it: the live ones stream their own updates.
@@ -2890,12 +2914,6 @@ function App() {
   // the table sits beside a "showing 50 of 0" notice forever.
   const historyReqRef = useRef(null);
   const allEventsReqRef = useRef(null);
-  // Which AREA is showing: the live board, or a configuration page.
-  //
-  // Separate from `tab`, which selects the board's view. Conflating them would put
-  // "Data to columns" in the tab strip beside "Open alerts", implying it is another
-  // way of looking at events.
-  const [area, setArea] = useState('board');
   // Collapsed by default on a narrow window: the board is the point, and a nav rail
   // eating 200px of a laptop screen to show two items is a bad trade.
   const [navOpen, setNavOpen] = useState(() => readPref(NAV_KEY, '1') !== '0');

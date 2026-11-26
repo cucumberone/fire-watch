@@ -1616,3 +1616,30 @@ test('a closed record renders its closedAt humanely while keeping the raw epoch'
   assert.equal(value('alertClosedBy'), '1795722434752-0', 'an id is left raw');
   assert.equal(value('alertState'), 'closed', 'a state string is left raw');
 });
+
+test('selecting a tab returns to the board from a configuration page', () => {
+  // The tab strip lives in the AppBar, so it is visible on the configuration pages too.
+  // Clicking "All events" there selected the tab and left the configuration page on
+  // screen — the strip and the content disagreed and the click looked broken.
+  //
+  // The fix is in `setTab`: it clears the area. Asserted on source because app.jsx has
+  // no unit harness.
+  const setTabBody = appSrc.slice(
+    appSrc.indexOf('const setTab = useCallback((id) => {'),
+    appSrc.indexOf('const onTabClick = useCallback'),
+  );
+  assert.match(setTabBody, /setTabState\(id\)/);
+  assert.match(setTabBody, /setArea\('board'\)/, 'selecting a tab must show the board');
+});
+
+test('area is declared before the tab handlers that use it', () => {
+  // A `const` referenced by a callback defined above it is a temporal-dead-zone error
+  // at CALL time — the click throws rather than the definition failing, which is a
+  // confusing way to find out.
+  const areaAt = appSrc.indexOf('const [area, setArea] = useState');
+  const setTabAt = appSrc.indexOf('const setTab = useCallback((id) => {');
+  assert.ok(areaAt > 0 && setTabAt > 0);
+  assert.ok(areaAt < setTabAt, 'area must be declared first');
+  // And it is declared exactly once.
+  assert.equal((appSrc.match(/const \[area, setArea\] = useState/g) ?? []).length, 1);
+});

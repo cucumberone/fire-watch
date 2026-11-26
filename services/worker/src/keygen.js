@@ -25,6 +25,9 @@ const SEP = '\u001f';
 /** Key prefix. The record itself is a hash at `event:<hash>`. */
 export const EVENT_PREFIX = 'event:';
 
+/** 32 hex characters: the only shape a bare record key may have. */
+const BARE_KEY_RE = /^[0-9a-f]{32}$/;
+
 /**
  * Normalise one identity component.
  *
@@ -70,7 +73,38 @@ export function deviceOf(evt) {
  * colon-splitting helper in the codebase would misparse it. Device and summary are
  * stored as hash FIELDS, so nothing is lost for display.
  */
+/**
+ * The record key for an event.
+ *
+ * TWO SOURCES, in this order:
+ *
+ *   1. `evt.key` — the ingress computed it from the identifier keys an operator
+ *      selected (services/http-ingress/src/schema.js `identifierHash`). It has
+ *      already been validated as 32 hex before it reached the stream, and the
+ *      gateway needs to derive the same key for its own writes, so it is carried on
+ *      the envelope rather than recomputed here.
+ *
+ *   2. `device + 0x1f + summary` — the CONDITION key. The fallback, and still the
+ *      normal case: an install that never configures identifier keys produces
+ *      events with no `key` at all.
+ *
+ * WHY THE INGRESS COMPUTES IT AND NOT THIS FUNCTION
+ *
+ *   The hash has to be in the stream entry. The gateway derives it from the record
+ *   it is closing (or an operator delete), the verification scripts read it back,
+ *   and a replay job must produce the same key from the same payload — all three
+ *   need it BEFORE a worker has seen anything. Computing it at the producer is the
+ *   only place that satisfies all of them with one formula.
+ *
+ *   The shape is re-validated here rather than trusted, because a bad key on the
+ *   envelope would mint a record nobody can address: `event:` + 32 hex is the whole
+ *   contract every index member and every client already relies on.
+ */
 export function eventKeyFor(evt) {
+  const fromEnvelope = evt?.key;
+  if (typeof fromEnvelope === 'string' && BARE_KEY_RE.test(fromEnvelope)) {
+    return `${EVENT_PREFIX}${fromEnvelope}`;
+  }
   const canonical = `${deviceOf(evt)}${SEP}${summaryOf(evt)}`;
   const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 32);
   return `${EVENT_PREFIX}${hash}`;
@@ -94,5 +128,5 @@ export function isValidEventKey(key) {
   if (typeof key !== 'string') return false;
   if (!key.startsWith(EVENT_PREFIX)) return false;
   const bare = key.slice(EVENT_PREFIX.length);
-  return /^[0-9a-f]{32}$/.test(bare);
+  return BARE_KEY_RE.test(bare);
 }

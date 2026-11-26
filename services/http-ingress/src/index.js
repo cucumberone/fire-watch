@@ -27,12 +27,15 @@ import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { ValkeyClient } from './valkey.js';
 import { StreamWriter } from './stream.js';
-import { normaliseBatch, streamFields, BadRequest, requiredFields, schemaFields } from './normalise.js';
+import { normaliseBatch, streamFields, BadRequest } from './normalise.js';
+import { SchemaSource, INPUT_SCHEMA_KEY, SCHEMA_PATH } from './schema.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
 const valkey = new ValkeyClient(cfg, log);
 const stream = new StreamWriter(cfg, valkey, log);
+// The ingest contract: the file default, overridden by `input-schema`.
+const schemaSource = new SchemaSource(valkey, log);
 let valkeyUp = false;
 
 let requests = 0;
@@ -152,14 +155,20 @@ const server = http.createServer(async (req, res) => {
 
   let events;
   try {
-    events = normaliseBatch(parsed, { maxBatch: cfg.maxBatch });
+    // The LIVE contract, read once per request. A refresh runs on a timer, so this
+    // is a plain property read: no Valkey round trip on the hot path.
+    const contract = schemaSource.get();
+    events = normaliseBatch(parsed, {
+      maxBatch: cfg.maxBatch,
+      compiled: contract.schema,
+      identifierKeys: contract.identifierKeys,
+    });
   } catch (err) {
     rejected += 1;
     const status = err instanceof BadRequest ? err.status : 400;
     json(res, status, { error: 'invalid_event', message: err.message });
     return;
   }
-
   // ---- append, and only then answer
   const correlationId = req.headers['x-request-id'] || undefined;
   try {
@@ -189,18 +198,23 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function main() {
-  // Load the ingest contract BEFORE listening.
+  // Load the DEFAULT contract from disk BEFORE listening.
   //
-  // It is read from disk at runtime (docs/event-schema.md), so an image that was
-  // built without schemas/ starts perfectly and then answers every EVT_* request
-  // with "400 invalid_event: ENOENT". That is indistinguishable from a producer
-  // sending a bad payload, and it cost real debugging time. Failing here turns a
-  // silently degraded container into an obvious crash loop that the readiness
-  // probe and the pod status both report immediately.
+  // It is read at runtime (docs/event-schema.md), so an image that was built
+  // without schemas/ starts perfectly and then answers every EVT_* request with
+  // "400 invalid_event: ENOENT". That is indistinguishable from a producer sending
+  // a bad payload, and it cost real debugging time. Failing here turns a silently
+  // degraded container into an obvious crash loop that the readiness probe and the
+  // pod status both report immediately.
+  //
+  // Even when `input-schema` exists in Valkey, this file is still required: it is
+  // what a corrupt or unreadable config degrades to.
   try {
+    const fallback = schemaSource.loadFallback();
     log.info('ingest schema loaded', {
-      fields: schemaFields().length,
-      required: requiredFields().join(','),
+      path: SCHEMA_PATH,
+      fields: fallback.fields.length,
+      required: [...fallback.required].join(','),
     });
   } catch (err) {
     log.error('cannot load the ingest schema; refusing to start', {
@@ -218,6 +232,7 @@ async function main() {
     sentinels: cfg.sentinels.length,
     maxBatch: cfg.maxBatch,
     authEnabled: Boolean(cfg.ingestToken),
+    contractKey: INPUT_SCHEMA_KEY,
   });
 
   server.listen(cfg.port, '0.0.0.0', () => {
@@ -230,6 +245,10 @@ async function main() {
     const up = await valkey.ping();
     if (up !== valkeyUp) log[up ? 'info' : 'warn'](up ? 'valkey reachable' : 'valkey unreachable');
     valkeyUp = up;
+    // Refresh the contract on the same tick. Both need Valkey, and one round trip
+    // per interval is nothing next to the write path — whereas a missed edit that
+    // only lands on restart is the failure this feature exists to remove.
+    if (up) await schemaSource.refresh();
   };
   await probe();
   setInterval(probe, 5000).unref();

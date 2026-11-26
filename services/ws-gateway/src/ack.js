@@ -169,8 +169,21 @@ export function validateClose(frame) {
 export function operatorCloseEvent(record, by, nowMs, eventId = `operator-close-${record?.source}-${nowMs}`) {
   const source = String(record?.source ?? '');
   const summary = String(record?.summary ?? '');
-  return {
+  const event = {
     id: eventId,
+    // The record's OWN key, when the envelope carries one.
+    //
+    // This matters once an operator configures identifier keys: such a record is
+    // keyed by a hash of those values, not by `sha256(device + 0x1f + summary)`, so
+    // a close that only echoed device and summary would open a SECOND condition
+    // beside the one that was clicked. `record.key` is the bare key the gateway read
+    // the record from, so echoing it retires exactly that record.
+    //
+    // Absent for a condition-keyed record, which is the normal case: the worker then
+    // derives device + summary itself and reaches the same key it always did.
+    ...(typeof record?.key === 'string' && /^[0-9a-f]{32}$/.test(record.key)
+      ? { key: record.key }
+      : {}),
     source,
     type: String(record?.type ?? ''),
     // The INTERNAL retirement value: this bypasses the ingress, so it sends what
@@ -189,6 +202,7 @@ export function operatorCloseEvent(record, by, nowMs, eventId = `operator-close-
       EVT_ClosedBy: by,
     },
   };
+  return event;
 }
 
 /**

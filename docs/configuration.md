@@ -128,3 +128,145 @@ reason ack and close do.
 | `setColumns` write fails | `columns_failed`; the form keeps its draft and the notice stays |
 | broadcast fails | the write is durable; other pods keep their old copy until they reload. Logged at `error` because the state genuinely diverges |
 | client not yet answered | it renders the built-in defaults, so the first paint is correct rather than blank |
+
+## 10. Ingest schema — which keys are accepted, and what identifies a record
+
+The second configuration page. It edits two things that are one contract:
+
+1. **Which `EVT_*` keys the ingress accepts.** Starts as
+   `schemas/event-ingest.schema.json`; an operator can add keys to it.
+2. **Which keys mint an identity when `EVT_Identifier` arrives empty.** The
+   resulting hash becomes the record key.
+
+Both are stored in one Valkey hash at `input-schema` and applied by the HTTP
+ingress **without a redeploy**.
+
+### 10.1 Storage
+
+| | |
+|---|---|
+| Key | `input-schema`, a hash |
+| `schema` | the whole JSON Schema document, as JSON |
+| `identifierKeys` | JSON array of `EVT_*` keys used for the identifier hash |
+| Lifetime | **no TTL** |
+| Who writes | the gateway (`op: setIngestSchema`), after validating both halves |
+| Who reads | the **HTTP ingress**, on a 5 s poll; the frontend via `op: ingestSchema` |
+
+One hash, not two keys: the two fields describe a single decision, and a key-by-key
+write could be read between the halves — a stored selection naming a key the stored
+schema had just dropped would make the ingress hash a field that never arrives.
+
+**No TTL**, for the same reason `config:columns` has none: a contract that expired
+would silently stop accepting a key on some later day, and the producer's `400`
+would point at its payload rather than at this.
+
+### 10.2 The file is still the default, and the fallback
+
+`schemas/event-ingest.schema.json` is shipped in the ingress image and remains
+load-bearing:
+
+| Situation | Contract in force |
+|---|---|
+| `input-schema` absent | the file |
+| `input-schema` unreadable / not JSON / fails validation | the **previous** contract; the file at boot |
+| `input-schema` valid | the stored document |
+| Valkey unreachable | the previous contract (ingestion continues) |
+
+A corrupted config therefore degrades to "no new keys accepted", never to "nothing
+is accepted". The ingress logs the reason at `error` and keeps serving.
+
+The gateway image does **not** ship `schemas/`, so it cannot answer with a default
+document of its own: `op: ingestSchema` answers `{schema: null, source: "file"}` and
+the **client** renders its own copy. `lib.test.js` reads the real schema file and
+asserts that copy matches, on keys, `required` and the severity enum.
+
+### 10.3 The core six are immutable
+
+`EVT_Device`, `EVT_Summary`, `EVT_Severity`, `EVT_EventKey`, `EVT_Agent`,
+`EVT_AgentOwner` must stay present **and required**. The validator refuses a document
+that removes one or drops it from `required`, and the form shows those rows with
+their Remove button disabled.
+
+They are not preferences — the pipeline is built on them:
+
+| Key | Why it cannot go |
+|---|---|
+| `EVT_Device`, `EVT_Summary` | they *are* the default record key, `sha256(device + 0x1f + summary)` |
+| `EVT_Severity` | the mapping onto the internal scale, and the `enum` that defines it |
+| `EVT_EventKey` | the table's type column and the subscription filter |
+| `EVT_Agent`, `EVT_AgentOwner` | shown on every row |
+
+Letting a web form remove one would break ingestion for every producer, with the
+symptom appearing in the payloads rather than here.
+
+### 10.4 Only `type: "string"` properties
+
+Enforced, not a JSON Schema limitation. Every value is stored as text in a hash
+field and rendered as text in a table cell, so a `number` or `object` property would
+be silently stringified and a `required` check on it would compare against
+`"undefined"`.
+
+Operator-added keys are carried into `payload` with a **1024-character** bound and no
+further validation — the point of adding a key is to accept a value the code does not
+know about. The loop walks the *contract*, never the request, so a producer posting
+an unknown `EVT_Whatever` cannot mint hash fields on the record.
+
+### 10.5 The identifier hash
+
+When `identifierKeys` is non-empty and `EVT_Identifier` arrives blank, the **ingress**
+computes
+
+```
+event:<sha256(normalise(values of the selected keys, joined by 0x1f))[0:32]>
+```
+
+and puts it on the envelope as `key`. The worker uses it in place of the condition
+key (`services/worker/src/keygen.js`).
+
+Where it is computed matters: the hash has to be **in the stream entry**. The worker,
+the gateway's operator close, the verification scripts and any replay job all need it,
+and only the producer sees the raw request. The worker re-validates the shape
+(32 lowercase hex) rather than trusting it — a bad key would mint a record no index
+member and no client can address.
+
+| Rule | Why |
+|---|---|
+| **Empty selection** means the legacy identity | an install that never opens the page behaves exactly as before |
+| A **supplied** `EVT_Identifier` wins, and no hash key is produced | keying on a per-delivery id would turn every repeat into a new record |
+| Values are **whitespace-normalised** before hashing | an upstream tool padding its summary differently would mint a new key each time |
+| **All values blank** falls back to a random id | a hash of "everything empty" is a constant, so every such event would collapse onto ONE record |
+| Case is **preserved** | merging `Disk Full` and `disk full` is a stronger claim than the data supports |
+
+An operator close sends the record's own `key` when there is one, so a CLOSE retires
+the record that was clicked instead of deriving a different key beside it.
+
+### 10.6 Protocol
+
+```json
+{"op":"ingestSchema"}
+{"op":"ingestSchema","schema":{…},"identifierKeys":["EVT_Device","EVT_EventKey"],
+ "identifierKeyChoices":["EVT_Severity",…],"source":"valkey","version":"stored"}
+
+{"op":"setIngestSchema","by":"gunnar","schema":{…},"identifierKeys":["EVT_Device"]}
+{"op":"ingestSchema", …the STORED document… }
+```
+
+`setIngestSchema` validates the schema and the selection **together** and rejects the
+whole frame on any problem. A schema saved without its selection, or a selection
+naming a key the new schema dropped, would make the ingress hash a field that never
+arrives — one constant key for the whole fleet. A partial save is therefore refused
+rather than merged.
+
+A successful write is broadcast on `fw:ch:alerts` as `{"kind":"ingestSchema"}`, so
+every open form updates without a reload. The writing pod skips its own echo, for the
+same reason ack and close do.
+
+### 10.7 Failure behaviour
+
+| Failure | Effect |
+|---|---|
+| `op: ingestSchema` read fails | answers `source: "file"` — the ingress is running the file contract, so this is the truth, not a fallback |
+| stored document is not JSON | same answer; the ingress logs it and keeps its previous contract |
+| `setIngestSchema` write fails | `ingest_schema_failed`; the form keeps its draft |
+| broadcast fails | the write is durable and the ingress picks it up on its next poll; other pods' clients keep the old copy |
+| an added key is missing from a payload | the key is simply absent; only keys added to `required` are enforced |

@@ -264,3 +264,24 @@ test('every field the history reader expects is present', () => {
   }
   assert.equal(typeof row.payload, 'object', 'payload is stored as a value; the writer stringifies');
 });
+
+test('a close echoes the record key so an identifier-keyed record is retired', () => {
+  // With identifier keys configured, a record is keyed by a hash of those values —
+  // NOT by sha256(device + summary). A close that only echoed device and summary
+  // would open a second condition beside the one the operator clicked.
+  const key = 'c'.repeat(32);
+  const evt = operatorCloseEvent({ key, source: 'dev', summary: 'sum', type: 't' }, 'gunnar', 1);
+  assert.equal(evt.key, key);
+});
+
+test('a close on a condition-keyed record carries no key, so the worker derives it', () => {
+  const evt = operatorCloseEvent({ source: 'dev', summary: 'sum', type: 't' }, 'gunnar', 1);
+  assert.equal('key' in evt, false);
+});
+
+test('a malformed record key is not echoed', () => {
+  for (const bad of ['not-hex', 'C'.repeat(32), 'c'.repeat(31), '', null]) {
+    const evt = operatorCloseEvent({ key: bad, source: 'd', summary: 's' }, 'g', 1);
+    assert.equal('key' in evt, false, `${String(bad)} must not be echoed`);
+  }
+});

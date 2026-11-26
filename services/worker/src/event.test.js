@@ -167,3 +167,30 @@ test('bareKeyFor strips the prefix, because zsets store the bare key', () => {
   const evt = { source: 's', payload: { msg: 'm' } };
   assert.equal(bareKeyFor(evt), eventKeyFor(evt).slice('event:'.length));
 });
+
+test('an envelope key from the ingress wins over the condition key', () => {
+  // The ingress mints this when an operator selected identifier keys
+  // (docs/configuration.md §10). It MUST win: the gateway derives the same key for
+  // its own writes, so re-deriving device+summary here would address a second record
+  // and the operator's close would not reach the row they clicked.
+  const key = 'a'.repeat(32);
+  assert.equal(
+    eventKeyFor({ key, source: 'sensor-a', payload: { msg: 'too hot' } }),
+    `event:${key}`,
+  );
+});
+
+test('a malformed envelope key is ignored, not trusted', () => {
+  // A bad key would mint a record no index member and no client can address, so the
+  // shape is re-checked rather than assumed.
+  for (const bad of ['not-hex', 'A'.repeat(32), 'a'.repeat(31), 'a'.repeat(33), '', null, 42]) {
+    const derived = eventKeyFor({ key: bad, source: 'sensor-a', payload: { msg: 'm' } });
+    assert.match(derived, /^event:[0-9a-f]{32}$/, `${String(bad)} must fall back`);
+    assert.equal(derived, eventKeyFor({ source: 'sensor-a', payload: { msg: 'm' } }));
+  }
+});
+
+test('bareKeyFor carries the envelope key through', () => {
+  const key = 'b'.repeat(32);
+  assert.equal(bareKeyFor({ key, source: 's', payload: { msg: 'm' } }), key);
+});

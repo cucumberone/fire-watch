@@ -232,6 +232,150 @@ export function configuredColumns(columns) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Ingest schema
+//
+// The client carries the DEFAULT contract because the gateway does not ship
+// `schemas/` and the form has to render before the first reply. `readFileSync` is
+// not available in the browser, so the defaults are a LITERAL here — and
+// `lib.test.js` reads the real file from disk and asserts the two agree, which is
+// the same guard `COLUMN_KEYS` already has.
+//
+// Consequence to keep in mind: adding a key to the schema file means editing this
+// list too, and the test is what makes that fail rather than silently ship a form
+// that cannot offer the new key.
+// ---------------------------------------------------------------------------
+
+/**
+ * Keys that cannot be removed and cannot stop being required.
+ *
+ * Mirrors `CORE_KEYS` in the gateway and ingress. The form shows them as fixed rows:
+ * every one of them is load-bearing downstream (device + summary IS the record key,
+ * severity drives the mapping and the enum, event key is the type column).
+ */
+export const INGEST_CORE_KEYS = [
+  'EVT_Severity',
+  'EVT_Summary',
+  'EVT_Device',
+  'EVT_EventKey',
+  'EVT_Agent',
+  'EVT_AgentOwner',
+];
+
+/** Longest key name accepted by the gateway. */
+export const MAX_KEY_LEN = 64;
+/** Longest identifier-key selection. */
+export const MAX_IDENTIFIER_KEYS = 8;
+
+/** The producer severities, as the schema declares them. */
+export const INGEST_SEVERITIES = [
+  'CLEAR', 'HARMLESS', 'INFORMATION', 'INDETERMINATE', 'WARNING', 'MINOR', 'MAJOR', 'CRITICAL',
+];
+
+/** Human labels for the default keys, matching the published schema titles. */
+const INGEST_TITLES = {
+  EVT_Device: 'Device/server/host that event is about',
+  EVT_EventKey: 'EventKey needed to ensure automations, ownership, handling etc.',
+  EVT_Identifier: 'Optional event ID/identifier',
+  EVT_Severity: "Events' default/original severity",
+  EVT_Summary: 'Event summary',
+  EVT_Details: 'Details message',
+  EVT_Agent: 'What tool/technology is sending the event',
+  EVT_AgentOwner: 'Support team owning the tool sending the event',
+  EVT_URL: 'Optional link/deep link to a page with full event details',
+  EVT_Environment: 'Optional environment of the event',
+};
+
+/**
+ * The default contract, in the order the form should present it.
+ *
+ * Order matters and is not alphabetical: the six core keys first, because they are
+ * the ones an operator cannot change and reads the list top-down to understand what
+ * the pipeline needs.
+ */
+export const INGEST_DEFAULT_KEYS = [
+  'EVT_Severity',
+  'EVT_Summary',
+  'EVT_Device',
+  'EVT_EventKey',
+  'EVT_Agent',
+  'EVT_AgentOwner',
+  'EVT_Identifier',
+  'EVT_Details',
+  'EVT_Environment',
+  'EVT_URL',
+];
+
+/** A key name is usable when it can be a hash field, a cell and a JSON property. */
+export function isValidIngestKey(name) {
+  return typeof name === 'string'
+    && /^EVT_[A-Za-z0-9_]+$/.test(name)
+    && name.length <= MAX_KEY_LEN;
+}
+
+/** Build a default schema document from the literal key list. */
+export function defaultIngestSchema() {
+  const properties = {};
+  for (const key of INGEST_DEFAULT_KEYS) {
+    properties[key] = {
+      type: 'string',
+      title: INGEST_TITLES[key] || key,
+      default: '',
+      ...(key === 'EVT_Severity' ? { enum: [...INGEST_SEVERITIES] } : {}),
+    };
+  }
+  return {
+    $schema: 'http://json-schema.org/draft-07/schema#',
+    title: 'Fire-Watch ingest event',
+    type: 'object',
+    additionalProperties: true,
+    properties,
+    required: [...INGEST_CORE_KEYS],
+  };
+}
+
+/**
+ * The contract to render: the STORED document when there is one, else the default.
+ *
+ * A stored document is used as-is (not merged with the defaults), because it IS the
+ * schema: if an operator removed a key, the ingress no longer accepts it, and a form
+ * that merged the default back in would let it be re-added without the pipeline
+ * ever seeing it. The core six cannot be removed anyway — the validator refuses
+ * that — so the only keys missing from a stored document are ones that were
+ * genuinely dropped on purpose.
+ */
+export function resolveIngestSchema(stored, source) {
+  if (source === 'valkey' && stored && stored.properties) return stored;
+  return defaultIngestSchema();
+}
+
+/** The property names of a schema, in document order. */
+export function ingestSchemaKeys(schema) {
+  return schema && schema.properties ? Object.keys(schema.properties) : [];
+}
+
+/** A one-line description for a key: its title, else the key itself. */
+export function ingestKeyLabel(schema, key) {
+  const def = schema?.properties?.[key];
+  const title = def?.title;
+  return typeof title === 'string' && title.trim() !== '' ? title.trim() : key;
+}
+
+/**
+ * What the identifier hash is currently built from, as one readable string.
+ *
+ * An empty selection means the legacy identity — the condition key (device +
+ * summary) computed by the worker — and the UI must SAY that rather than show an
+ * empty list, or an operator cannot tell "nothing selected" from "not loaded".
+ */
+export function identifierPolicyText(keys) {
+  if (!Array.isArray(keys) || keys.length === 0) {
+    return 'No hash: the record key stays device + summary (the condition).';
+  }
+  return `sha256(${keys.join(' + ')}) → event:<32 hex>`;
+}
+
+
 /** gzip marker, matching services/worker/src/event.js. */
 const GZ_MARK = '__gz';
 

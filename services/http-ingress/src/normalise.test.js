@@ -304,3 +304,115 @@ test('EVT_Details above its bound is refused rather than truncated', () => {
     BadRequest,
   );
 });
+
+// ------------------------------------------------ configurable contract + key
+// The schema is now a runtime object, and an operator can add keys to it from the
+// GUI. These tests pin the two behaviours that change with it: extra keys are
+// carried through, and a chosen identifier policy mints the RECORD key before the
+// event reaches the stream.
+import { compileSchema, identifierHash, keyForIdentifier } from './schema.js';
+
+/** The compiled form of the file contract, which is what a fresh install runs. */
+const compiled = compileSchema(ingestSchema());
+
+test('an extra key added by an operator is carried into the payload', () => {
+  const withExtra = compileSchema({
+    ...ingestSchema(),
+    properties: { ...ingestSchema().properties, EVT_Ticket: { type: 'string' } },
+  });
+  const e = normaliseEvent(upstream({ EVT_Ticket: 'INC-1234' }), { ...opts, compiled: withExtra });
+  assert.equal(e.payload.EVT_Ticket, 'INC-1234');
+});
+
+test('a key NOT in the contract is never put on the payload', () => {
+  // Iterating the contract rather than the request is what stops a producer minting
+  // arbitrary hash fields on the record.
+  const e = normaliseEvent(upstream({ EVT_Unknown: 'nope' }), { ...opts, compiled });
+  assert.equal('EVT_Unknown' in e.payload, false);
+});
+
+test('an operator-added key that is missing is simply absent', () => {
+  const withExtra = compileSchema({
+    ...ingestSchema(),
+    properties: { ...ingestSchema().properties, EVT_Ticket: { type: 'string' } },
+  });
+  const e = normaliseEvent(upstream(), { ...opts, compiled: withExtra });
+  assert.equal('EVT_Ticket' in e.payload, false);
+});
+
+test('a required key added by an operator is enforced', () => {
+  const withExtra = compileSchema({
+    ...ingestSchema(),
+    properties: { ...ingestSchema().properties, EVT_Ticket: { type: 'string' } },
+    required: [...ingestSchema().required, 'EVT_Ticket'],
+  });
+  assert.throws(
+    () => normaliseEvent(upstream(), { ...opts, compiled: withExtra }),
+    /EVT_Ticket is required/,
+  );
+});
+
+test('no identifier policy means no record key on the envelope', () => {
+  // This is the wire format an install that never opens the page produces, and the
+  // worker's device+summary fallback depends on it staying absent.
+  const e = normaliseEvent(upstream(), { ...opts, compiled });
+  assert.equal('key' in e, false);
+});
+
+test('a chosen policy mints a 32-hex record key from the selected values', () => {
+  const e = normaliseEvent(
+    upstream({ EVT_Identifier: '' }),
+    { ...opts, compiled, identifierKeys: ['EVT_Device', 'EVT_EventKey'] },
+  );
+  assert.match(e.key, /^[0-9a-f]{32}$/);
+  assert.equal(e.key, identifierHash(upstream(), ['EVT_Device', 'EVT_EventKey']));
+  assert.equal(e.id, `ih-${e.key}`);
+});
+
+test('the same selected values always mint the same key', () => {
+  // Otherwise every delivery is a new record, which is the storage explosion the
+  // one-record-per-condition model exists to prevent.
+  const a = normaliseEvent(upstream({ EVT_Identifier: '' }), { ...opts, compiled, identifierKeys: ['EVT_Device'] });
+  const b = normaliseEvent(upstream({ EVT_Identifier: '' }), { ...opts, compiled, identifierKeys: ['EVT_Device'] });
+  assert.equal(a.key, b.key);
+});
+
+test('padding in a selected value does not mint a different key', () => {
+  const a = normaliseEvent(upstream({ EVT_Identifier: '', EVT_Device: 'core-sw-07' }), { ...opts, compiled, identifierKeys: ['EVT_Device'] });
+  const b = normaliseEvent(upstream({ EVT_Identifier: '', EVT_Device: '  core-sw-07  ' }), { ...opts, compiled, identifierKeys: ['EVT_Device'] });
+  assert.equal(a.key, b.key);
+});
+
+test('a supplied identifier wins and no hash key is produced', () => {
+  // Keying on a per-delivery id would turn every repeat into a new record.
+  const e = normaliseEvent(upstream({ EVT_Identifier: 'own-id-1' }), {
+    ...opts, compiled, identifierKeys: ['EVT_Device'],
+  });
+  assert.equal('key' in e, false);
+  assert.equal(e.id, 'own-id-1');
+});
+
+test('an all-blank selection falls back to a random id, not a constant hash', () => {
+  // A hash of "everything empty" is a constant, so every such event in the fleet
+  // would collapse onto ONE record. Visible and separate beats merged and invisible.
+  const e = normaliseEvent(
+    upstream({ EVT_Identifier: '', EVT_Environment: '' }),
+    { ...opts, compiled, identifierKeys: ['EVT_Environment'] },
+  );
+  assert.equal('key' in e, false);
+  assert.equal(e.id, 'gen-id');
+});
+
+test('the compiled key set distinguishes core from operator-added keys', () => {
+  // The form pins the first list and allows removing the rest, so the split has to be
+  // the same on both sides.
+  assert.deepEqual(compiled.extraFields.sort(), [
+    'EVT_Details', 'EVT_Environment', 'EVT_Identifier', 'EVT_URL',
+  ]);
+});
+
+test('keyForIdentifier digests a free-text id into the record-key shape', () => {
+  const k = keyForIdentifier('own-recipe-of-unique-identifier');
+  assert.match(k, /^[0-9a-f]{32}$/);
+  assert.equal(k, keyForIdentifier('  own-recipe-of-unique-identifier  '));
+});

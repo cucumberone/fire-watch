@@ -18,6 +18,7 @@
  */
 import Redis from 'ioredis';
 import { COLUMNS_KEY } from './columns.js';
+import { INPUT_SCHEMA_KEY, SCHEMA_FIELD, IDENTIFIER_KEYS_FIELD } from './ingestSchema.js';
 
 /**
  * The open-event snapshot's hash read, as one server-side script.
@@ -989,9 +990,49 @@ export class ValkeyReader {
     return true;
   }
 
+  /**
+   * Read the live ingest contract (`input-schema`).
+   *
+   * Returns the RAW hash, or null when the key is absent. Absent is a real answer:
+   * it means "never configured", and the client then renders its own copy of
+   * `schemas/event-ingest.schema.json`. The gateway does not ship that file, so it
+   * cannot answer with a default document of its own.
+   *
+   * NO TTL, for the same reason the column configuration has none: an expiring
+   * contract would silently revert every added key to "not accepted" on some later
+   * day, and the producer's 400s would point at the payload rather than at this.
+   */
+  async readIngestSchema() {
+    const c = await this.connect();
+    return c.hgetall(INPUT_SCHEMA_KEY);
+  }
+
+  /**
+   * Replace the live ingest contract.
+   *
+   * DEL then HSET in one MULTI, like `writeColumns`: the hash is a snapshot, so a
+   * field this write does not name must not survive from a previous one. The two
+   * fields are the schema and the identifier selection; writing them separately
+   * would let the ingress read the halves of two different decisions.
+   */
+  async writeIngestSchema({ schema, identifierKeys }) {
+    const c = await this.connect();
+    const res = await c.multi()
+      .del(INPUT_SCHEMA_KEY)
+      .hset(
+        INPUT_SCHEMA_KEY,
+        SCHEMA_FIELD, JSON.stringify(schema),
+        IDENTIFIER_KEYS_FIELD, JSON.stringify(identifierKeys ?? []),
+      )
+      .exec();
+    for (const [err] of res || []) {
+      if (err) throw err;
+    }
+    return true;
+  }
+
   async appendJournal(bareKey, entry, ttlMs, maxEntries) {
-    const key = journalKey(bareKey);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const key = journalKey(bareKey);    for (let attempt = 0; attempt < 2; attempt += 1) {
       const c = await this.connect();
       try {
         const pipe = c.multi()

@@ -5,14 +5,23 @@ external interface in the system: everything after the HTTP ingress uses the
 internal envelope (`id` / `source` / `type` / `severity` / `payload`) and never
 sees `EVT_*` names.
 
+> **The contract is also editable at runtime.** The file below is the DEFAULT and
+> the fallback. An operator can add keys to it from Configuration → Ingest schema,
+> which stores the result in Valkey at `input-schema`; the ingress re-reads it on a
+> 5 s poll, so a new key needs no redeploy. The six required keys cannot be removed
+> from that page — the pipeline is built on them. See
+> [configuration.md](configuration.md) §10.
+
 - **Schema file:** [`schemas/event-ingest.schema.json`](../schemas/event-ingest.schema.json)
 - **Mapping and validation:** [`services/http-ingress/src/normalise.js`](../services/http-ingress/src/normalise.js)
+- **Live contract (operator-added keys):** [`services/http-ingress/src/schema.js`](../services/http-ingress/src/schema.js)
 
 The JSON Schema is not documentation that happens to exist alongside the code. The
 ingress **reads it at runtime**: required fields, the set of accepted properties
-and the severity enum all come from the file. A test asserts that every property in
-the schema has a corresponding mapping, so adding a field to the schema without
-handling it fails the build rather than silently dropping data in production.
+and the severity enum all come from the document in force — the file, or the stored
+override. A test asserts that every property in the file has a corresponding
+mapping, so adding a field to the schema without handling it fails the build rather
+than silently dropping data in production.
 
 ---
 

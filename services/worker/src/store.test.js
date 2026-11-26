@@ -310,7 +310,11 @@ test('recordDelivery forks EVERY delivery, before any dedup', async () => {
   // Both index members are the delivery ids, scored by broker timestamp.
   const indexed = valkey.calls.zadd.filter((z) => z.key === 'idx:history');
   assert.equal(indexed.length, 2);
-  assert.deepEqual(indexed.map((z) => z.member).sort(), [a, b]);
+  // Compare as SETS. Sorting the expected array was wrong: `newDeliveryId` is
+  // `<ms36>-<uuid>`, and two ids minted in the same millisecond differ only in a
+  // random UUID, so `[a, b]` is not in sorted order half the time. That made this
+  // test fail intermittently for a reason that had nothing to do with the code.
+  assert.deepEqual(new Set(indexed.map((z) => z.member)), new Set([a, b]));
 });
 
 test('the fork runs for a delivery the fold will reject', async () => {

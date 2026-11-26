@@ -24,42 +24,54 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-/** Repo-root `schemas/`, resolved from this file so cwd does not matter. */
-const SCHEMA_PATH = join(HERE, '..', '..', '..', 'schemas', 'event-ingest.schema.json');
+import {
+  compileSchema,
+  loadDefaultSchema,
+  identifierHash,
+  isBareKey,
+  SCHEMA_PATH,
+} from './schema.js';
 
 let cachedSchema = null;
 
 /**
- * The ingest schema, read from disk once.
+ * The ingest schema as shipped in the image, read from disk once.
  *
  * Read rather than duplicated as a literal: a second copy in code is exactly how
- * a published contract ends up describing something the code no longer does.
+ * a published contract ends up describing something the code no longer does. It is
+ * also the fallback the live contract degrades to (services/http-ingress/src/
+ * schema.js), which is why it must stay readable even when Valkey is not.
  */
 export function ingestSchema() {
-  if (!cachedSchema) {
-    cachedSchema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
-  }
+  if (!cachedSchema) cachedSchema = loadDefaultSchema();
   return cachedSchema;
 }
 
-/** Required ingest fields, straight from the schema. */
+/** Where the default contract is read from. Reported at startup. */
+export { SCHEMA_PATH };
+
+/** Required ingest fields, straight from the FILE schema. */
 export function requiredFields() {
   return ingestSchema().required;
 }
 
-/** Every property name the schema defines. */
+/** Every property name the FILE schema defines. */
 export function schemaFields() {
   return Object.keys(ingestSchema().properties);
 }
 
 /**
- * Source severities, as the producer reports them — taken from the schema's
- * `enum` so an added value cannot be accepted by one and rejected by the other.
+ * The compiled file contract, built once.
+ *
+ * Used as the default when a caller does not pass one, which keeps every existing
+ * call site and test working unchanged. The live contract is normally supplied by
+ * `SchemaSource` (see schema.js), which is what makes an operator's edit take
+ * effect without a restart.
  */
-function sourceSeverities() {
-  return new Set(ingestSchema().properties.EVT_Severity.enum);
+let cachedCompiled = null;
+export function defaultCompiledSchema() {
+  if (!cachedCompiled) cachedCompiled = compileSchema(loadDefaultSchema());
+  return cachedCompiled;
 }
 
 /**
@@ -91,6 +103,31 @@ const SEVERITIES = new Set(['FATAL', 'CRITICAL', 'WARNING', 'HARMLESS', 'CLOSE']
 const MAX_SOURCE_LEN = 256;
 const MAX_TYPE_LEN = 256;
 const MAX_ID_LEN = 128;
+// Keys an operator added to the schema have no declared bound, so they get one.
+// Without it a producer could park an arbitrarily large value on the hash that the
+// inspector then has to render.
+const MAX_EXTRA_LEN = 1024;
+
+/**
+ * Keys this file maps explicitly.
+ *
+ * Listed so the "extra keys" loop can skip them: a key with a mapping — or one
+ * deliberately left out of the payload — must not be re-read against the generic
+ * bound. `EVT_Details` is the one that matters, because its own bound is 8192 and
+ * the generic one is 1024.
+ */
+const MAPPED_KEYS = new Set([
+  'EVT_Device',
+  'EVT_EventKey',
+  'EVT_Severity',
+  'EVT_Summary',
+  'EVT_Agent',
+  'EVT_AgentOwner',
+  'EVT_Identifier',
+  'EVT_Details',
+  'EVT_Environment',
+  'EVT_URL',
+]);
 // The details field is the expandable body, not a label. Without its own bound it
 // would inherit the 256 default, which rejects any producer that actually explains
 // what happened. The worker's gzip threshold is 512 bytes, so shorter values are
@@ -138,19 +175,34 @@ function text(value, field, { required = false, max = 256 } = {}) {
  *   EVT_Identifier-> id            (or generated when blank)
  *   rest          -> payload.EVT_* (kept as-is for the inspector)
  *
- * The record key is derived from `EVT_Device` + `EVT_Summary`, NOT from
- * `EVT_EventKey`: it is
- * `event:<sha256(device + 0x1f + summary)[0:32]>`, computed by the worker
- * (services/worker/src/keygen.js). `EVT_EventKey` still becomes `type`, which the
- * UI shows and the subscription filter matches on, but it is not part of the
- * identity — two different event keys with the same words on screen are one row
- * for an operator (docs/valkey.md §2).
+ * THE RECORD KEY, and the one thing that changed with the configurable contract.
+ *
+ *   Without an identifier policy the record is identified by its CONDITION:
+ *   `event:<sha256(device + 0x1f + summary)[0:32]>`, derived by the WORKER
+ *   (services/worker/src/keygen.js). `EVT_EventKey` becomes `type`, which the UI
+ *   shows and the subscription filter matches on, but it is not part of the
+ *   identity — two different event keys with the same words on screen are one row
+ *   for an operator (docs/valkey.md §2).
+ *
+ *   When an operator selects identifier keys, the envelope carries `key` and the
+ *   record is identified by the hash those keys produce. That is the requested
+ *   behaviour: one record per derived identity, computed HERE, before the event
+ *   reaches the stream, so every worker and the gateway agree without deriving it
+ *   a second time.
+ *
+ *   The `key` field is the ONLY thing that changes shape downstream, and it is
+ *   optional on the envelope — an install that never opens the page produces
+ *   byte-identical events to before.
  */
-export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {}) {
-  // Required fields come from the schema, not from this function. Adding one
-  // there is enough to start rejecting requests that omit it — and the test suite
-  // fails if it is not also mapped below, so the two cannot drift apart.
-  const required = new Set(requiredFields());
+export function fromUpstream(raw, {
+  now = Date.now(),
+  randomId = defaultId,
+  compiled = defaultCompiledSchema(),
+  identifierKeys = [],
+} = {}) {
+  // Required fields come from the CONTRACT, not from this function. Adding one in
+  // the GUI is enough to start rejecting requests that omit it.
+  const required = compiled.required;
   const req = (name, max) => text(raw[name], name, { required: required.has(name), max });
   const opt = (name, max) => text(raw[name], name, { required: false, max });
 
@@ -160,18 +212,52 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
   const agentOwner = req('EVT_AgentOwner', MAX_SOURCE_LEN);
   const summary = req('EVT_Summary');
 
+  // Required keys an operator ADDED. Checked here rather than in the loop below,
+  // because a missing required field must be a 400 naming the field — the loop skips
+  // blanks so an optional key costs no hash field, which would silently swallow it.
+  for (const name of compiled.required) {
+    if (MAPPED_KEYS.has(name)) continue;
+    if (text(raw[name], name, { required: true, max: MAX_EXTRA_LEN }) === '') {
+      // `text` already throws for an empty required value; this branch is unreachable
+      // and exists only to keep the intent obvious next to the skip above.
+      throw new BadRequest(`${name} is required`);
+    }
+  }
+
   const rawSeverity = req('EVT_Severity');
   const severity = SEVERITY_MAP[rawSeverity];
   if (!severity) {
     throw new BadRequest(
-      `EVT_Severity must be one of ${[...sourceSeverities()].join(', ')} (got ${JSON.stringify(rawSeverity)})`,
+      `EVT_Severity must be one of ${[...compiled.severities].join(', ')} (got ${JSON.stringify(rawSeverity)})`,
     );
   }
 
-  // `EVT_Identifier` is optional. When present it is the message identity; when
-  // blank a random one is generated, because the duplicate gate needs an id.
+  // `EVT_Identifier` is optional. When present it is the message identity and the
+  // record key stays the CONDITION key (device + summary); when blank, the keys an
+  // operator selected mint a hash that becomes the record key.
+  //
+  // Only the blank case consults the picker, and that is not a shortcut: a producer
+  // that sends a unique id per delivery would otherwise turn every repeat into a
+  // new record, which is the storage explosion the one-record-per-condition model
+  // exists to prevent. The selection is a fallback identity for producers that have
+  // no id, not an override for producers that do.
   const givenId = opt('EVT_Identifier', MAX_ID_LEN);
-  const id = givenId || randomId(now);
+  let derivedKey = '';
+  let id = givenId;
+
+  if (!id && identifierKeys.length > 0) {
+    // A hash of the selected values. Returns '' when they are ALL blank, and that
+    // is a deliberate refusal: a hash of "everything empty" is a constant, so
+    // every such event in the fleet would collapse onto one record. Falling
+    // through to a random id keeps them separate, which is visible; one merged
+    // row is not.
+    const hash = identifierHash(raw, identifierKeys);
+    if (hash) {
+      derivedKey = hash;
+      id = `ih-${hash}`;
+    }
+  }
+  if (!id) id = randomId(now);
 
   // The summary is the row's display text; the details are the expandable body.
   // Keeping them as msg/msgc means the existing compression and UI work unchanged.
@@ -189,11 +275,31 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
   if (environment) payload.EVT_Environment = environment;
   const url = opt('EVT_URL');
   if (url) payload.EVT_URL = url;
+  // The identifier that was actually accepted, so the inspector shows the same
+  // value the record was keyed by rather than the producer's blank.
+  if (givenId) payload.EVT_Identifier = givenId;
   // The producer's original severity is kept for display: the operator may want
   // to know it was MINOR rather than the WARNING it maps to.
   payload.EVT_Severity = rawSeverity;
 
-  return {
+  // Keys an operator ADDED to the contract. Carried through with a declared bound
+  // and no validation beyond "it is text", because the whole point of adding a key
+  // is to accept a value the code does not know about.
+  //
+  // Iterated from the contract, never from the request: a producer posting an
+  // unknown `EVT_Whatever` must not be able to mint hash fields on the record.
+  //
+  // The keys with a mapping of their own are skipped. Without that, the built-in
+  // `EVT_Details` — which is not a CORE key, so it counts as "extra" — would be
+  // read a second time against the generic bound and a legitimate 4000-character
+  // detail body would be refused for being longer than a field nobody added.
+  for (const name of compiled.extraFields) {
+    if (MAPPED_KEYS.has(name) || name in payload) continue;
+    const value = opt(name, MAX_EXTRA_LEN);
+    if (value) payload[name] = value;
+  }
+
+  const event = {
     id,
     // The alert key is device + event key: the two things the ingest schema
     // guarantees identify an alarm. Using the agent would split one device's
@@ -204,6 +310,10 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
     ts: raw.ts !== undefined ? String(raw.ts) : new Date(now).toISOString(),
     payload,
   };
+  // Only present when an identifier policy produced it. Absent is the old wire
+  // format, which is why the worker's fallback still matters.
+  if (derivedKey) event.key = derivedKey;
+  return event;
 }
 
 /**
@@ -213,7 +323,12 @@ export function fromUpstream(raw, { now = Date.now(), randomId = defaultId } = {
  * envelope. Both paths converge on the same output, so a legacy producer keeps
  * working while the documented schema is what new producers send.
  */
-export function normaliseEvent(raw, { now = Date.now(), randomId = defaultId } = {}) {
+export function normaliseEvent(raw, {
+  now = Date.now(),
+  randomId = defaultId,
+  compiled = defaultCompiledSchema(),
+  identifierKeys = [],
+} = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new BadRequest('each event must be an object');
   }
@@ -223,7 +338,7 @@ export function normaliseEvent(raw, { now = Date.now(), randomId = defaultId } =
   // silently fell through to the legacy path, which invents a default `type` and
   // accepted an event that should have been a 400.
   if (Object.keys(raw).some((k) => k.startsWith('EVT_'))) {
-    return fromUpstream(raw, { now, randomId });
+    return fromUpstream(raw, { now, randomId, compiled, identifierKeys });
   }
 
   const id = raw.id === undefined || raw.id === null ? randomId(now) : String(raw.id);
@@ -256,7 +371,7 @@ export function normaliseEvent(raw, { now = Date.now(), randomId = defaultId } =
     throw new BadRequest('payload must be an object');
   }
 
-  return {
+  const event = {
     id,
     source,
     type,
@@ -266,10 +381,21 @@ export function normaliseEvent(raw, { now = Date.now(), randomId = defaultId } =
     ts: raw.ts !== undefined ? String(raw.ts) : new Date(now).toISOString(),
     payload,
   };
+  // A canonical envelope may carry the record key itself — the operator close does,
+  // because it must land on the condition it is closing. Only a 32-hex value is
+  // accepted: anything else is a producer guessing at an internal format.
+  if (isBareKey(raw.key)) event.key = raw.key;
+  return event;
 }
 
 /** Validate a whole batch. Either all events are valid or the request is 400. */
-export function normaliseBatch(body, { maxBatch, now = Date.now(), randomId = defaultId } = {}) {
+export function normaliseBatch(body, {
+  maxBatch,
+  now = Date.now(),
+  randomId = defaultId,
+  compiled = defaultCompiledSchema(),
+  identifierKeys = [],
+} = {}) {
   const raw = extractEvents(body);
   if (raw.length === 0) throw new BadRequest('no events in request');
   if (raw.length > maxBatch) {
@@ -277,7 +403,7 @@ export function normaliseBatch(body, { maxBatch, now = Date.now(), randomId = de
   }
   return raw.map((e, i) => {
     try {
-      return normaliseEvent(e, { now, randomId });
+      return normaliseEvent(e, { now, randomId, compiled, identifierKeys });
     } catch (err) {
       throw new BadRequest(`event[${i}]: ${err.message}`);
     }

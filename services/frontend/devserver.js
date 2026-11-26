@@ -211,6 +211,19 @@ const closedMock = new Map();
 const columnConfig = {};
 
 /**
+ * The live ingest contract, for the harness.
+ *
+ * `schema: null` + `source: 'file'` is what the real gateway answers when nothing is
+ * stored: the ingress is running the document in its image and the client renders its
+ * own copy. Starting here means the harness exercises the "untouched install" path,
+ * which is the one a fresh deploy takes.
+ *
+ * `let` because `setIngestSchema` replaces it wholesale — the hash is a snapshot, not
+ * a merge.
+ */
+let ingestContract = { op: 'ingestSchema', schema: null, identifierKeys: [], source: 'file' };
+
+/**
  * Every event the mock has produced, keyed by id.
  *
  * The real worker writes each accepted event to a global timeline; the mock keeps
@@ -615,6 +628,32 @@ wss.on('connection', async (ws) => {
         if (client.readyState === client.OPEN) {
           client.send(JSON.stringify({ op: 'columns', columns: columnConfig }));
         }
+      }
+      return;
+    }
+
+    // ---- op: ingestSchema / setIngestSchema — the live ingest contract.
+    //
+    // Stored in a module-level variable so a change survives a reconnect, exactly
+    // as the real one survives in Valkey. Starts EMPTY, which is `source: 'file'`:
+    // the ingress is running the document shipped in its image and the client
+    // renders its own copy. That is the state a fresh install is in.
+    if (frameIn.op === 'ingestSchema') {
+      ws.send(JSON.stringify(ingestContract));
+      return;
+    }
+    if (frameIn.op === 'setIngestSchema') {
+      // Mirror the gateway: validate nothing here (the harness is not the
+      // authority), store what arrived, echo it back as the stored document, and
+      // fan it out to every other client.
+      ingestContract = {
+        op: 'ingestSchema',
+        schema: frameIn.schema ?? null,
+        identifierKeys: Array.isArray(frameIn.identifierKeys) ? frameIn.identifierKeys : [],
+        source: 'valkey',
+      };
+      for (const client of wss.clients) {
+        if (client.readyState === client.OPEN) client.send(JSON.stringify(ingestContract));
       }
       return;
     }

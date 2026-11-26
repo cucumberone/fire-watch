@@ -114,6 +114,32 @@ Device and summary are stored as hash **fields** instead, so nothing is lost for
 display or filtering. The trade-off is that `valkey-cli KEYS 'event:*'` tells you
 nothing about what a row is; `HGETALL` does.
 
+### 2.3.1 The key can be overridden by an operator's identifier policy
+
+The formula above is the DEFAULT. When an operator selects identifier keys on
+Configuration → Ingest schema
+([configuration.md](configuration.md) §10), the **HTTP ingress** puts a different
+32-hex key on the envelope as `key`, and the worker uses it instead of deriving
+device + summary:
+
+```text
+event:<sha256(values of the selected keys, joined by 0x1f)[0:32]>
+```
+
+Three consequences worth knowing when reading a keyspace by hand:
+
+- the key is still `event:` + 32 hex, so every index member, `isValidEventKey` and
+the UI work unchanged — the SHAPE is invariant, only the input is;
+- a record keyed this way does **not** move when its summary is reworded, while a
+condition-keyed one does. Two records for what looks like one alarm is the symptom
+of a policy change, not a fold bug;
+- an operator close echoes the record's own bare key, so it retires the record that
+was clicked rather than a re-derived neighbour.
+
+The fallback still applies whenever the selection is empty or the event carries an
+`EVT_Identifier`, so an install that never opens the page produces exactly the
+condition keys described above.
+
 ### 2.4 The ingest stream
 
 | Key | Type | Written by | Removed by |

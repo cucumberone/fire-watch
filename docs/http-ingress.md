@@ -182,7 +182,8 @@ That last check is the one that matters: **if the ingress ever answers 202 while
 
 Four, because external producers vary. The canonical shape is the `EVT_*` contract
 specified in [event-schema.md](event-schema.md) and enforced from
-[`schemas/event-ingest.schema.json`](../schemas/event-ingest.schema.json):
+the document in force — `schemas/event-ingest.schema.json`, or the operator's stored
+override at `input-schema` ([configuration.md](configuration.md) §10):
 
 ```json
 { "EVT_Device": "core-sw-07", "EVT_EventKey": "net.link.down",
@@ -242,3 +243,36 @@ Validation is **strict** on what it does receive: severity must be one of the ex
 uppercase values, `payload` must be an object, and string fields have length limits.
 Rejecting is better than normalising a typo — a lowercase `critical` would otherwise
 create a second, invisible alert key.
+
+## 12. The live contract
+
+The schema this component validates against is **not fixed at build time**. At boot
+it loads `schemas/event-ingest.schema.json` from the image, then every 5 s it reads
+`input-schema` from Valkey and swaps in whatever an operator stored from
+Configuration → Ingest schema ([configuration.md](configuration.md) §10).
+
+```text
+main()                       load schemas/event-ingest.schema.json   (fail fast)
+  └─ setInterval(5s)         HGETALL input-schema → validate → compile → swap
+request path                 schemaSource.get()  — a property read, no round trip
+```
+
+Design notes:
+
+- **The poll runs on the same timer as the Valkey health probe.** Both need the
+  database, and one extra `HGETALL` per interval is nothing next to the write path.
+  It also means the contract recovers by itself after an outage, with no restart.
+- **The hot path does not touch Valkey.** `normaliseBatch` receives the compiled
+  contract (a `Set` of required fields, the severity `Set`, the field list), so the
+  per-event cost is unchanged.
+- **A bad stored document is ignored, not applied.** Validation failure keeps the
+  previous contract and logs at `error`; ingestion continues against a contract that
+  is known good.
+- **The file is still required.** It is the default, and what the ingress degrades to
+  when the store cannot be read at boot. An image without `schemas/` still refuses to
+  start, for the reason in `main()`: an ENOENT there is indistinguishable from a
+  producer sending bad payloads.
+
+An envelope may also carry `key` (32 lowercase hex). The legacy internal envelope
+honours it, which is what lets an operator close land on a record that was keyed by
+an identifier policy rather than by device + summary.

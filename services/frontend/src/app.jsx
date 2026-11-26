@@ -46,6 +46,15 @@ import {
   COLUMN_KEYS,
   COLUMN_DEFAULTS,
   mergeColumns,
+  resolveIngestSchema,
+  defaultIngestSchema,
+  ingestSchemaKeys,
+  ingestKeyLabel,
+  identifierPolicyText,
+  isValidIngestKey,
+  INGEST_CORE_KEYS,
+  MAX_KEY_LEN,
+  MAX_IDENTIFIER_KEYS,
   linkState,
   insertAllEvent,
   allEventRowKey,
@@ -693,6 +702,13 @@ function useSocket(config) {
   // first reply — the pre-feature column names — and an unreachable gateway degrades
   // to that rather than to an empty table.
   const [columns, setColumns] = useState(() => mergeColumns({}));
+  // The GLOBAL ingest contract: which `EVT_*` keys the ingress accepts, and which
+  // of them mint an identity when `EVT_Identifier` is blank.
+  //
+  // Starts as `null`, not as the default document: `resolveIngestSchema` falls back
+  // to the built-in copy, and keeping "not loaded yet" distinct from "loaded, and
+  // it is the default" is what lets the page say which one it is showing.
+  const [ingestContract, setIngestContract] = useState(null);
 
   // The All Events tab's data: a windowed server query over the raw event log.
   // Held here so switching tabs does not re-fetch, and keyed by the range so
@@ -1072,6 +1088,17 @@ function useSocket(config) {
       setColumns(mergeColumns(frame.columns));
       return;
     }
+    if (frame.op === 'ingestSchema') {
+      // The live contract. NOT merged onto any default here: the document IS the
+      // schema, so merging would resurrect a key the operator removed and the
+      // ingress no longer accepts.
+      setIngestContract({
+        schema: frame.schema ?? null,
+        identifierKeys: Array.isArray(frame.identifierKeys) ? frame.identifierKeys : [],
+        source: frame.source === 'valkey' ? 'valkey' : 'file',
+      });
+      return;
+    }
     if (frame.op === 'snapshot') {
       // The state of the world as of connect, or as of the last resync. Without
       // this the board is empty on load until something new fires, because events
@@ -1310,6 +1337,10 @@ function useSocket(config) {
       // renamed a column while this tab was disconnected, and the gateway has no
       // per-client replay.
       ws.send(JSON.stringify({ op: 'columns' }));
+
+      // Same for the ingest contract: an operator may have added a key, and a
+      // disconnected tab would otherwise keep showing the old one.
+      ws.send(JSON.stringify({ op: 'ingestSchema' }));
 
       // A reconnect follows a window in which frames were definitely missed, so
       // the board is resynced straight away rather than waiting for the next
@@ -1605,6 +1636,37 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Read the live ingest contract.
+   *
+   * On connect, like the column configuration. The answer may be `source: 'file'`,
+   * which means nothing is stored and the ingress is running the document shipped in
+   * its image — the client renders its own copy of that document.
+   */
+  const loadIngestSchema = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ op: 'ingestSchema' }));
+  }, []);
+
+  /**
+   * Save the live ingest contract.
+   *
+   * The SERVER decides the result: it validates both halves and echoes the stored
+   * document back, which replaces the local copy. Applying the request optimistically
+   * would let the form show a contract the ingress refused — and a refused contract is
+   * stored as nothing at all, so the form and the pipeline would disagree silently.
+   */
+  const saveIngestSchema = useCallback(({ schema, identifierKeys }, by) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice('not connected — ingest schema not saved');
+      return false;
+    }
+    ws.send(JSON.stringify({ op: 'setIngestSchema', schema, identifierKeys, by }));
+    return true;
+  }, []);
+
+  /**
    * Ask for the AUDIT trail in a time window.
    *
    * Same shape as `loadAllEvents` — a bounded, on-demand query rather than a
@@ -1643,6 +1705,7 @@ function useSocket(config) {
     loadAllEvents, allEvents,
     loadHistory, setHistoryQuery, history,
     columns, loadColumns, saveColumns,
+    ingestContract, loadIngestSchema, saveIngestSchema,
     journals, loadJournal, addJournalEntry,
     dbUp,
   };
@@ -2284,6 +2347,22 @@ function ColumnsIcon() {
 }
 
 /**
+ * The ingest-schema icon: a document with a key on it.
+ *
+ * Read as "the contract", which is what the page edits.
+ */
+function SchemaIcon() {
+  return (
+    <svg {...NAV_ICON_PROPS} width="18" height="18">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+      <circle cx="12" cy="15" r="1.6" />
+      <path d="M13.6 15h2.4M12 13.4V12" />
+    </svg>
+  );
+}
+
+/**
  * The left navigation rail.
  *
  * Two areas, not two tabs: the board and the configuration pages are different KINDS
@@ -2325,11 +2404,12 @@ function NavRail({ open, onToggle, area, onSelect }) {
       </button>
 
       {item('board', 'Board', BoardIcon)}
-      {/* The first configuration PAGE. If more are added they nest under a
-          "Configuration" heading; with one, a heading would be a label above a
-          single item. */}
+      {/* Configuration PAGES. The heading is worth the space once there is more
+          than one; with two it also stops "Ingest schema" reading as a way of
+          looking at events rather than as a setting. */}
       {open ? <div className="navgroup">Configuration</div> : null}
       {item('columns', 'Data to columns', ColumnsIcon)}
+      {item('schema', 'Ingest schema', SchemaIcon)}
     </nav>
   );
 }
@@ -2458,12 +2538,285 @@ function pickEditable(map) {
   return out;
 }
 
+/**
+ * Configuration → Ingest schema.
+ *
+ * Two decisions on one page, because they are one contract:
+ *
+ *   1. WHICH KEYS the ingress accepts. Starts as `schemas/event-ingest.schema.json`
+ *      and an operator can add keys to it. The ingress reads the result from Valkey
+ *      (`input-schema`) on a poll, so a save takes effect within seconds and needs no
+ *      redeploy.
+ *
+ *   2. WHICH KEYS mint an identity when `EVT_Identifier` arrives empty. The resulting
+ *      hash becomes the record key for that event (`event:<32 hex>`), computed by the
+ *      ingress before the event is appended to the stream.
+ *
+ * WHY THE SAVE IS EXPLICIT. The ingress re-reads the contract every few seconds, so
+ * writing on each keystroke would apply half-typed key names to live ingestion — a
+ * producer sending `EVT_Foo` would get a 400 between two keystrokes. The draft is
+ * local until Save, exactly like Data to columns.
+ *
+ * WHY THE CORE SIX ARE READ-ONLY. Device + summary IS the record key, severity drives
+ * the mapping and the enum, event key is the type column and the subscription filter,
+ * agent/agent owner are on every row. Letting a web form remove one would break
+ * ingestion for every producer with no way to see why from the payload.
+ */
+function IngestSchemaPanel({ contract, onSave, operatorName }) {
+  // The document being edited. `resolveIngestSchema` returns the DEFAULTS when the
+  // store is empty, so a fresh install opens on the published contract rather than
+  // on an empty form.
+  const [draft, setDraft] = useState(
+    () => resolveIngestSchema(contract?.schema, contract?.source),
+  );
+  const [keys, setKeys] = useState(() => (contract?.identifierKeys || []).slice());
+  const [newKey, setNewKey] = useState('');
+  const [error, setError] = useState(null);
+
+  // Reset from the server whenever it changes identity — a save's echo, or another
+  // operator's broadcast. Without this the form would keep showing a draft the
+  // server has already replaced.
+  const serverJson = JSON.stringify({ s: contract?.schema, k: contract?.identifierKeys });
+  useEffect(() => {
+    setDraft(resolveIngestSchema(contract?.schema, contract?.source));
+    setKeys((contract?.identifierKeys || []).slice());
+    setError(null);
+  }, [serverJson]);
+
+  const propKeys = ingestSchemaKeys(draft);
+  const dirty = useMemo(() => {
+    // Compare against what the SERVER holds, not against what was rendered: an
+    // untouched install renders the built-in default while the server holds nothing,
+    // and that must not read as "unsaved changes".
+    const storedSchema = contract?.source === 'valkey' ? contract.schema : null;
+    const storedKeys = contract?.identifierKeys ?? [];
+    const schemaChanged = JSON.stringify(draft) !== JSON.stringify(
+      storedSchema ?? defaultIngestSchema(),
+    );
+    return schemaChanged || JSON.stringify(keys) !== JSON.stringify(storedKeys);
+  }, [serverJson, JSON.stringify(draft), JSON.stringify(keys)]);
+
+  const addKey = () => {
+    const name = newKey.trim();
+    if (!isValidIngestKey(name)) {
+      setError(`"${name}" is not a usable key: EVT_ prefix, A-Z 0-9 _, at most ${MAX_KEY_LEN} characters.`);
+      return;
+    }
+    if (draft.properties[name]) {
+      setError(`${name} is already in the schema.`);
+      return;
+    }
+    setError(null);
+    setDraft((prev) => ({
+      ...prev,
+      properties: { ...prev.properties, [name]: { type: 'string', title: name, default: '' } },
+    }));
+    setNewKey('');
+  };
+
+  const removeKey = (key) => {
+    if (INGEST_CORE_KEYS.includes(key)) {
+      // The server refuses this too. The guard is here so the operator sees the
+      // reason next to the row instead of getting a rejected save.
+      setError(`${key} is required by the pipeline and cannot be removed.`);
+      return;
+    }
+    setError(null);
+    setDraft((prev) => {
+      const properties = { ...prev.properties };
+      delete properties[key];
+      return { ...prev, properties };
+    });
+    // A key that no longer exists cannot stay in the identifier selection: the
+    // ingress would hash a field the schema dropped, producing the SAME hash for
+    // every event and collapsing the whole fleet onto one record.
+    setKeys((prev) => prev.filter((k) => k !== key));
+  };
+
+  const toggleIdentifier = (key, on) => {
+    // `EVT_Identifier` cannot be one of the inputs to its own fallback: it is the
+    // field that arrived blank. Hashing it would contribute the empty string on
+    // every event and, with nothing else selected, produce no key at all.
+    if (key === 'EVT_Identifier') return;
+    setKeys((prev) => {
+      if (on) return prev.includes(key) ? prev : [...prev, key].slice(0, MAX_IDENTIFIER_KEYS);
+      return prev.filter((k) => k !== key);
+    });
+  };
+
+  const save = () => {
+    if (keys.length > MAX_IDENTIFIER_KEYS) {
+      setError(`At most ${MAX_IDENTIFIER_KEYS} identifier keys.`);
+      return;
+    }
+    setError(null);
+    onSave({ schema: draft, identifierKeys: keys }, operatorName || undefined);
+  };
+
+  const source = contract?.source === 'valkey' ? 'stored' : 'the built-in default';
+
+  return (
+    <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mb: 1 }}>
+        <Typography variant="h2">Ingest schema</Typography>
+        <Box sx={{ flex: 1 }} />
+        <Button
+          variant="outlined"
+          size="small"
+          disabled={!dirty}
+          onClick={() => {
+            setDraft(resolveIngestSchema(contract?.schema, contract?.source));
+            setKeys((contract?.identifierKeys || []).slice());
+            setError(null);
+          }}
+        >
+          Reset
+        </Button>
+        <Button variant="contained" size="small" disabled={!dirty} onClick={save}>
+          Save for everyone
+        </Button>
+      </Stack>
+
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1, maxWidth: 820 }}>
+        The keys the HTTP ingress accepts. It re-reads this contract from Valkey every
+        few seconds, so a save applies without a redeploy. Currently reading{' '}
+        <strong>{source}</strong>. The six keys marked <em>required by the pipeline</em>{' '}
+        cannot be removed: the record key, the severity mapping and the table columns are
+        built on them. Tick a key to include it in the identifier hash, described at the
+        bottom of the page.
+      </Typography>
+
+      {error ? (
+        <MuiAlert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>
+          {error}
+        </MuiAlert>
+      ) : null}
+
+      {dirty ? (
+        <MuiAlert severity="info" sx={{ mb: 1.5 }}>
+          Unsaved changes. The ingress keeps using the stored contract until you press
+          Save.
+        </MuiAlert>
+      ) : null}
+
+      <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+        <table className="cfgtbl" style={{ maxWidth: 1000 }}>
+          <thead>
+            <tr>
+              <th>Key</th>
+              <th>Description</th>
+              <th>Identifier hash</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {propKeys.map((key) => {
+              const core = INGEST_CORE_KEYS.includes(key);
+              const inHash = keys.includes(key);
+              return (
+                <tr key={key} className={core ? 'locked' : ''}>
+                  <td className="mono nowrap">{key}</td>
+                  <td>
+                    <TextField
+                      value={ingestKeyLabel(draft, key)}
+                      size="small"
+                      onChange={(e) => setDraft((prev) => ({
+                        ...prev,
+                        properties: {
+                          ...prev.properties,
+                          [key]: { ...prev.properties[key], title: e.target.value },
+                        },
+                      }))}
+                      inputProps={{ 'aria-label': `Description for ${key}`, maxLength: 120 }}
+                      sx={{ width: 300 }}
+                    />
+                  </td>
+                  <td>
+                    <Checkbox
+                      checked={inHash}
+                      onChange={(e) => toggleIdentifier(key, e.target.checked)}
+                      inputProps={{ 'aria-label': `Include ${key} in the identifier hash` }}
+                      disabled={key === 'EVT_Identifier'}
+                    />
+                  </td>
+                  <td>
+                    {core ? (
+                      <Tooltip title="The pipeline is built on this key">
+                        <span className="dim nowrap">fixed</span>
+                      </Tooltip>
+                    ) : (
+                      <Button
+                        size="small"
+                        color="error"
+                        onClick={() => removeKey(key)}
+                        aria-label={`Remove ${key}`}
+                      >
+                        Remove
+                      </Button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', mt: 2, maxWidth: 900 }}>
+          <TextField
+            value={newKey}
+            size="small"
+            placeholder="EVT_NewKey"
+            label="Add a key"
+            onChange={(e) => setNewKey(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') addKey(); }}
+            inputProps={{ maxLength: MAX_KEY_LEN, 'aria-label': 'New ingest key name' }}
+            sx={{ width: 260 }}
+          />
+          <Button variant="outlined" size="small" onClick={addKey} disabled={newKey.trim() === ''}>
+            Add key
+          </Button>
+        </Stack>
+
+        <Box sx={{ mt: 3, maxWidth: 900 }}>
+          <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+            Record key from a missing identifier
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            When <span className="mono">EVT_Identifier</span> arrives empty, the ingress
+            hashes the selected keys and uses the result as the record key, so the event
+            lands on one record per derived identity instead of a random one per delivery.
+            Computed before the event enters the stream. Leave everything unticked to keep
+            the existing behaviour, where the record is identified by its condition
+            (device + summary).
+          </Typography>
+          <Box
+            component="code"
+            sx={{ display: 'block', p: 1, borderRadius: 1, bgcolor: 'action.hover',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: '0.78rem', wordBreak: 'break-all' }}
+          >
+            {identifierPolicyText(keys)}
+          </Box>
+          {keys.length === 0 ? null : (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+              Values are whitespace-normalised and joined with 0x1f before hashing. An event
+              whose selected values are <em>all</em> blank keeps a random id rather than
+              hashing to a constant, which would merge every such event into one record.
+            </Typography>
+          )}
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
 function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
     loadAllEvents, allEvents, loadHistory, setHistoryQuery, history,
     columns, loadColumns, saveColumns, dbUp,
+    ingestContract, loadIngestSchema, saveIngestSchema,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
   const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
@@ -2833,6 +3186,17 @@ function App() {
         <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                    p: 2, pt: 1.5 }}>
           <ColumnConfigPanel columns={columns} onSave={saveColumns} operatorName={operatorName} />
+        </Box>
+      ) : null}
+
+      {area === 'schema' ? (
+        <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
+                   p: 2, pt: 1.5 }}>
+          <IngestSchemaPanel
+            contract={ingestContract}
+            onSave={saveIngestSchema}
+            operatorName={operatorName}
+          />
         </Box>
       ) : null}
 

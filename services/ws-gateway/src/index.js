@@ -54,6 +54,13 @@ import {
   validateSetColumns,
   columnsFrame,
 } from './columns.js';
+import {
+  validateSetIngestSchema,
+  ingestSchemaFrame,
+  SCHEMA_FIELD,
+  IDENTIFIER_KEYS_FIELD,
+  CORE_KEYS,
+} from './ingestSchema.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
@@ -251,6 +258,16 @@ wss.on('connection', (ws, req) => {
 
     if (frame.op === 'setColumns') {
       await handleSetColumns(frame, send);
+      return;
+    }
+
+    if (frame.op === 'ingestSchema') {
+      await handleIngestSchemaRead(send);
+      return;
+    }
+
+    if (frame.op === 'setIngestSchema') {
+      await handleSetIngestSchema(frame, send);
       return;
     }
 
@@ -905,8 +922,123 @@ async function handleSetColumns(frame, send) {
   }
 }
 
-async function handleHistoryQuery(conn, frame, send) {
-  const verdict = validateHistoryQuery(frame);
+/**
+ * `{"op":"ingestSchema"}` — the live ingest contract and the identifier selection.
+ *
+ * Answers `source: 'file'` with `schema: null` when nothing is stored. That is a
+ * complete answer, not a failure: the client carries its own copy of
+ * `schemas/event-ingest.schema.json` (it needs it to render the form before the
+ * first reply anyway) and the ingress is running that same document. The gateway
+ * does not ship `schemas/`, so it cannot invent the default here.
+ */
+async function handleIngestSchemaRead(send) {
+  let raw;
+  try {
+    raw = await reader.readIngestSchema();
+  } catch (err) {
+    log.warn('ingest-schema read failed', { err: String(err) });
+    // Degrade the way the column read does: the defaults are a correct, complete
+    // answer, so an operator mid-incident gets a form they can read rather than an
+    // error. `stored: false` tells the client the answer is the fallback.
+    send(ingestSchemaFrame({ schema: null, identifierKeys: [], source: 'file', version: 'file' }));
+    return;
+  }
+
+  if (!raw || !raw[SCHEMA_FIELD]) {
+    send(ingestSchemaFrame({ schema: null, identifierKeys: [], source: 'file', version: 'file' }));
+    return;
+  }
+
+  let schema;
+  try {
+    schema = JSON.parse(raw[SCHEMA_FIELD]);
+  } catch {
+    // A corrupt document is reported as "not configured", which is exactly what the
+    // ingress is doing with it (it kept the file contract). Reporting an error
+    // instead would suggest ingestion is broken, and it is not.
+    log.error('stored input-schema is not valid JSON; answering with the file default');
+    send(ingestSchemaFrame({ schema: null, identifierKeys: [], source: 'file', version: 'file' }));
+    return;
+  }
+
+  let identifierKeys = [];
+  if (raw[IDENTIFIER_KEYS_FIELD]) {
+    try {
+      const parsed = JSON.parse(raw[IDENTIFIER_KEYS_FIELD]);
+      if (Array.isArray(parsed)) identifierKeys = parsed;
+    } catch {
+      log.error('stored identifierKeys is not valid JSON; answering with no selection');
+    }
+  }
+
+  send(ingestSchemaFrame({ schema, identifierKeys, source: 'valkey', version: 'stored' }));
+}
+
+/**
+ * `{"op":"setIngestSchema","schema":{…},"identifierKeys":["EVT_Device", …]}` —
+ * replace the live contract.
+ *
+ * Both halves are validated together and rejected together. A schema saved without
+ * its selection, or a selection naming a key the new schema dropped, would leave the
+ * ingress hashing fields that no longer exist — the same hash for every event, which
+ * collapses the whole fleet onto one record. That is the failure this validation
+ * exists to make impossible, so a partial save is refused rather than merged.
+ */
+async function handleSetIngestSchema(frame, send) {
+  const verdict = validateSetIngestSchema(frame);
+  if (!verdict.ok) {
+    send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
+    return;
+  }
+
+  try {
+    await reader.writeIngestSchema({
+      schema: verdict.schema,
+      identifierKeys: verdict.identifierKeys,
+    });
+  } catch (err) {
+    log.error('ingest-schema write failed', { by: verdict.by, err: String(err) });
+    send(JSON.stringify({
+      op: 'error',
+      code: 'ingest_schema_failed',
+      message: 'could not save the ingest schema, retry',
+    }));
+    return;
+  }
+
+  log.info('ingest contract updated', {
+    by: verdict.by,
+    fields: Object.keys(verdict.schema.properties).length,
+    extra: Object.keys(verdict.schema.properties).filter((k) => !CORE_KEYS.includes(k)).join(',') || '-',
+    identifierKeys: verdict.identifierKeys.join(',') || '-',
+  });
+
+  // The originator gets the authoritative stored document, so its form re-renders
+  // from what was saved rather than from what it sent — the same rule as setColumns.
+  send(ingestSchemaFrame({
+    schema: verdict.schema,
+    identifierKeys: verdict.identifierKeys,
+    source: 'valkey',
+    version: 'stored',
+  }));
+
+  // Everybody else gets it too: two operators editing the same contract must not
+  // end up looking at different documents.
+  try {
+    await reader.publish(cfg.channelAlerts, JSON.stringify({
+      kind: 'ingestSchema',
+      origin: POD_NAME,
+      schema: verdict.schema,
+      identifierKeys: verdict.identifierKeys,
+    }));
+  } catch (err) {
+    // The write is durable; the ingress picks it up on its next poll either way.
+    // Other PODS' clients keep their old copy until they reload.
+    log.error('ingest-schema broadcast failed after a durable write', { err: String(err) });
+  }
+}
+
+async function handleHistoryQuery(conn, frame, send) {  const verdict = validateHistoryQuery(frame);
   if (!verdict.ok) {
     send(JSON.stringify({ op: 'error', code: verdict.code, message: verdict.message }));
     return;
@@ -1220,6 +1352,22 @@ async function handleAlertMessage(raw) {
   if (parsed.kind === 'columns') {
     if (!shouldFanOut(parsed, POD_NAME)) return;
     const frame = columnsFrame(parsed.columns || {});
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
+    }
+    return;
+  }
+
+  // An ingest-contract change. Same echo guard: the writing pod already answered the
+  // originating client with the stored document.
+  if (parsed.kind === 'ingestSchema') {
+    if (!shouldFanOut(parsed, POD_NAME)) return;
+    const frame = ingestSchemaFrame({
+      schema: parsed.schema ?? null,
+      identifierKeys: parsed.identifierKeys || [],
+      source: 'valkey',
+      version: 'stored',
+    });
     for (const ws of wss.clients) {
       if (ws.readyState === ws.OPEN && ws.__send) ws.__send(frame);
     }

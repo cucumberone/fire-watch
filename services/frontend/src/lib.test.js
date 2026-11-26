@@ -37,6 +37,15 @@ import {
   tabBadgeCount,
   linkState,
   formatTimeValue,
+  defaultIngestSchema,
+  resolveIngestSchema,
+  ingestSchemaKeys,
+  ingestKeyLabel,
+  identifierPolicyText,
+  isValidIngestKey,
+  INGEST_CORE_KEYS,
+  INGEST_DEFAULT_KEYS,
+  MAX_KEY_LEN,
 } from './lib.js';
 
 const gunzip = async (bytes) => gunzipSync(Buffer.from(bytes));
@@ -1281,4 +1290,76 @@ test('visibleColumns preserves schema order, not storage order', () => {
     const d = COLUMN_DEFAULTS.find((c) => c.key === k);
     return d.asColumn || d.locked;
   }));
+});
+
+// ------------------------------------------------------------ ingest schema page
+// The client carries a LITERAL copy of the default contract because the browser
+// cannot read `schemas/`, and the form must render before the first reply. These
+// tests are what keep that copy honest.
+const fileSchema = JSON.parse(
+  readFileSync(new URL('../../../schemas/event-ingest.schema.json', import.meta.url), 'utf8'),
+);
+
+test('the client default schema has the same keys as the schema file', () => {
+  const built = defaultIngestSchema();
+  assert.deepEqual(
+    Object.keys(built.properties).sort(),
+    Object.keys(fileSchema.properties).sort(),
+    'add the key to INGEST_DEFAULT_KEYS as well as schemas/event-ingest.schema.json',
+  );
+});
+
+test('the client default schema has the same required list as the file', () => {
+  assert.deepEqual([...defaultIngestSchema().required].sort(), [...fileSchema.required].sort());
+});
+
+test('the client default schema has the same severities as the file', () => {
+  const built = defaultIngestSchema();
+  assert.deepEqual(built.properties.EVT_Severity.enum, fileSchema.properties.EVT_Severity.enum);
+});
+
+test('every client default key is a valid key', () => {
+  // The picker offers these to the operator and the gateway validates them, so an
+  // invalid one here would be a row that cannot be saved.
+  for (const key of INGEST_DEFAULT_KEYS) assert.equal(isValidIngestKey(key), true, key);
+  assert.equal(isValidIngestKey('NotPrefixed'), false);
+  assert.equal(isValidIngestKey('EVT_With-Dash'), false);
+  assert.equal(isValidIngestKey('EVT_' + 'X'.repeat(MAX_KEY_LEN)), false, 'too long');
+});
+
+test('the core keys the form pins are the ones the file requires', () => {
+  // The form disables "Remove" for these, so they have to be exactly the required
+  // set — a mismatch either blocks a removable key or lets a load-bearing one go.
+  assert.deepEqual([...INGEST_CORE_KEYS].sort(), [...fileSchema.required].sort());
+});
+
+test('a stored document replaces the default rather than merging with it', () => {
+  // Merging would resurrect a key the operator removed, and the ingress would still
+  // not accept it — the form would show a key that 400s.
+  const stored = {
+    type: 'object',
+    properties: { EVT_Device: { type: 'string' } },
+    required: ['EVT_Device'],
+  };
+  assert.deepEqual(ingestSchemaKeys(resolveIngestSchema(stored, 'valkey')), ['EVT_Device']);
+  assert.equal(resolveIngestSchema(null, 'file').properties.EVT_Agent.type, 'string');
+});
+
+test('an absent store renders the built-in default, not an empty form', () => {
+  const schema = resolveIngestSchema(null, 'file');
+  assert.deepEqual(ingestSchemaKeys(schema), INGEST_DEFAULT_KEYS);
+});
+
+test('a key with no title is labelled by its own name', () => {
+  // An operator-added key starts with its name as the title. Falling back to '' would
+  // render an invisible description cell.
+  const schema = { properties: { EVT_NewKey: { type: 'string' } } };
+  assert.equal(ingestKeyLabel(schema, 'EVT_NewKey'), 'EVT_NewKey');
+  assert.equal(ingestKeyLabel(schema, 'EVT_Missing'), 'EVT_Missing');
+});
+
+test('the identifier policy text names the legacy behaviour when nothing is picked', () => {
+  assert.match(identifierPolicyText([]), /device \+ summary/);
+  assert.match(identifierPolicyText(null), /device \+ summary/);
+  assert.match(identifierPolicyText(['EVT_Device', 'EVT_EventKey']), /EVT_Device \+ EVT_EventKey/);
 });

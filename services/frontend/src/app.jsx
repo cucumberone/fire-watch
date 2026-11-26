@@ -2898,14 +2898,33 @@ function App() {
    * strip is the app's primary navigation, and removing it from half the screens would
    * force an operator to find the nav rail to get back to the board, which is a longer
    * trip than tapping the tab they can already see.
+   *
+   * This is the `onChange` path, which covers KEYBOARD navigation between tabs. It does
+   * NOT cover a click on the tab that is already selected — MUI only calls `onChange`
+   * when `!selected` — so the area is also cleared in `onTabClick` below, which fires on
+   * every click. Both are needed: measured on the cluster, with All events already
+   * selected, clicking it left the config page up because only `onChange` cleared the
+   * area.
    */
   const setTab = useCallback((id) => {
     setTabState(id);
     writePref(TAB_KEY, id);
     setArea('board');
   }, []);
+  /**
+   * Every tab click, including one on the tab that is already selected.
+   *
+   * Two jobs, both of which need to happen on a click MUI will not report through
+   * `onChange`:
+   *
+   *   1. re-read the query-backed tab (the `tabNonce` bump), and
+   *   2. leave any configuration page, so a visible tab always describes what is on
+   *      screen.
+   */
   const onTabClick = useCallback((id) => {
-    // Only the query-backed tabs need it: the live ones stream their own updates.
+    setArea('board');
+    // Only the query-backed tabs need a re-read: the live ones stream their own
+    // updates.
     if (id === 'all' || id === 'history') setTabNonce((n) => n + 1);
   }, []);
   // Signature of the last query each query-backed tab issued, so entering a tab

@@ -1643,3 +1643,18 @@ test('area is declared before the tab handlers that use it', () => {
   // And it is declared exactly once.
   assert.equal((appSrc.match(/const \[area, setArea\] = useState/g) ?? []).length, 1);
 });
+
+test('a click on the ALREADY-SELECTED tab also leaves the configuration page', () => {
+  // MUI calls `onChange` only when `!selected`, so clearing the area in `setTab` alone
+  // left one path broken: with All events already selected (the tab is persisted), a
+  // click on it while a config page was open did nothing. Measured on the cluster —
+  // heading stayed "Data to columns".
+  //
+  // `onTabClick` fires on EVERY click, so the area reset has to be there as well.
+  const clickBody = appSrc.slice(
+    appSrc.indexOf('const onTabClick = useCallback((id) => {'),
+    appSrc.indexOf('const historyReqRef'),
+  );
+  assert.match(clickBody, /setArea\('board'\)/, 'a re-click must also show the board');
+  assert.match(clickBody, /setTabNonce/, 'and still re-read the query-backed tab');
+});

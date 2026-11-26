@@ -14,6 +14,7 @@ import {
   AppBar, Toolbar, Tabs, Tab, TextField, MenuItem, Select, FormControl,
   InputLabel, Button, IconButton, Tooltip, Chip, Box, Stack, Typography,
   Paper, Alert as MuiAlert, CircularProgress, Checkbox,
+  Menu, Divider, ListItemText,
 } from '@mui/material';
 import {
   DarkMode as DarkModeIcon,
@@ -22,6 +23,7 @@ import {
   Refresh as RefreshIcon,
   Pause as PauseIcon,
   PlayArrow as PlayArrowIcon,
+  ViewColumn as ViewColumnIcon,
 } from '@mui/icons-material';
 import {
   resolveWsUrl,
@@ -46,6 +48,8 @@ import {
   COLUMN_KEYS,
   COLUMN_DEFAULTS,
   mergeColumns,
+  normaliseHidden,
+  defaultHidden,
   resolveIngestSchema,
   defaultIngestSchema,
   ingestSchemaKeys,
@@ -164,6 +168,11 @@ const OPERATOR_KEY = 'fw:operator';
 // Which tab was last open. A workspace preference: an operator who works from
 // Live events should not be reset to Alerts every reload.
 const TAB_KEY = 'fw:tab';
+// Which enriched columns THIS browser hides. Per-browser on purpose: what a header is
+// CALLED is a team convention (stored in Valkey, shared), but which columns an
+// operator wants on screen is personal — two people triaging the same incident can
+// reasonably want different densities, and neither is "the intended view".
+const HIDDEN_COLS_KEY = 'fw:hiddenColumns';
 // Whether the left navigation is expanded. A workspace preference like the tab: an
 // operator who works with it open should not have to reopen it every reload.
 const NAV_KEY = 'fw:nav';
@@ -420,9 +429,40 @@ function usePreferences() {
     writePref(OPERATOR_KEY, clean || null);
   }, []);
 
+  // The LOCAL hidden column set.
+  //
+  // Absent storage means "never chosen", which is NOT the same as "hide nothing": it
+  // gets `defaultHidden()` so a new browser opens on Severity, Summary and the Event
+  // Key rather than on all ten columns. A stored empty array is a real choice — the
+  // operator turned everything on — and is respected.
+  //
+  // Stored as an ARRAY of hidden keys rather than a map of booleans because the
+  // complement is what needs remembering: a key added to the schema later arrives
+  // visible instead of needing an entry to appear.
+  const [hiddenColumns, setHiddenColumnsState] = useState(() => {
+    const raw = readPref(HIDDEN_COLS_KEY, null);
+    if (raw === null) return defaultHidden();
+    try {
+      return normaliseHidden(JSON.parse(raw));
+    } catch {
+      // Unreadable storage falls back to the defaults rather than to "hide nothing",
+      // which would silently show every column.
+      return defaultHidden();
+    }
+  });
+
+  useEffect(() => {
+    writePref(HIDDEN_COLS_KEY, JSON.stringify(hiddenColumns));
+  }, [hiddenColumns]);
+
+  const setHiddenColumns = useCallback((next) => {
+    setHiddenColumnsState(normaliseHidden(next));
+  }, []);
+
   return {
     themePreference, darkMode, rowColor, setTheme, setRowColor,
     operatorName, setOperatorName,
+    hiddenColumns, setHiddenColumns,
   };
 }
 
@@ -1747,6 +1787,100 @@ function useSocket(config) {
 
 // ------------------------------------------------------------------------ UI
 /**
+ * Which columns to show, as a dropdown in the header.
+ *
+ * LOCAL, not shared. What a header is *called* is a team convention and lives in
+ * Valkey so every board reads the same (Data to columns). Which columns an operator
+ * wants on screen is a per-glance preference — you notice a column is in the way while
+ * reading — so it is remembered per browser and never broadcast.
+ *
+ * Only the ENRICHED columns are listed. Severity and Summary are locked: the table
+ * renders a badge and the summary cell itself, so a checkbox for them would promise a
+ * control that does nothing. Count and the two occurrence columns are part of the
+ * fixed layout and are not switchable either — hiding them would leave a row with no
+ * time reference at all.
+ *
+ * `hidden` is the complement (`normaliseHidden` keeps it that way), so an item's
+ * checked state is simply "not in the list".
+ */
+function ColumnPicker({ columns, hidden, onChange }) {
+  const [anchor, setAnchor] = useState(null);
+  const off = new Set(hidden);
+  // The rename map carries the labels; COLUMN_DEFAULTS carries the order and the
+  // locked flag. Merging here means the menu shows the operator's names, not the
+  // build-time defaults.
+  const merged = mergeColumns(columns);
+  const items = COLUMN_DEFAULTS.filter((c) => !c.locked);
+
+  const toggle = (key, visible) => {
+    const next = new Set(off);
+    if (visible) next.delete(key);
+    else next.add(key);
+    onChange([...next]);
+  };
+
+  return (
+    <>
+      <Tooltip title="Choose columns">
+        <IconButton
+          size="small"
+          color={off.size > 0 ? 'primary' : 'inherit'}
+          onClick={(e) => setAnchor(e.currentTarget)}
+          aria-label="Choose columns"
+          aria-haspopup="true"
+          aria-expanded={Boolean(anchor)}
+        >
+          <ViewColumnIcon fontSize="small" />
+        </IconButton>
+      </Tooltip>
+      <Menu
+        anchorEl={anchor}
+        open={Boolean(anchor)}
+        onClose={() => setAnchor(null)}
+        // Dense and anchored to the icon, so it opens where the eye already is
+        // instead of as a centred modal over the board.
+        MenuListProps={{ dense: true, 'aria-label': 'Columns' }}
+      >
+        <MenuItem disabled sx={{ opacity: '1 !important', fontSize: '.72rem',
+                                 textTransform: 'uppercase', letterSpacing: '.05em' }}>
+          Columns
+        </MenuItem>
+        {items.map((c) => {
+          const visible = !off.has(c.key);
+          return (
+            <MenuItem key={c.key} onClick={() => toggle(c.key, !visible)}
+                      aria-label={`Show ${c.key}`}>
+              <Checkbox
+                size="small"
+                checked={visible}
+                // The Item owns the click; a second handler on the box would fire
+                // twice for one press and cancel itself out.
+                onChange={() => {}}
+                tabIndex={-1}
+                disableRipple
+                sx={{ p: 0, mr: 1 }}
+              />
+              <ListItemText
+                primary={merged[c.key]?.label ?? c.label}
+                secondary={c.key}
+                secondaryTypographyProps={{ className: 'mono', fontSize: '.68rem' }}
+              />
+            </MenuItem>
+          );
+        })}
+        <Divider />
+        <MenuItem
+          onClick={() => onChange(defaultHidden())}
+          aria-label="Reset columns to the defaults"
+        >
+          <ListItemText primary="Reset to defaults" />
+        </MenuItem>
+      </Menu>
+    </>
+  );
+}
+
+/**
  * The line between the connection chip and the database chip.
  *
  * Its colour is the COMBINED state, so the pair reads as one statement instead of
@@ -2480,7 +2614,7 @@ function NavRail({ open, onToggle, area, onSelect }) {
  * rename to every open board mid-word, and a mistyped header would flash up on
  * someone else's screen during an incident.
  */
-function ColumnConfigPanel({ columns, onSave, operatorName }) {
+function ColumnConfigPanel({ columns, onSave, operatorName, schemaKeys = [] }) {
   // Draft = what the form shows. Reset from the server's copy whenever it changes
   // identity, so a broadcast from another operator (or this save's echo) replaces
   // the draft rather than being ignored.
@@ -2488,10 +2622,28 @@ function ColumnConfigPanel({ columns, onSave, operatorName }) {
   const serverJson = JSON.stringify(columns);
   useEffect(() => { setDraft(mergeColumns(columns)); }, [serverJson]);
 
+  // Every key the CONTRACT declares, in the client's order first and any
+  // operator-added keys after it.
+  //
+  // The client list is a build-time copy of the published schema, so a key an
+  // operator added from Configuration → Ingest schema would otherwise be missing
+  // here and could never be given a name — the one thing this page exists to do.
+  // Union rather than replace: the client list has the presentation order and the
+  // `locked` flags, and `schemaKeys` is empty until the contract has loaded.
+  const allKeys = useMemo(() => {
+    const seen = new Set(COLUMN_KEYS);
+    const extra = schemaKeys.filter((k) => !seen.has(k));
+    return [...COLUMN_KEYS, ...extra];
+  }, [JSON.stringify(schemaKeys)]);
+
   // Only the CONFIGURABLE rows are editable. The locked ones are shown so the list
   // reads as the complete mapping rather than as "some of the schema", but their
   // name and visibility belong to the table's own rendering.
-  const editable = COLUMN_KEYS.filter((k) => !draft[k]?.locked);
+  //
+  // An operator-added key has no entry in `draft` yet, so it is treated as unlocked
+  // with its own name as the default label — which is what `mergeColumns` does for
+  // any key it does not know.
+  const editable = allKeys.filter((k) => !draft[k]?.locked);
 
   const dirty = useMemo(
     () => JSON.stringify(pickEditable(draft)) !== JSON.stringify(pickEditable(mergeColumns(columns))),
@@ -2541,12 +2693,16 @@ function ColumnConfigPanel({ columns, onSave, operatorName }) {
             <tr>
               <th>Ingest key</th>
               <th>Column name</th>
-              <th>Visible as column</th>
+              <th>Shown by</th>
             </tr>
           </thead>
           <tbody>
-            {COLUMN_KEYS.map((key) => {
-              const row = draft[key];
+            {allKeys.map((key) => {
+              // `mergeColumns` only knows the client's own keys, so an
+              // operator-added one has no row yet. Synthesising its default here —
+              // its own name, unlocked — is what lets it be renamed without a
+              // round trip through the gateway.
+              const row = draft[key] ?? { label: key, locked: false };
               return (
                 <tr key={key} className={row.locked ? 'locked' : ''}>
                   <td className="mono">{key}</td>
@@ -2561,13 +2717,12 @@ function ColumnConfigPanel({ columns, onSave, operatorName }) {
                     />
                   </td>
                   <td>
-                    <Checkbox
-                      checked={row.asColumn}
-                      onChange={(e) => set(key, { asColumn: e.target.checked })}
-                      disabled={row.locked}
-                      inputProps={{ 'aria-label': `Show ${key} as a column` }}
-                    />
-                    {row.locked ? <span className="dim"> always shown</span> : null}
+                    {/* Visibility moved OUT of this page: it is per-operator and
+                        lives in the header's column picker. Leaving the checkbox
+                        here would imply a shared control over a personal setting. */}
+                    <span className="dim">
+                      {row.locked ? 'always — the table renders it' : 'each operator'}
+                    </span>
                   </td>
                 </tr>
               );
@@ -2579,13 +2734,20 @@ function ColumnConfigPanel({ columns, onSave, operatorName }) {
   );
 }
 
-/** The rows the form owns: everything that is not locked by the table. */
+/**
+ * The rows the form owns: every key, minus the locked ones.
+ *
+ * `asColumn` is still sent because the gateway's validator requires the field, but
+ * this page no longer offers a control for it — visibility is per-operator now, in
+ * the header's column picker. Sending the DEFAULT keeps the stored value stable
+ * rather than rewriting it to whatever this browser happens to show.
+ */
 function pickEditable(map) {
   const out = {};
-  for (const key of COLUMN_KEYS) {
+  for (const key of Object.keys(map || {})) {
     const row = map[key];
     if (!row || row.locked) continue;
-    out[key] = { label: row.label, asColumn: row.asColumn };
+    out[key] = { label: row.label, asColumn: Boolean(row.asColumn) };
   }
   return out;
 }
@@ -2872,7 +3034,10 @@ function App() {
     ingestContract, loadIngestSchema, saveIngestSchema,
     journals, loadJournal, addJournalEntry,
   } = useSocket(config);
-  const { themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName } = usePreferences();
+  const {
+    themePreference, darkMode, rowColor, setTheme, setRowColor, operatorName, setOperatorName,
+    hiddenColumns, setHiddenColumns,
+  } = usePreferences();
   // Which tab is showing. Persisted as a workspace preference, in the same spirit
   // as the theme: reopening the app should land where the operator left off.
   const [tab, setTabState] = useState(() => {
@@ -3125,7 +3290,12 @@ function App() {
   // The enriched columns every events table renders, already filtered and renamed
   // by the global configuration. Derived once per configuration change rather than
   // per row: two tables and their headers all read the same list.
-  const eventColumns = useMemo(() => configuredColumns(columns), [columns]);
+  // The enriched columns to render, minus whatever THIS browser hid. `columns` carries
+  // the shared labels; `hiddenColumns` is the local visibility list.
+  const eventColumns = useMemo(
+    () => configuredColumns(columns, hiddenColumns),
+    [columns, hiddenColumns],
+  );
 
   const sortedAlerts = useMemo(
     () => [...alerts.values()].sort(
@@ -3228,6 +3398,19 @@ function App() {
                 <PaletteIcon fontSize="small" />
               </IconButton>
             </Tooltip>
+            {/* Column selector, at the operator's request: a dropdown beside the
+                theme and colour toggles rather than another configuration page.
+                Picking columns is a per-glance adjustment — you notice a column is
+                in the way while reading the board — so it belongs next to the board
+                and must not mean a round trip through the nav rail.
+
+                The rename map is NOT here: what a header is called is shared, which
+                is what Data to columns is for. This only decides what is shown. */}
+            <ColumnPicker
+              columns={columns}
+              hidden={hiddenColumns}
+              onChange={setHiddenColumns}
+            />
           </Toolbar>
 
           {/* Tabs live in the AppBar so the header and the view selector are one
@@ -3306,7 +3489,12 @@ function App() {
       {area === 'columns' ? (
         <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column',
                    p: 2, pt: 1.5 }}>
-          <ColumnConfigPanel columns={columns} onSave={saveColumns} operatorName={operatorName} />
+          <ColumnConfigPanel
+            columns={columns}
+            onSave={saveColumns}
+            operatorName={operatorName}
+            schemaKeys={ingestSchemaKeys(resolveIngestSchema(ingestContract?.schema, ingestContract?.source))}
+          />
         </Box>
       ) : null}
 

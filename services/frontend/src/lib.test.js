@@ -28,6 +28,8 @@ import {
   COLUMN_KEYS,
   mergeColumns,
   visibleColumns,
+  normaliseHidden,
+  defaultHidden,
   WIRE_FIELD,
   SEVERITY_RANK,
   isUnsupportedOpError,
@@ -1225,19 +1227,30 @@ test('mergeColumns fills in the defaults for anything not stored', () => {
   // safe to deploy onto a running system.
   const merged = mergeColumns({});
   assert.equal(merged.EVT_Agent.label, 'Agent');
-  assert.equal(merged.EVT_Agent.asColumn, true);
-  assert.equal(merged.EVT_Identifier.asColumn, false);
+  assert.equal(merged.EVT_Identifier.locked, false);
+  // The DEFAULT VISIBLE set: Severity, Summary and the Event Key. Stated as the
+  // default HIDDEN set applied, because visibility is explicit — an empty hidden list
+  // means "hide nothing", which is what a browser with no stored preference gets only
+  // after `defaultHidden()` is written on first run.
+  const visible = visibleColumns({}, defaultHidden()).map((c) => c.key);
+  assert.deepEqual(visible, ['EVT_Severity', 'EVT_Summary', 'EVT_EventKey']);
 });
 
-test('mergeColumns applies a stored rename and visibility', () => {
+test('mergeColumns applies a stored RENAME but not a stored visibility', () => {
+  // Labels are a team convention; visibility is per-operator and lives in
+  // localStorage. A stored `asColumn` is ignored — honouring it would let one
+  // operator's rename change what everyone else sees.
   const merged = mergeColumns({
     EVT_Agent: { label: 'Tool', asColumn: false },
     EVT_URL: { label: 'Link', asColumn: true },
   });
   assert.equal(merged.EVT_Agent.label, 'Tool');
-  assert.equal(merged.EVT_Agent.asColumn, false);
   assert.equal(merged.EVT_URL.label, 'Link');
-  assert.equal(merged.EVT_URL.asColumn, true);
+  // The field still exists (it is the DEFAULT visibility), but the stored value did
+  // not move it: Agent stays off by default and URL stays off regardless of the
+  // `asColumn: true` the store claims.
+  assert.equal(merged.EVT_Agent.asColumn, false, 'stored visibility is not applied');
+  assert.equal(merged.EVT_URL.asColumn, false, 'and not for a stored true either');
   // Untouched keys keep their defaults.
   assert.equal(merged.EVT_Device.label, 'Device');
 });
@@ -1269,27 +1282,46 @@ test('mergeColumns ignores a blank rename', () => {
   assert.equal(merged.EVT_Agent.label, 'Agent');
 });
 
-test('visibleColumns keeps locked ones and honours the rest', () => {
-  const cols = visibleColumns({
-    EVT_Agent: { label: 'Tool', asColumn: false },
-    EVT_Identifier: { label: 'ID', asColumn: true },
-  });
+test('visibleColumns keeps locked ones and honours the LOCAL hidden list', () => {
+  const cols = visibleColumns(
+    { EVT_Agent: { label: 'Tool' }, EVT_Identifier: { label: 'ID' } },
+    ['EVT_EventKey', 'EVT_Identifier', 'EVT_Severity'],   // the last is locked
+  );
   const keys = cols.map((c) => c.key);
   assert.ok(keys.includes('EVT_Severity'), 'locked columns are always rendered');
   assert.ok(keys.includes('EVT_Summary'), 'including the summary cell');
-  assert.ok(!keys.includes('EVT_Agent'), 'a hidden column is dropped');
-  assert.ok(keys.includes('EVT_Identifier'), 'a promoted one is added');
-  assert.equal(cols.find((c) => c.key === 'EVT_Identifier').label, 'ID');
+  assert.ok(!keys.includes('EVT_EventKey'), 'a hidden column is dropped');
+  // A hidden unlocked key is gone; an UNhidden one is present with its rename.
+  assert.ok(!keys.includes('EVT_Identifier'), 'a hidden enriched key is dropped');
+  assert.equal(cols.find((c) => c.key === 'EVT_Agent').label, 'Tool');
+});
+
+test('an unlocked key is visible unless it is explicitly hidden', () => {
+  // "hidden" is the smaller set and the one worth storing: a key ADDED to the
+  // schema then arrives visible instead of needing an entry to appear.
+  const visibleWithNothingStored = visibleColumns({}, []).map((c) => c.key);
+  assert.ok(visibleWithNothingStored.includes('EVT_Device'));
+  assert.deepEqual(normaliseHidden(['EVT_Severity', 'EVT_Severity', 'nope', 42]),
+    ['nope'], 'locked and non-string entries are dropped, duplicates collapsed');
 });
 
 test('visibleColumns preserves schema order, not storage order', () => {
   // Stored hashes come back in arbitrary order; a table whose columns reshuffle
   // between reloads would be maddening.
-  const cols = visibleColumns({});
-  assert.deepEqual(cols.map((c) => c.key), COLUMN_KEYS.filter((k) => {
-    const d = COLUMN_DEFAULTS.find((c) => c.key === k);
-    return d.asColumn || d.locked;
-  }));
+  const cols = visibleColumns({}, []);
+  assert.deepEqual(cols.map((c) => c.key), [...COLUMN_KEYS]);
+});
+
+test('the default hidden set is everything unlocked that is not defaultOn', () => {
+  const hidden = defaultHidden();
+  assert.ok(!hidden.includes('EVT_Severity'), 'locked keys are never hidden');
+  assert.ok(!hidden.includes('EVT_Summary'));
+  assert.ok(!hidden.includes('EVT_EventKey'), 'the event key is on by default');
+  assert.ok(hidden.includes('EVT_Device'));
+  assert.ok(hidden.includes('EVT_URL'));
+  // And the two views agree: default hidden + visibleColumns == the defaultOn set.
+  assert.deepEqual(visibleColumns({}, hidden).map((c) => c.key),
+    ['EVT_Severity', 'EVT_Summary', 'EVT_EventKey']);
 });
 
 // ------------------------------------------------------------ ingest schema page

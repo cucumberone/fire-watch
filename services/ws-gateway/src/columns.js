@@ -55,6 +55,15 @@ const KEY_SET = new Set(COLUMN_KEYS);
 /** Longest accepted column name. A header is one line; beyond this it truncates. */
 export const MAX_LABEL_LEN = 40;
 
+/**
+ * A key this build does not know but the contract may: `EVT_` plus a bounded name.
+ *
+ * Same shape the ingest contract enforces for an added key
+ * (services/http-ingress/src/schema.js `cleanKey`), so a name that could not be an
+ * ingest key can never be stored as a column name either.
+ */
+const EXTRA_KEY_RE = /^EVT_[A-Za-z0-9_]{1,61}$/;
+
 /** Defaults as a plain map, which is what the wire carries. */
 export function defaultColumns() {
   const out = {};
@@ -112,11 +121,19 @@ export function validateSetColumns(frame) {
 
   const out = {};
   for (const [key, value] of Object.entries(frame.columns)) {
-    if (!KEY_SET.has(key)) {
+    // A key the client's build-time copy does not know is accepted when it is a
+    // plausible ingest key. `COLUMN_KEYS` is a COPY of the published schema, so an
+    // operator who added `EVT_Ticket` from Configuration → Ingest schema could never
+    // rename it otherwise — the one thing this op exists to do.
+    //
+    // Tightened rather than dropped: the shape must still be an `EVT_*` name a hash
+    // field can hold, so a client cannot store arbitrary text here and have it land
+    // in a hash the inspector renders.
+    if (!KEY_SET.has(key) && !EXTRA_KEY_RE.test(key)) {
       return {
         ok: false,
         code: 'unknown_key',
-        message: `${JSON.stringify(key)} is not an ingest-schema key; allowed: ${COLUMN_KEYS.join(', ')}`,
+        message: `${JSON.stringify(key)} is not an ingest-schema key; allowed: ${COLUMN_KEYS.join(', ')}, or an EVT_* name`,
       };
     }
     if (!value || typeof value !== 'object') {

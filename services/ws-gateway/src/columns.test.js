@@ -146,3 +146,25 @@ test('the frame carries the whole configuration', () => {
 test('COLUMN_DEFAULTS and COLUMN_KEYS agree', () => {
   assert.deepEqual(COLUMN_KEYS, COLUMN_DEFAULTS.map((c) => c.key));
 });
+
+test('an operator-added ingest key can be renamed', () => {
+  // COLUMN_KEYS is a COPY of the published schema, so a key added from
+  // Configuration → Ingest schema was rejected here and could never be given a name —
+  // the one thing setColumns exists to do.
+  const v = validateSetColumns({
+    op: 'setColumns',
+    columns: { EVT_Ticket: { label: 'Ticket', asColumn: false } },
+  });
+  assert.equal(v.ok, true, v.message);
+  assert.equal(v.columns.EVT_Ticket.label, 'Ticket');
+});
+
+test('a name that could not be an ingest key is still rejected', () => {
+  // The allowlist was widened, not dropped: this must remain a name a hash field can
+  // hold, or arbitrary text lands in a hash the inspector renders.
+  for (const bad of ['NotPrefixed', 'EVT_With-Dash', 'EVT_' + 'x'.repeat(70), 'evt_lower', '']) {
+    const v = validateSetColumns({ op: 'setColumns', columns: { [bad]: { label: 'X', asColumn: true } } });
+    assert.equal(v.ok, false, `${bad} must be rejected`);
+    assert.equal(v.code, 'unknown_key');
+  }
+});

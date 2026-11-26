@@ -1,8 +1,14 @@
 # Configuration — data to columns
 
 The first configuration page, reached from the left navigation rail. It maps each
-`EVT_*` key the ingress accepts onto the name shown in the GUI, and decides whether
-that value gets a **table column** or only appears under **Information**.
+`EVT_*` key the ingress accepts onto the name shown in the GUI.
+
+**Visibility is NOT here.** Which columns an operator sees is a per-browser setting,
+chosen from the **column picker** in the header (§10.1) and stored in
+`localStorage`. What a header is *called* is a team convention — two operators should
+not disagree about that — while which columns an individual wants on screen is
+their own business. Storing the two together was the original mistake: one
+operator's rename silently changed everyone's visible set.
 
 ## 1. Global, not per-user
 
@@ -277,3 +283,47 @@ same reason ack and close do.
 | `setIngestSchema` write fails | `ingest_schema_failed`; the form keeps its draft |
 | broadcast fails | the write is durable and the ingress picks it up on its next poll; other pods' clients keep the old copy |
 | an added key is missing from a payload | the key is simply absent; only keys added to `required` are enforced |
+
+## 10.1 The column picker (per browser)
+
+An icon in the header, beside the theme and row-colour toggles, opens a dropdown
+listing every unlocked ingest key with a checkbox.
+
+| | |
+|---|---|
+| Storage | `localStorage['fw:hiddenColumns']`, a JSON array of **hidden** keys |
+| Scope | one browser — never broadcast, never in Valkey |
+| Default | Severity, Summary and **Event Key** visible; everything else hidden |
+
+**Hidden, not shown.** The stored set is the complement, because that is the smaller
+one and it degrades correctly: a key added to the ingest schema later arrives
+*visible* rather than needing an entry to appear. `normaliseHidden()` drops locked
+keys and non-strings, so stale or hand-edited storage cannot hide the severity badge.
+
+**Absent storage is not "hide nothing".** With no stored value the client applies
+`defaultHidden()`, so a new browser opens on the columns that carry the signal. An
+empty stored array is a real choice — the operator turned everything on — and is
+respected. Unreadable JSON falls back to the defaults rather than to "show all".
+
+**Severity and Summary are not switchable.** They are `locked`: the table renders a
+severity badge and a summary cell, not generic cells, so a checkbox for either would
+promise a control that does nothing. Count and the two occurrence columns are part of
+the fixed layout for the same kind of reason — a row with no time reference is not
+useful.
+
+**Renames come from here, visibility does not.** The picker reads `config:columns`
+for the labels, so a renamed header shows the operator's name in the menu. It writes
+only to `localStorage`.
+
+### 10.1.1 Operator-added keys
+
+Data to columns lists **every key the ingest contract declares**, not just the
+client's build-time copy: `COLUMN_KEYS` first (it carries the presentation order and
+the `locked` flags), then any key from `input-schema` that it does not know. Without
+that union, a key added from Configuration → Ingest schema could never be given a
+name — the one thing the page exists to do.
+
+The gateway accepts those names too. Its allowlist was `COLUMN_KEYS` exactly, so it
+rejected what the form was happy to send; it now also accepts `EVT_[A-Za-z0-9_]{1,61}`
+— the same shape the ingest contract enforces for an added key, so a name that could
+not be an ingest key still cannot be stored as a column name.

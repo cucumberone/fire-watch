@@ -126,16 +126,23 @@ export const WIRE_FIELD = { summary: 'msg', msgCompleteString: 'msgc' };
  * summary cell) and this configuration therefore cannot hide it.
  */
 export const COLUMN_DEFAULTS = [
-  { key: 'EVT_Severity', label: 'Severity', asColumn: true, locked: true },
-  { key: 'EVT_Summary', label: 'Summary', asColumn: true, locked: true },
-  { key: 'EVT_Device', label: 'Device', asColumn: true },
-  { key: 'EVT_EventKey', label: 'Event key', asColumn: true },
-  { key: 'EVT_Agent', label: 'Agent', asColumn: true },
-  { key: 'EVT_AgentOwner', label: 'Agent owner', asColumn: true },
-  { key: 'EVT_Environment', label: 'Environment', asColumn: true },
-  { key: 'EVT_Identifier', label: 'Identifier', asColumn: false },
-  { key: 'EVT_Details', label: 'Details', asColumn: false },
-  { key: 'EVT_URL', label: 'URL', asColumn: false },
+  // `locked` means the table renders this itself and it can never be hidden —
+  // Severity is a badge and Summary is the row's text, not generic cells.
+  //
+  // `defaultOn` is the STARTING visibility for a new browser. Severity, Summary and
+  // Count are always shown; of the remaining keys only the Event Key joins them, so
+  // the board opens on the columns that carry the signal. Everything else is one
+  // tick away in the column selector, and the choice is remembered per browser.
+  { key: 'EVT_Severity', label: 'Severity', locked: true },
+  { key: 'EVT_Summary', label: 'Summary', locked: true },
+  { key: 'EVT_EventKey', label: 'Event Key', defaultOn: true },
+  { key: 'EVT_Device', label: 'Device', defaultOn: false },
+  { key: 'EVT_Agent', label: 'Agent', defaultOn: false },
+  { key: 'EVT_AgentOwner', label: 'Agent owner', defaultOn: false },
+  { key: 'EVT_Environment', label: 'Environment', defaultOn: false },
+  { key: 'EVT_Identifier', label: 'Identifier', defaultOn: false },
+  { key: 'EVT_Details', label: 'Details', defaultOn: false },
+  { key: 'EVT_URL', label: 'URL', defaultOn: false },
 ];
 
 /** Configurable keys in presentation order. */
@@ -145,7 +152,7 @@ export const COLUMN_KEYS = COLUMN_DEFAULTS.map((c) => c.key);
 export function defaultColumns() {
   const out = {};
   for (const c of COLUMN_DEFAULTS) {
-    out[c.key] = { label: c.label, asColumn: c.asColumn, locked: Boolean(c.locked) };
+    out[c.key] = { label: c.label, asColumn: Boolean(c.defaultOn || c.locked), locked: Boolean(c.locked) };
   }
   return out;
 }
@@ -155,6 +162,12 @@ export function defaultColumns() {
  * does: a key with no stored value keeps its default, so an empty store means "all
  * defaults" rather than "no columns", and a key added to the schema later appears
  * automatically.
+ *
+ * Only LABELS come from here. Visibility is per-operator and lives in localStorage
+ * (see `applyVisibility`), because renaming a header is a team convention — two
+ * operators should not disagree about what a column is called — while which columns
+ * an individual wants on screen is a personal preference. Storing the two together
+ * was the original mistake: a rename would silently change everyone's visible set.
  *
  * `locked` always comes from the DEFAULTS. A stored `locked: false` must not be able
  * to turn a core column into a hiding one — that flag describes what the table can
@@ -168,7 +181,6 @@ export function mergeColumns(stored) {
     if (typeof value.label === 'string' && value.label.trim() !== '') {
       out[key].label = value.label.trim();
     }
-    if (typeof value.asColumn === 'boolean') out[key].asColumn = value.asColumn;
   }
   return out;
 }
@@ -180,11 +192,41 @@ export function mergeColumns(stored) {
  * render Severity and Summary themselves, so hiding them would silently drop a
  * column the configuration has no control over.
  */
-export function visibleColumns(columns) {
+export function visibleColumns(columns, hidden = []) {
   const merged = mergeColumns(columns);
+  const off = new Set(Array.isArray(hidden) ? hidden : []);
   return COLUMN_KEYS
-    .filter((k) => merged[k].asColumn || merged[k].locked)
+    .filter((k) => merged[k].locked || !off.has(k))
     .map((k) => ({ key: k, label: merged[k].label, locked: merged[k].locked }));
+}
+
+/**
+ * The keys an operator has turned OFF, as a validated array.
+ *
+ * The complement of what `visibleColumns` takes, because "hidden" is the smaller set
+ * and the one that actually needs remembering: a new key added to the schema arrives
+ * VISIBLE rather than needing an entry to appear. Locked keys are dropped — they
+ * cannot be hidden, so a stored entry for one is stale data rather than a preference.
+ *
+ * Unknown keys survive the call deliberately: an operator may have hidden a key that
+ * the ingest contract no longer defines, and silently rewriting their storage on read
+ * would be a write they did not ask for. `visibleColumns` ignores anything not in
+ * COLUMN_KEYS, so the effect is nil.
+ */
+export function normaliseHidden(hidden) {
+  if (!Array.isArray(hidden)) return [];
+  const locked = new Set(COLUMN_DEFAULTS.filter((c) => c.locked).map((c) => c.key));
+  const out = [];
+  for (const k of hidden) {
+    if (typeof k !== 'string' || locked.has(k)) continue;
+    if (!out.includes(k)) out.push(k);
+  }
+  return out;
+}
+
+/** The default hidden set: every unlocked key that is not `defaultOn`. */
+export function defaultHidden() {
+  return COLUMN_DEFAULTS.filter((c) => !c.locked && !c.defaultOn).map((c) => c.key);
 }
 
 export const ENRICHED_FIELDS = [
@@ -220,13 +262,26 @@ export const ENRICHED_WIRE_KEY = {
  * `toViewEvent` accessor. That is a deliberate limit rather than a bug: adding a
  * column means adding a field to the view shape, not just flipping a flag.
  */
-export function configuredColumns(columns) {
+/**
+ * The enriched columns a table should render, with the CONFIGURED label.
+ *
+ * `hidden` is the operator's LOCAL visibility list (see `normaliseHidden`), not part
+ * of the stored configuration: the label is shared, the visible set is personal.
+ *
+ * Only fields that have a configuration row and are not hidden. These are the fields
+ * with a `toViewEvent` accessor — `EVT_Identifier`, `EVT_Details` and `EVT_URL` are
+ * not view fields, so offering them here would add a column that always reads `—`.
+ * They are still offered in the RENAME list, because an operator-added key does have
+ * a value and a header to name.
+ */
+export function configuredColumns(columns, hidden = []) {
   const merged = mergeColumns(columns);
+  const off = new Set(Array.isArray(hidden) ? hidden : []);
   const out = [];
   for (const f of ENRICHED_FIELDS) {
     const wireKey = ENRICHED_WIRE_KEY[f.key];
     const cfg = wireKey ? merged[wireKey] : null;
-    if (!cfg || !cfg.asColumn) continue;
+    if (!cfg || off.has(wireKey)) continue;
     out.push({ ...f, label: cfg.label });
   }
   return out;

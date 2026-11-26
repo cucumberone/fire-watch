@@ -525,7 +525,30 @@ wss.on('connection', async (ws) => {
       const now = Date.now();
       const since = now - RANGE_MS[range];
       const limit = Math.min(frameIn.limit || 1000, 1000);
-      const rows = [...mockEventLog.values()]
+      // ONE MEMBER PER CONDITION, like the real `idx:event:all`.
+      //
+      // This op used to answer from `mockEventLog`, which is keyed by event ID and so
+      // holds one row per ARRIVAL. The real gateway reads `idx:event:all`, whose
+      // members are record keys — the worker ZADDs the same condition again rather
+      // than adding a second member. The mock therefore disagreed with production in
+      // the most misleading possible way: here every arrival grew the list and the
+      // badge, so a frozen All events badge could never be reproduced locally, while
+      // against the real gateway the badge legitimately stands still when the stream
+      // is repeating conditions.
+      //
+      // Measured on the cluster to settle which was right: 3 repeats of one condition
+      // + 1 new one -> `idx:event:all` = 2, `idx:history` = +4. Per-condition.
+      //
+      // `idx:history` is what enumerates deliveries, and `op: history` already mirrors
+      // it from `mockEventLog`.
+      const byCondition = new Map();
+      for (const e of mockEventLog.values()) {
+        if (!e?.key) continue;
+        const prev = byCondition.get(e.key);
+        // Newest arrival wins, exactly as the fold leaves one hash holding lastSeen.
+        if (!prev || (e.brokerTs ?? 0) >= (prev.brokerTs ?? 0)) byCondition.set(e.key, e);
+      }
+      const rows = [...byCondition.values()]
         .filter((e) => (e.brokerTs ?? 0) > since)
         .sort((a, b) => (b.brokerTs ?? 0) - (a.brokerTs ?? 0));
       const page = rows.slice(0, limit);
@@ -766,6 +789,21 @@ wss.on('connection', async (ws) => {
         severity,
         brokerTs: Date.now(),
         ts: new Date().toISOString(),
+        // A NEW CONDITION every tick, which is what the real stream does.
+        //
+        // `mkEvent` derives both `key` (sha256 of device+summary) and the summary
+        // from the bare index `i`, so the rotating `source` alone only ever reached
+        // 12 distinct keys — 4 sources x 6 summaries, both cycling on the same
+        // period. The record key is the CONDITION, and a `Map` keyed by id kept every
+        // arrival, so All events looked like it was growing forever while the badge
+        // (correctly, in production terms) would not move: every arrival was a REPEAT
+        // of one of 12 conditions. That made the harness unable to show the one thing
+        // it is for — a frozen All events badge.
+        //
+        // Offsetting the summary by `n` gives each tick its own condition, so the
+        // badge, the table and the live tail all move together as they do against the
+        // real gateway (verified: 3 repeats -> total 1, 1 new condition -> total 2).
+        payload: { msg: `live condition #${n}` },
       });
       foldMock(evt, applied);
       retireMock(evt, applied);

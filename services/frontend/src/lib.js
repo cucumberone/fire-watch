@@ -550,7 +550,23 @@ const TIME_KEYS = new Set([
 export function isTimeField(name) {
   if (typeof name !== 'string') return false;
   // Strip separators so `brokerTs`, `broker_ts` and `broker-ts` are one key.
-  return TIME_KEYS.has(name.toLowerCase().replace(/[_.-]/g, ''));
+  const flat = name.toLowerCase().replace(/[_.-]/g, '');
+  if (TIME_KEYS.has(flat)) return true;
+  // A row carries the record's fields TWICE, under two vocabularies: the raw hash
+  // fields (`closedAt`, `ackedAt`) and the view fields the gateway derives from them
+  // (`alertClosedAt`, `alertAckedAt`). The view names are the ones a record actually
+  // shows, because `_row()` maps `closedAt` → `alertClosedAt` in
+  // services/ws-gateway/src/valkey.js.
+  //
+  // Without this the closed timestamp rendered as a raw epoch — `1795722434752` —
+  // while `ackedAt` immediately above it rendered as `2026-11-26 20:47:14
+  // (1795722434752)`. Two timestamps, two formats, one screen.
+  //
+  // Stripping the prefix rather than listing the names keeps the rule in one place: a
+  // future `alertXxxAt` is covered without another entry, and it cannot drift from
+  // the TIME_KEYS set.
+  if (flat.startsWith('alert')) return TIME_KEYS.has(flat.slice('alert'.length));
+  return false;
 }
 
 /**

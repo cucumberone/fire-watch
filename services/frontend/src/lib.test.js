@@ -1565,3 +1565,54 @@ test('dropping id leaves the rest of the inspector untouched', () => {
   // Every other row is byte-identical, in the same order.
   assert.deepEqual(after, before.filter(([k]) => k !== 'id'));
 });
+
+// ------------------------------------------------- inspector: time formatting
+test('alertClosedAt is formatted like ackedAt, not as a raw epoch', () => {
+  // A row carries record fields under two vocabularies: the raw hash names (`closedAt`,
+  // `ackedAt`) and the view names the gateway derives from them (`alertClosedAt`,
+  // `alertAckedAt`, via `_row()` in services/ws-gateway/src/valkey.js). Only the view
+  // names reach the inspector, and `isTimeField` knew the raw ones.
+  //
+  // The visible result was two timestamps on one screen in two formats:
+  //   ackedAt        2026-11-26 20:47:14  (1795722434752)
+  //   alertClosedAt  1795722434752
+  const at = 1795722434752;
+  const entries = recordEntries({ key: 'k', ackedAt: at, alertClosedAt: at }, { formatTimes: true });
+  const value = (n) => entries.find(([k]) => k === n)?.[1];
+  const human = formatClock(at);
+
+  assert.equal(value('alertClosedAt'), `${human}  (${at})`, 'clock plus the raw value');
+  assert.equal(value('ackedAt'), `${human}  (${at})`, 'the two must agree');
+  assert.match(value('alertClosedAt'), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  \(\d+\)$/);
+});
+
+test('only the alert-prefixed TIME fields are reformatted', () => {
+  // The prefix must not turn every `alert*` field into a timestamp: `alertState` and
+  // `alertClosedBy` carry a state string and a stream entry id, and reformatting either
+  // would corrupt it.
+  assert.equal(isTimeField('alertClosedAt'), true);
+  assert.equal(isTimeField('alertAckedAt'), true);
+  assert.equal(isTimeField('alertState'), false);
+  assert.equal(isTimeField('alertClosedBy'), false);
+  // The unprefixed names and the separator variants keep working.
+  assert.equal(isTimeField('closedAt'), true);
+  assert.equal(isTimeField('acked_at'), true);
+  assert.equal(isTimeField('brokerTs'), true);
+  assert.equal(isTimeField('lastId'), false);
+  assert.equal(isTimeField('key'), false);
+});
+
+test('a closed record renders its closedAt humanely while keeping the raw epoch', () => {
+  // What the operator sees on a closed alert's Information panel.
+  const at = 1795722434752;
+  const entries = recordEntries({
+    key: 'c'.repeat(32), source: 'uniq-03', type: 'unique.test', summary: 's',
+    severity: 'CLOSE', displaySeverity: 'CLOSED',
+    lastId: '1795722434893-0', count: 1,
+    alertState: 'closed', alertClosedAt: at, alertClosedBy: '1795722434752-0',
+  });
+  const value = (n) => entries.find(([k]) => k === n)?.[1];
+  assert.match(value('alertClosedAt'), /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  \(1795722434752\)/);
+  assert.equal(value('alertClosedBy'), '1795722434752-0', 'an id is left raw');
+  assert.equal(value('alertState'), 'closed', 'a state string is left raw');
+});

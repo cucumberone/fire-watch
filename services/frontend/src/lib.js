@@ -649,7 +649,38 @@ export function recordEntries(record, { formatTimes = true } = {}) {
     out.push([path, String(value)]);
   };
   walk(record, '');
-  return out;
+  return dropRedundantId(out);
+}
+
+/**
+ * Remove `id` from the inspector when it is a duplicate of `key`.
+ *
+ * They are the same value on every record, because the gateway sets both to the bare
+ * record key (`_row()` in services/ws-gateway/src/valkey.js): one record per
+ * CONDITION has a single address, so `id` and `key` stop being different things.
+ *
+ * It is confusing rather than merely redundant. The reader sees `id` and `key` with
+ * one value and reasonably asks which one is the identity — and the field they might
+ * expect `id` to be is `lastId` (the stream entry id of the newest delivery) or
+ * `eventId` (the producer's message id), both of which ARE distinct and both of which
+ * sit further down the list.
+ *
+ * Display-only on purpose. `id` stays on the wire and in the row object because
+ * `toViewEvent` and `insertAllEvent` fall back to `e?.key ?? e?.id`, and the delete
+ * path carries an id — removing the field itself would be a much larger change for no
+ * reader-visible benefit.
+ *
+ * `id` is kept when there is no `key` at all, which is the one case it still carries
+ * information.
+ *
+ * @param {Array<[string, string]>} entries  the flattened inspector rows
+ */
+function dropRedundantId(entries) {
+  const valueOf = (name) => entries.find(([k]) => k === name)?.[1];
+  const key = valueOf('key');
+  const id = valueOf('id');
+  if (key === undefined || id === undefined || key !== id) return entries;
+  return entries.filter(([k]) => k !== 'id');
 }
 
 /** Epoch ms → locale clock time, or '' when the value is not a usable time. */

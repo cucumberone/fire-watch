@@ -1523,3 +1523,45 @@ test('every column list has a width for each column', () => {
   assert.equal(widths('EVENT_DEFAULT_W').length, cols('EVENT_COLS').length);
   assert.equal(widths('ALL_EVENT_DEFAULT_W').length, cols('ALL_EVENT_COLS').length);
 });
+
+// ------------------------------------------------ inspector: id vs key
+// The gateway sets `id` and `key` to the SAME bare record key (one record per
+// condition has a single address), so showing both invites the reader to work out
+// which is the identity — while the field they probably want, `lastId` (the stream
+// entry id) or `eventId` (the producer id), is further down and genuinely different.
+test('the inspector drops id when it duplicates key', () => {
+  const entries = recordEntries({
+    id: 'a'.repeat(32), key: 'a'.repeat(32),
+    source: 'core-sw-07', lastId: '1795722434893-0', eventId: 'evt-1',
+  });
+  const names = entries.map(([k]) => k);
+  assert.ok(!names.includes('id'), 'the duplicate id is not rendered');
+  assert.ok(names.includes('key'), 'key is still the identity shown');
+  // The genuinely distinct ids survive.
+  assert.equal(entries.find(([k]) => k === 'lastId')[1], '1795722434893-0');
+  assert.equal(entries.find(([k]) => k === 'eventId')[1], 'evt-1');
+});
+
+test('the inspector keeps id when it is not a duplicate of key', () => {
+  // A record without a `key` still has to show its id, or it loses its only
+  // identifier. This is also what keeps the drop rule from being a blanket removal.
+  const entries = recordEntries({ id: 'some-id', source: 'x' });
+  assert.equal(entries.find(([k]) => k === 'id')?.[1], 'some-id');
+
+  // Different values: both are shown, because then they really are two facts.
+  const both = recordEntries({ id: 'one', key: 'two' });
+  assert.deepEqual(both.map(([k]) => k), ['id', 'key']);
+});
+
+test('dropping id leaves the rest of the inspector untouched', () => {
+  const record = {
+    id: 'k'.repeat(32), key: 'k'.repeat(32), source: 'dev',
+    payload: { msg: 'hello', EVT_Agent: 'curl' },
+    count: 3, alertState: 'open',
+  };
+  const before = recordEntries({ ...record, id: 'different' });
+  const after = recordEntries(record);
+  assert.equal(after.length, before.length - 1, 'exactly one row fewer');
+  // Every other row is byte-identical, in the same order.
+  assert.deepEqual(after, before.filter(([k]) => k !== 'id'));
+});

@@ -59,5 +59,22 @@ spec:
       containers:
         - name: bridge
           env:
-            - name: SENTINELS
-              value: "sentinel-0.sentinel-headless.$(POD_NAMESPACE):26379"
+            # Deliberately the SHORT name, like the three above it.
+            #
+            # It was `sentinel-0.sentinel-headless.$(POD_NAMESPACE):26379`, copied
+            # from the base. That is wrong HERE for a reason specific to a patch:
+            # this is a strategic merge, so the entry lands wherever it lands —
+            # measured on the cluster, SENTINELS at index 1 and POD_NAMESPACE at
+            # index 7. Kubernetes expands `$(VAR)` only from variables declared
+            # EARLIER in the list, so the reference became an empty string and the
+            # bridge dialled `sentinel-0.sentinel-headless.:26379`. The only
+            # symptom was `sentinel unavailable; leaving cluster untouched` every
+            # 5 s, which reads as a Sentinel outage and sent me looking at the
+            # Sentinel.
+            #
+            # The base keeps the interpolation because prod's manifest must not
+            # name a namespace. In the lab the namespace is already fixed by
+            # common/kustomization.yaml, and the cluster search domains resolve the
+            # short name from any pod in it — which is exactly what http-ingress,
+            # worker and ws-gateway already rely on.
+            - { name: SENTINELS, value: "sentinel-0.sentinel-headless:26379" }

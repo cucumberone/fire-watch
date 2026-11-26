@@ -92,7 +92,7 @@ const FRAME_BUDGET_PER_SEC = 8;
 
 // Column labels, defined once so the header, the colgroup and the resize state
 // cannot drift out of order. Order is documented in docs/frontend.md §4.3.
-const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack', 'Key'];
+const ALERT_COLS = ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack'];
 
 // The enriched columns are fixed-width labels, so only the leading four are
 // user-resizable; ENRICHED_FIELDS is appended after them.
@@ -149,7 +149,7 @@ const HISTORY_PAGE_DEFAULT = 50;
  * the pane when the columns are narrower than it, and overflows (scrolls) when
  * they are wider. Without the spacer, `width: 100%` redistributes again.
  */
-const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88, 240];
+const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88];
 const EVENT_DEFAULT_W = [96, 84, 172, 172, 340];
 const ALL_EVENT_DEFAULT_W = [96, 84, 172, 172, 64, 340];
 
@@ -2215,8 +2215,12 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
     >
       <td><Badge severity={alert.severity} label={label} /></td>
       {/* Order follows the live table: severity, first, last, count, summary.
-          Key is last: it is a stable identifier, read once when you need it,
-          not scanned down the column on every glance. */}
+          NO Key column. The key is a 32-hex hash of the condition — an opaque
+          address, not something an operator reads down a column. It was last,
+          and it was still the widest cell in the pane for a value nobody scans;
+          every action that needs it (close, ack, journal, the inspector) already
+          holds it on the row, and All events / the inspector still show it for
+          anyone who does want it. */}
       <td className="mono">{formatClock(alert.firstSeen)}</td>
       <td className="mono">{formatClock(alert.lastSeen)}</td>
       <td className="num">{alert.count}</td>
@@ -2226,7 +2230,6 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu }) {
           ? <span className="acked-tag" title={`${ack.by} at ${formatClock(ack.at)}`}>acked · {ack.by}</span>
           : <span className="dim">—</span>}
       </td>
-      <td className="mono nowrap">{alert.key}</td>
       {/* Spacer cell, matching the spacer column in the header. */}
       <td />
     </tr>

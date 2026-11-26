@@ -205,13 +205,24 @@ Both tables lead with identity and status, then time, then volume, then the huma
 | **Count** | *(removed — always 1)* |
 | Summary | Summary |
 | Ack | CIF, Alarm ID key, Alarm owner, Auto close, Support group |
-| **Key** | |
 
 The Count column exists only on the alert table, where it is the fold's occurrence
 rollup. The event tables had one too, carrying a per-message `Count` field that no
 producer sends; it was a constant `1` and has been removed (§5.6).
 
-`Key` is deliberately **last** in the alert table. It is a stable identifier you read once when you need it, not something scanned down the column on every glance — putting it first pushed the signal (severity, recency, count) off to the right. Ack sits immediately before it because both are "about this specific row" rather than about the condition.
+**The alert table has no Key column.** It used to be last, on the reasoning that a
+stable identifier is read once rather than scanned — but that argued for moving it,
+not for keeping it. The value is an opaque 32-hex hash of the condition: an address,
+not information. It was also the widest single cell in the pane, spent on something
+nobody reads, while the columns that carry the signal (severity, recency, count,
+summary) were squeezed.
+
+Nothing is lost: the key is still the row's identity, every action that needs it
+(close, ack, journal) already holds it, and the **inspector** still shows it as its
+first field. All events and the live tail show their keys in the enriched columns.
+`lib.test.js` asserts that the header list, the row's `<td>` count and the width
+array stay in step, because a half-edit here shifts every cell under the wrong
+heading.
 
 With ten columns the live table is horizontally tight, so:
 

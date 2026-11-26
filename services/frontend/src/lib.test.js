@@ -1476,3 +1476,50 @@ test('the payload copy wins over the record field when both exist', () => {
   });
   assert.equal(v.eventKey, 'from-payload');
 });
+
+test('Open alerts has no Key column, and every table stays column/cell aligned', () => {
+  // The Key column was removed from Open alerts: it is an opaque 32-hex hash of the
+  // condition, not a value an operator scans down a column, and it was the widest cell
+  // in the pane. Everything that needs it (close, ack, journal, the inspector) already
+  // holds it on the row.
+  //
+  // The real risk in a change like this is a half-edit: dropping the header label but
+  // leaving the <td>, which shifts every cell one column left under the wrong heading.
+  // So this pins BOTH lists against the cells their row component renders.
+  const colList = (name) => {
+    const m = appSrc.match(new RegExp(`const ${name} = \\[([^\\]]+)\\]`));
+    assert.ok(m, `${name} should still be defined`);
+    return m[1].split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter(Boolean);
+  };
+
+  const alertCols = colList('ALERT_COLS');
+  assert.ok(!alertCols.includes('Key'), 'Key must be gone from Open alerts');
+  assert.deepEqual(alertCols, ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack']);
+
+  const alertRow = appSrc.slice(appSrc.indexOf('function AlertRow'), appSrc.indexOf('function EventRow'));
+  // Severity is a Badge, then 4 formatted/numbered/scalar cells, the ack cell and the
+  // trailing spacer. Count the <td>s the row renders.
+  const alertTds = (alertRow.match(/<td[\s>]/g) ?? []).length;
+  assert.equal(alertTds, alertCols.length + 1, 'one <td> per header label, plus the spacer');
+  assert.ok(!/alert\.key/.test(alertRow), 'the alert row must not render alert.key any more');
+
+  // The other two tables keep their Key-free lists and their own widths.
+  assert.deepEqual(colList('EVENT_COLS'), ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Summary']);
+  assert.deepEqual(colList('ALL_EVENT_COLS'), ['Severity', 'State', 'First occurrence', 'Last occurrence', 'Count', 'Summary']);
+});
+
+test('every column list has a width for each column', () => {
+  // The widths are positional: a shorter list than the columns silently leaves the
+  // trailing columns at the minimum, which is how a "removed" column leaves a gap.
+  const widths = (name) => {
+    const m = appSrc.match(new RegExp(`const ${name} = \\[([^\\]]+)\\]`));
+    return m[1].split(',').map((s) => s.trim()).filter(Boolean);
+  };
+  const cols = (name) => {
+    const m = appSrc.match(new RegExp(`const ${name} = \\[([^\\]]+)\\]`));
+    return m[1].split(',').map((s) => s.trim()).filter(Boolean);
+  };
+  assert.equal(widths('ALERT_DEFAULT_W').length, cols('ALERT_COLS').length);
+  assert.equal(widths('EVENT_DEFAULT_W').length, cols('EVENT_COLS').length);
+  assert.equal(widths('ALL_EVENT_DEFAULT_W').length, cols('ALL_EVENT_COLS').length);
+});

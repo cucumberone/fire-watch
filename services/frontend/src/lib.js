@@ -235,6 +235,18 @@ export const ENRICHED_FIELDS = [
   { key: 'agentOwner', label: 'Agent owner', wire: ['EVT_AgentOwner', 'agentOwner'] },
   { key: 'eventKey', label: 'Event key', wire: ['EVT_EventKey', 'eventKey'] },
   { key: 'environment', label: 'Environment', wire: ['EVT_Environment', 'environment'] },
+  // These three were missing, so the column picker offered Identifier, Details and
+  // URL and ticking one changed nothing — `configuredColumns` walks this list, and a
+  // key with no entry has no cell to render. `toViewEvent` sets all three, so only
+  // the accessor was absent.
+  //
+  // `identifier` is the producer's `EVT_Identifier` (never the generated fallback,
+  // which would be noise in a column), `url` is the deep link, and `details` is the
+  // long body — the same string `msgCompleteString` carries, under the name an
+  // operator is mapping.
+  { key: 'identifier', label: 'Identifier', wire: ['EVT_Identifier', 'identifier'] },
+  { key: 'details', label: 'Details', wire: ['EVT_Details', 'details'] },
+  { key: 'url', label: 'URL', wire: ['EVT_URL', 'url'] },
 ];
 
 /**
@@ -251,7 +263,18 @@ export const ENRICHED_WIRE_KEY = {
   agentOwner: 'EVT_AgentOwner',
   eventKey: 'EVT_EventKey',
   environment: 'EVT_Environment',
+  identifier: 'EVT_Identifier',
+  details: 'EVT_Details',
+  url: 'EVT_URL',
 };
+
+// Columns whose value has no natural length bound. Details is the whole body and a
+// URL can be anything, so as a `nowrap` cell either would set the width of the
+// entire table. The table clamps these and keeps the full value in a tooltip.
+export const CLAMPED_COLUMNS = new Set(['details', 'url']);
+export function isClampedColumn(key) {
+  return CLAMPED_COLUMNS.has(key);
+}
 
 /**
  * The enriched columns a table should render, with the CONFIGURED label.
@@ -268,11 +291,9 @@ export const ENRICHED_WIRE_KEY = {
  * `hidden` is the operator's LOCAL visibility list (see `normaliseHidden`), not part
  * of the stored configuration: the label is shared, the visible set is personal.
  *
- * Only fields that have a configuration row and are not hidden. These are the fields
- * with a `toViewEvent` accessor — `EVT_Identifier`, `EVT_Details` and `EVT_URL` are
- * not view fields, so offering them here would add a column that always reads `—`.
- * They are still offered in the RENAME list, because an operator-added key does have
- * a value and a header to name.
+ * Only fields that have a configuration row and are not hidden. Every entry in
+ * ENRICHED_FIELDS has a `toViewEvent` accessor, so anything offered here can actually
+ * render — the list and the picker cannot drift apart.
  */
 export function configuredColumns(columns, hidden = []) {
   const merged = mergeColumns(columns);
@@ -555,8 +576,13 @@ export function toViewEvent(evt) {
   view.displaySeverity = asText(firstPresent(payload, ['EVT_Severity'])) || view.severity;
 
   for (const field of ENRICHED_FIELDS) {
-    view[field.key] = asText(firstPresent(payload, field.wire));
+    view[field.key] = asPayloadText(firstPresent(payload, field.wire));
   }
+  // `details` is the same string as `msgCompleteString`, which has already been
+  // through the compressed-field guard. Reusing it keeps ONE decode path: a second
+  // reading of `payload.msgc` here would render `[object Object]` on the paths that
+  // had not decompressed yet.
+  view.details = view.msgCompleteString;
 
   // The event key also lives on the RECORD as `type`, and a close has to fall back
   // to it.

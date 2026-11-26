@@ -61,10 +61,30 @@ const TYPES = ['link.down', 'power.fault', 'telemetry.temperature', 'disk.smart'
 // The upstream payload fields a real producer sends; the mock must populate them
 // or the enriched columns would be empty in every screenshot.
 const ENRICH = [
-  { EVT_Agent: 'Prometheus', EVT_AgentOwner: 'AM-000042', EVT_Device: 'core-sw-07', EVT_EventKey: 'net.link.down', EVT_Environment: 'production' },
-  { EVT_Agent: 'Zabbix', EVT_AgentOwner: 'AM-000117', EVT_Device: 'db-node-03', EVT_EventKey: 'hw.psu.voltage', EVT_Environment: 'production' },
-  { EVT_Agent: 'SNMP', EVT_AgentOwner: 'AM-000208', EVT_Device: 'sensor-rack-a', EVT_EventKey: 'env.temperature', EVT_Environment: 'stage' },
-  { EVT_Agent: 'SMARTd', EVT_AgentOwner: 'AM-000315', EVT_Device: 'edge-gw-02', EVT_EventKey: 'disk.predictive', EVT_Environment: 'development' },
+  {
+    EVT_Agent: 'Prometheus', EVT_AgentOwner: 'AM-000042', EVT_Device: 'core-sw-07',
+    EVT_EventKey: 'net.link.down', EVT_Environment: 'production',
+    EVT_Identifier: 'sw07/gi0/12', EVT_URL: 'https://grafana.invalid/d/net/gi0-12',
+    EVT_Details: 'uplink carrier lost after 3 retries; last flush 12s ago',
+  },
+  {
+    EVT_Agent: 'Zabbix', EVT_AgentOwner: 'AM-000117', EVT_Device: 'db-node-03',
+    EVT_EventKey: 'hw.psu.voltage', EVT_Environment: 'production',
+    EVT_Identifier: 'db03/psu-b', EVT_URL: 'https://zabbix.invalid/triggers/8814',
+    EVT_Details: 'PSU-B rail sagged to 11.4V under load; redundancy is now lost',
+  },
+  {
+    EVT_Agent: 'SNMP', EVT_AgentOwner: 'AM-000208', EVT_Device: 'sensor-rack-a',
+    EVT_EventKey: 'env.temperature', EVT_Environment: 'stage',
+    EVT_Identifier: 'rack-a/inlet-2', EVT_URL: 'https://grafana.invalid/d/rack-a',
+    EVT_Details: 'inlet temperature 41C, above the 38C staging threshold',
+  },
+  {
+    EVT_Agent: 'SMARTd', EVT_AgentOwner: 'AM-000315', EVT_Device: 'edge-gw-02',
+    EVT_EventKey: 'disk.predictive', EVT_Environment: 'development',
+    EVT_Identifier: 'gw02/disk0', EVT_URL: 'https://wiki.invalid/runbooks/smart',
+    EVT_Details: 'reallocated sector count climbed from 8 to 31 in 24h',
+  },
 ];
 
 function mkEvent(i, overrides = {}) {
@@ -287,6 +307,8 @@ for (let i = 0; i < 14; i += 1) logMockEvent(mkEvent(i));
           msg: seed.type + ' cleared on ' + seed.src,
           EVT_Device: seed.src, EVT_EventKey: seed.type, EVT_Agent: seed.agent,
           EVT_AgentOwner: 'AM-000100', EVT_Environment: 'production',
+          EVT_Identifier: seed.src + '/' + seed.type,
+          EVT_Details: seed.type + ' cleared on ' + seed.src,
         },
       },
     });

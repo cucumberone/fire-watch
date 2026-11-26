@@ -24,8 +24,10 @@ import {
   recordEntries,
   formatClock,
   ENRICHED_FIELDS,
+  ENRICHED_WIRE_KEY,
   COLUMN_DEFAULTS,
   COLUMN_KEYS,
+  configuredColumns,
   mergeColumns,
   visibleColumns,
   normaliseHidden,
@@ -610,11 +612,18 @@ test('ENRICHED_FIELDS covers exactly the fields the inspector relies on', () => 
       EVT_AgentOwner: 'o',
       EVT_EventKey: 'k',
       EVT_Environment: 'e',
+      EVT_Identifier: 'i',
+      EVT_Details: 'x',
+      EVT_URL: 'u',
     },
   });
   for (const f of ENRICHED_FIELDS) {
     assert.ok(f.key in view, `${f.key} is mapped`);
-    assert.ok(f.wire.includes(`EVT_${f.key[0].toUpperCase()}${f.key.slice(1)}`),
+    // The wire spelling is not derivable from the view name: `url` maps to `EVT_URL`,
+    // not `EVT_Url`, and `details` to `EVT_Details` which the ingress stores as
+    // `msgc`. So the mapping is asserted against ENRICHED_WIRE_KEY, the one place
+    // that states it.
+    assert.ok(f.wire.includes(ENRICHED_WIRE_KEY[f.key]),
       `${f.key} lists the EVT_ wire spelling`);
   }
 });
@@ -1529,12 +1538,27 @@ test('Open alerts has no Key column, and every table stays column/cell aligned',
   assert.deepEqual(alertCols, ['Severity', 'First occurrence', 'Last occurrence', 'Count', 'Summary', 'Ack']);
 
   const alertRow = appSrc.slice(appSrc.indexOf('function AlertRow'), appSrc.indexOf('function EventRow'));
-  // Severity is a Badge, then 4 formatted/numbered/scalar cells, the ack cell, the
-  // configured enriched columns (a `cols.map` cell) and the trailing spacer.
-  const alertTds = (alertRow.match(/<td[\s>]/g) ?? []).length;
-  assert.equal(alertTds, alertCols.length + 2,
-    'one <td> per header label, one for the cols.map cell, plus the spacer');
-  assert.match(alertRow, /cols\.map\(\(f\) => \(/, 'the alert row renders the configured columns');
+  // The mapped cells are counted as one logical cell, not by counting `<td`. A cell
+  // whose column is clamped (Details, URL) is written as a ternary with a `<td>` in
+  // each branch, so a raw `<td` count reports two cells for one column. Strip the
+  // map block, count the fixed cells, then assert the map itself renders one cell.
+  const mapStart = alertRow.indexOf('{cols.map(');
+  assert.ok(mapStart > -1, 'the alert row renders the configured columns');
+  const mapEnd = alertRow.indexOf('))}', mapStart);
+  assert.ok(mapEnd > mapStart, 'the cols.map block is closed');
+  const mappedBlock = alertRow.slice(mapStart, mapEnd);
+  const fixedCellCount = (alertRow.slice(0, mapStart) + alertRow.slice(mapEnd))
+    .match(/<td[\s>]/g)?.length ?? 0;
+  assert.equal(fixedCellCount, alertCols.length + 1,
+    'one <td> per fixed header label, plus the trailing spacer');
+  // Regardless of clamping branches, every iteration emits exactly one cell.
+  const branches = (mappedBlock.match(/<td[\s>]/g) ?? []).length;
+  assert.ok(branches === 1 || branches === 2,
+    `the mapped cell must render one <td> per row, found ${branches} in source`);
+  if (branches === 2) {
+    assert.match(mappedBlock, /\?\s*<td[\s\S]*?:\s*<td/,
+      'a two-branch cell must be a ternary, so only one branch renders');
+  }
   assert.ok(!/alert\.key/.test(alertRow), 'the alert row must not render alert.key any more');
 
   // The other two tables keep their Key-free lists and their own widths.
@@ -1702,10 +1726,15 @@ test('Open alerts renders the configured columns, not just the fixed ones', () =
     appSrc.indexOf("name=\"Open alerts\""),
     appSrc.indexOf("name=\"Live events\""),
   );
-  assert.match(alertsTable, /eventColumns\.map\(\(f\) => <th key=\{f\.key\}>\{f\.label\}<\/th>\)/,
+  assert.match(alertsTable, /eventColumns\.map\(\(f, i\) => \(/,
     'the alert header must render the configured columns');
-  assert.match(alertsTable, /eventColumns\.map\(\(f\) => <col key=\{f\.key\} \/>\)/,
-    'and a col for each, so the header and body stay aligned');
+  assert.match(alertsTable, /\{f\.label\}/, 'and label them');
+  // The col must carry a WIDTH. A bare `<col>` gets none under
+  // `table-layout: fixed`, so the column rendered 0px wide — the checkbox in
+  // "Choose columns" did add a column, invisible, and the report was "I can not
+  // see Identifier". Width and header are asserted together for that reason.
+  assert.match(alertsTable, /<col key=\{f\.key\} style=\{\{ width: `\$\{alertEnrichedWidthOf\(i\)\}px` \}\} \/>/,
+    'and a WIDTHED col for each, so the column is visible and aligned');
   assert.match(alertsTable, /cols=\{eventColumns\}/, 'the row must be told which columns to render');
 
   // The values come off `alert.event`, because the rollup only carries
@@ -1714,4 +1743,121 @@ test('Open alerts renders the configured columns, not just the fixed ones', () =
   const alertRow = appSrc.slice(appSrc.indexOf('function AlertRow'), appSrc.indexOf('function EventRow'));
   assert.match(alertRow, /const source = alert\.event \?\? alert;/);
   assert.match(alertRow, /\{source\[f\.key\] \|\| '—'\}/);
+});
+
+// ------------------------------------------------- optional enriched columns
+test('Identifier, Details and URL are real view fields, not phantom columns', () => {
+  // The column picker offers all ten keys, but `configuredColumns` walks
+  // ENRICHED_FIELDS — and these three had no entry. Ticking Identifier therefore
+  // added a header and no cell, which is what "I can not see Identifier" was.
+  const v = toViewEvent({
+    key: 'k', source: 'uniq-03', type: 'unique.test', summary: 'cond 3',
+    payload: {
+      msg: 'cond 3',
+      // The ingress maps EVT_Details -> payload.msgc, so this is the real shape.
+      msgc: 'the long body',
+      EVT_Device: 'uniq-03', EVT_Agent: 'seed', EVT_AgentOwner: 'lab',
+      EVT_EventKey: 'unique.test', EVT_Environment: 'production',
+      EVT_Identifier: 'uniq-id-3', EVT_URL: 'https://example.invalid/3',
+    },
+  });
+  assert.equal(v.identifier, 'uniq-id-3');
+  assert.equal(v.url, 'https://example.invalid/3');
+  assert.equal(v.details, 'the long body', 'the decoded long body');
+  assert.equal(v.details, v.msgCompleteString, 'one decode path, two names');
+});
+
+test('every offered column can actually render', () => {
+  // The guard against this class of bug: the picker lists COLUMN_DEFAULTS and the
+  // table renders configuredColumns. If a key is in the first and not the second, its
+  // checkbox is a lie.
+  const renderable = new Set(configuredColumns({}, []).map((c) => c.key));
+  const wire = new Set(Object.values(ENRICHED_WIRE_KEY));
+  for (const c of COLUMN_DEFAULTS) {
+    if (c.locked) continue;                     // Severity/Summary are drawn by the table
+    assert.ok(wire.has(c.key), `${c.key} is offered by the picker but has no view field`);
+  }
+  // And every renderable one is offered, so nothing can be rendered that cannot be hidden.
+  for (const k of wire) {
+    assert.ok(COLUMN_KEYS.includes(k), `${k} renders but is not offered`);
+  }
+  assert.equal(renderable.size, COLUMN_DEFAULTS.length - 2);
+});
+
+test('a compressed Details field renders as text, never [object Object]', () => {
+  // EVT_Details arrives as `{__gz: base64}` when it is long. Reading payload.msgc a
+  // second time here would defeat the guard that the summary path already applies.
+  const v = toViewEvent({
+    key: 'k',
+    payload: { msg: 'x', msgc: { __gz: 'H4sIAAAAAAAAA' }, EVT_Details: 'ignored' },
+  });
+  assert.equal(v.details, '', 'an undecoded compressed field yields text, not an object');
+  assert.doesNotMatch(v.details, /object/i);
+});
+
+test('EventRow renders exactly one cell per configured column, clamped or not', () => {
+  // Same half-edit risk as the alert row, on the two event tables. They are not
+  // pinned by ALERT_COLS, so the cell count is derived from the row source: the
+  // fixed cells before the map must match EVENT_COLS, and the map must emit one
+  // cell per iteration whichever branch a clamped column takes.
+  const start = appSrc.indexOf('function EventRow');
+  assert.ok(start > -1, 'EventRow still exists');
+  const end = appSrc.indexOf('\nfunction ', start + 10);
+  const row = appSrc.slice(start, end > -1 ? end : undefined);
+
+  const mapStart = row.indexOf('{cols.map(');
+  assert.ok(mapStart > -1, 'EventRow renders the configured columns');
+  const mapped = row.slice(mapStart, row.indexOf('))}', mapStart));
+
+  const fixed = (row.slice(0, mapStart).match(/<td[\s>]/g) ?? []).length;
+  // Severity, First occurrence, Last occurrence, Summary, then either State+Count
+  // (all events) or State (open) — resolved at runtime by `evt.state` presence, so
+  // at most 6 fixed cells. Exactly one of the two lists must match.
+  assert.ok(fixed === 5 || fixed === 6,
+    `EventRow fixed cells should be 5 or 6, found ${fixed}`);
+
+  const branches = (mapped.match(/<td[\s>]/g) ?? []).length;
+  assert.ok(branches === 1 || branches === 2,
+    `the mapped cell must render one <td> per row, found ${branches} in source`);
+  if (branches === 2) {
+    assert.match(mapped, /\?\s*<td[\s\S]*?:\s*<td/,
+      'a two-branch cell must be a ternary, so only one branch renders');
+    assert.match(mapped, /isClampedColumn\(/, 'the second branch is the clamp');
+  }
+  assert.equal((row.match(/<td \/>/g) ?? []).length, 1, 'exactly one spacer cell');
+});
+
+test('no rendered column is left without a width', () => {
+  // The bug this pins: `eventColumns` emitted a bare `<col />`, which in a
+  // `table-layout: fixed` table is allotted ZERO width once the fixed columns
+  // already exceed the pane. The column existed, the checkbox worked, and nothing
+  // was visible. Every <col> in the file must therefore carry a width, and the
+  // spacer — which is *supposed* to be widthless, so it absorbs the leftover — is
+  // the one exception.
+  const bare = [...appSrc.matchAll(/<col\b[^>]*\/>/g)].map((m) => m[0]);
+  assert.ok(bare.length >= 4, `expected several <col> elements, found ${bare.length}`);
+  for (const col of bare) {
+    const isSpacer = col === '<col />';
+    const hasWidth = /style=\{\{\s*width:/.test(col);
+    assert.ok(hasWidth || isSpacer,
+      `this column would render 0px wide: ${col.trim()}`);
+  }
+});
+
+test('the enriched width hooks are declared after the column list they read', () => {
+  // Shipped broken once: the width hooks were placed above `eventColumns`, so the
+  // first render died with "Cannot access 'Gt' before initialization" — a bundled
+  // TDZ error, invisible to every test here because none of them evaluate the
+  // component. Order is the invariant, so order is what gets asserted.
+  const colListAt = appSrc.indexOf('const eventColumns = useMemo(');
+  const namesAt = appSrc.indexOf('const enrichedColNames = useMemo(');
+  assert.ok(colListAt > -1 && namesAt > -1, 'both declarations exist');
+  assert.ok(namesAt > colListAt,
+    'enrichedColNames must be declared after eventColumns');
+
+  for (const table of ['alerts', 'events', 'all']) {
+    const hookAt = appSrc.indexOf(`useColumnWidths('${table}-enriched'`);
+    assert.ok(hookAt > namesAt,
+      `the ${table} enriched width hook must come after enrichedColNames`);
+  }
 });

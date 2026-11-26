@@ -296,6 +296,9 @@ tr.retirement td:first-child { opacity:1; }
 
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.8rem; }
 .nowrap { white-space:nowrap; }
+/* Details is a whole body and a URL is unbounded: as nowrap cells they would set
+   the width of the table. Clamp instead, full value in the title attribute. */
+.clipped { max-width:24rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dim { color:var(--dim); }
 .num { text-align:right; font-variant-numeric: tabular-nums; }
 .sev { display:inline-block; padding:.1rem .4rem; border-radius:.25rem; font-size:.7rem;

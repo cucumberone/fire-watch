@@ -40,6 +40,7 @@ import {
   formatClock,
   ENRICHED_FIELDS,
   configuredColumns,
+  isClampedColumn,
   SEVERITY_RANK,
   isUnsupportedOpError,
   filterEvents,
@@ -154,6 +155,31 @@ const HISTORY_PAGE_DEFAULT = 50;
  * they are wider. Without the spacer, `width: 100%` redistributes again.
  */
 const ALERT_DEFAULT_W = [96, 172, 172, 64, 340, 88];
+
+/**
+ * Default widths for the configurable enriched columns, keyed by WIRE KEY.
+ *
+ * These used to be omitted, on the theory that their width would come from the
+ * header label. It does not: the tables are `table-layout: fixed`, and the six
+ * fixed columns already total 932px inside a pane that is often narrower. Every
+ * remaining column is therefore allotted zero width and both the header and the
+ * cells render collapsed — the checkbox in "Choose columns" appeared to do
+ * nothing, because it did add a column, 0px wide. A column must carry a width
+ * like any other, and be draggable like any other.
+ *
+ * Keyed by wire key, not by position: the visible set changes as columns are
+ * hidden, so an index would put a saved width on the wrong column.
+ */
+const ENRICHED_DEFAULT_W = {
+  eventKey: 180,
+  device: 140,
+  agent: 120,
+  agentOwner: 140,
+  environment: 130,
+  identifier: 170,
+  details: 340,
+  url: 260,
+};
 const EVENT_DEFAULT_W = [96, 84, 172, 172, 340];
 const ALL_EVENT_DEFAULT_W = [96, 84, 172, 172, 64, 340];
 
@@ -624,8 +650,17 @@ function useColumnWidths(table, cols, defaults) {
   // Effective width for a column: the operator's value, else the default. Keyed by
   // LABEL, so adding or removing a column cannot shift a saved width onto its
   // neighbour.
+  //
+  // `defaults` may be an ARRAY indexed by position (the fixed columns, whose order
+  // never changes) or an OBJECT keyed by column name (the enriched columns, whose
+  // visible set changes as they are hidden). A positional default cannot serve the
+  // second case.
   const widthOf = useCallback(
-    (index) => Math.max(MIN_COL_WIDTH, overrides[cols[index]] ?? defaults[index] ?? MIN_COL_WIDTH),
+    (index) => {
+      const name = cols[index];
+      const fallback = Array.isArray(defaults) ? defaults[index] : defaults[name];
+      return Math.max(MIN_COL_WIDTH, overrides[name] ?? fallback ?? MIN_COL_WIDTH);
+    },
     [overrides, cols, defaults],
   );
 
@@ -2377,7 +2412,11 @@ function AlertRow({ alert, ack, selected, onSelect, onContextMenu, cols = [] }) 
           under Data to columns changed nothing here — the alert row simply had no
           such column. */}
       {cols.map((f) => (
-        <td key={f.key} className="mono dim nowrap">{source[f.key] || '—'}</td>
+        isClampedColumn(f.key)
+          ? <td key={f.key} className="mono dim clipped" title={source[f.key] || undefined}>
+              {source[f.key] || '—'}
+            </td>
+          : <td key={f.key} className="mono dim nowrap">{source[f.key] || '—'}</td>
       ))}
       {/* Spacer cell, matching the spacer column in the header. */}
       <td />
@@ -2445,7 +2484,11 @@ function EventRow({ evt, selected, onSelect, onContextMenu, showCount = false, c
         {summary || <span className="dim">—</span>}
       </td>
       {cols.map((f) => (
-        <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
+        isClampedColumn(f.key)
+          ? <td key={f.key} className="mono dim clipped" title={evt[f.key] || undefined}>
+              {evt[f.key] || '—'}
+            </td>
+          : <td key={f.key} className="mono dim nowrap">{evt[f.key] || '—'}</td>
       ))}
       {/* Spacer cell, matching the spacer column in the header. */}
       <td />
@@ -3297,6 +3340,27 @@ function App() {
     [columns, hiddenColumns],
   );
 
+  // The configurable enriched columns are sized per table like everything else.
+  // Declared HERE, after `eventColumns`: the width hooks index into this list, and
+  // reading `eventColumns` before its `const` has initialised is a TDZ error at
+  // render time ("Cannot access 'x' before initialization").
+  const enrichedColNames = useMemo(
+    () => eventColumns.map((f) => f.key),
+    [eventColumns],
+  );
+  const {
+    widthOf: alertEnrichedWidthOf,
+    beginResize: beginAlertEnrichedResize,
+  } = useColumnWidths('alerts-enriched', enrichedColNames, ENRICHED_DEFAULT_W);
+  const {
+    widthOf: eventEnrichedWidthOf,
+    beginResize: beginEventEnrichedResize,
+  } = useColumnWidths('events-enriched', enrichedColNames, ENRICHED_DEFAULT_W);
+  const {
+    widthOf: allEnrichedWidthOf,
+    beginResize: beginAllEnrichedResize,
+  } = useColumnWidths('all-enriched', enrichedColNames, ENRICHED_DEFAULT_W);
+
   const sortedAlerts = useMemo(
     () => [...alerts.values()].sort(
       (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
@@ -3537,9 +3601,12 @@ function App() {
                   ))}
                   {/* The configured enriched columns, after the fixed ones — the
                       same order the event tables use, so the three tables read
-                      alike. Unstyled cols: their width comes from the header
-                      content, which is a short label. */}
-                  {eventColumns.map((f) => <col key={f.key} />)}
+                      alike. They carry a width like every other column: a bare
+                      <col> gets none in a fixed layout, so the column collapsed
+                      to 0px and the checkbox appeared to do nothing. */}
+                  {eventColumns.map((f, i) => (
+                    <col key={f.key} style={{ width: `${alertEnrichedWidthOf(i)}px` }} />
+                  ))}
                   {/* Spacer: absorbs leftover width so the table still fills the
                       pane, instead of stretching the real columns. */}
                   <col />
@@ -3557,7 +3624,16 @@ function App() {
                       {label}
                     </ResizableTh>
                   ))}
-                  {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
+                  {eventColumns.map((f, i) => (
+                    <ResizableTh
+                      key={f.key}
+                      index={i}
+                      width={alertEnrichedWidthOf(i)}
+                      onBegin={beginAlertEnrichedResize}
+                    >
+                      {f.label}
+                    </ResizableTh>
+                  ))}
                   {/* Spacer header, aligned with the spacer col. */}
                   <th />
                 </>
@@ -3666,8 +3742,8 @@ function App() {
                     {EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${eventWidthOf(i)}px` }} />
                     ))}
-                    {eventColumns.map((f) => (
-                      <col key={f.key} />
+                    {eventColumns.map((f, i) => (
+                      <col key={f.key} style={{ width: `${eventEnrichedWidthOf(i)}px` }} />
                     ))}
                     {/* Spacer, same reasoning as the alert table. */}
                     <col />
@@ -3685,7 +3761,16 @@ function App() {
                         {label}
                       </ResizableTh>
                     ))}
-                    {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
+                    {eventColumns.map((f, i) => (
+                      <ResizableTh
+                        key={f.key}
+                        index={i}
+                        width={eventEnrichedWidthOf(i)}
+                        onBegin={beginEventEnrichedResize}
+                      >
+                        {f.label}
+                      </ResizableTh>
+                    ))}
                     {/* Spacer header, aligned with the spacer col. */}
                     <th />
                   </>
@@ -3869,7 +3954,9 @@ function App() {
                     {ALL_EVENT_COLS.map((c, i) => (
                       <col key={c} style={{ width: `${allWidthOf(i)}px` }} />
                     ))}
-                    {eventColumns.map((f) => <col key={f.key} />)}
+                    {eventColumns.map((f, i) => (
+                      <col key={f.key} style={{ width: `${allEnrichedWidthOf(i)}px` }} />
+                    ))}
                     <col />
                   </>
                 )}
@@ -3885,7 +3972,16 @@ function App() {
                         {label}
                       </ResizableTh>
                     ))}
-                    {eventColumns.map((f) => <th key={f.key}>{f.label}</th>)}
+                    {eventColumns.map((f, i) => (
+                      <ResizableTh
+                        key={f.key}
+                        index={i}
+                        width={allEnrichedWidthOf(i)}
+                        onBegin={beginAllEnrichedResize}
+                      >
+                        {f.label}
+                      </ResizableTh>
+                    ))}
                     <th />
                   </>
                 )}

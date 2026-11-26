@@ -193,6 +193,62 @@ Accepted spellings are listed explicitly rather than matched case-insensitively:
 
 **Fallback rule.** Without enrichment, a single raw event is its own first *and* last occurrence with `count: 1`. That is the honest answer for one event; extrapolating a wider window would be a guess. `first` and `last` therefore being equal is expected and correct for an unenriched stream — it does not indicate a bug.
 
+### 4.2b The optional enriched columns
+
+The picker offers ten keys. Two are `locked` (Severity is a badge, Summary is the
+row's text — the table draws them itself and they cannot be hidden); the other
+eight are generic cells, each one tick away and remembered per browser.
+
+| Key | View field | Source | Default |
+|---|---|---|---|
+| `EVT_EventKey` | `eventKey` | `payload.EVT_EventKey` | **on** |
+| `EVT_Device` | `device` | `payload.EVT_Device` | off |
+| `EVT_Agent` | `agent` | `payload.EVT_Agent` | off |
+| `EVT_AgentOwner` | `agentOwner` | `payload.EVT_AgentOwner` | off |
+| `EVT_Environment` | `environment` | `payload.EVT_Environment` | off |
+| `EVT_Identifier` | `identifier` | `payload.EVT_Identifier` | off |
+| `EVT_Details` | `details` | `payload.msgc` — the **same** decode as `msgCompleteString` | off |
+| `EVT_URL` | `url` | `payload.EVT_URL` | off |
+
+**The renderable list and the offered list must not drift.** `COLUMN_DEFAULTS` is
+what the picker lists; `ENRICHED_FIELDS` is what the table can render, and
+`configuredColumns` walks the second one. For a while Identifier, Details and URL
+were in the picker but not in `ENRICHED_FIELDS` — the checkbox worked, the header
+appeared, and no cell was ever emitted, because there was nothing to emit. A
+`lib.test.js` test now asserts both directions: every non-locked offered key has
+a view field, and every view field is offered.
+
+Details is not a separate field, only a second name for the decoded body. It
+reads `payload.msgc` through the same `asPayloadText` the summary path uses, so
+the compressed form can never render as `[object Object]`.
+
+**Details and URL are clamped.** Both have no natural length bound — Details is
+the whole body — so as ordinary `nowrap` cells either would set the width of the
+entire table. `isClampedColumn()` routes them through a `.clipped` cell
+(`max-width: 24rem`, ellipsis) with the full value in the `title` attribute. The
+inspector remains the place to read the whole thing.
+
+**Every column carries a width, and every column is draggable.** These columns
+used to be emitted as a bare `<col />`, on the theory that the header label would
+supply the width. It does not: the tables are `table-layout: fixed`, and the six
+fixed columns already total 932px, so a widthless column is allotted **zero**.
+The column existed, the checkbox in **Choose columns** flipped, the header `<th>`
+was in the DOM — and nothing was visible. That is what "I can not see Identifier"
+was, twice over: first the field was missing from `ENRICHED_FIELDS`, then it was
+present but 0px wide.
+
+Widths live in `ENRICHED_DEFAULT_W`, keyed by **view field** (`identifier`,
+`details`, …) not by wire key and not by index. `useColumnWidths` accepts either a
+positional array (the fixed columns, whose order never changes) or a by-name
+object (these, whose visible set changes as they are hidden) — an index would put
+a saved width on whichever column happened to land at that position.
+
+**Order matters in `App`.** The width hooks index into `enrichedColNames`, which
+is derived from `eventColumns`. Declaring them above `eventColumns` is a
+temporal-dead-zone error at render: the board fails with `Cannot access 'x'
+before initialization`, and no test here catches it because none of them evaluate
+the component. A test asserts declaration order.
+
 ### 4.3 Column order
 
 Both tables lead with identity and status, then time, then volume, then the human-readable text, then enrichment. Keeping the two tables in the same order means an operator's eye lands in the same place after switching views.

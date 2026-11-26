@@ -36,7 +36,8 @@ k8s/
     │   │   ├── valkey-lab.yaml
     │   │   ├── sentinel-lab.yaml
     │   │   ├── bridge-lab.yaml
-    │   │   └── stream-lab.yaml
+    │   │   ├── stream-lab.yaml
+    │   │   └── sentinels-lab.yaml # SENTINELS → the one Sentinel that exists
     │   ├── openshift/             # Routes, lab hostnames
     │   │   ├── kustomization.yaml
     │   │   ├── routes.yaml
@@ -114,7 +115,7 @@ overlays/
     │   ├── kustomization.yaml   (this IS the lab base, not an overlay)
     │   ├── replicas.yaml, resources.yaml, storage.yaml
     │   ├── delete-pdb.yaml, delete-anti-affinity.yaml, delete-hpa.yaml, delete-monitoring.yaml
-    │   └── valkey-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml, stream-lab.yaml
+    │   └── valkey-lab.yaml, sentinel-lab.yaml, bridge-lab.yaml, stream-lab.yaml, sentinels-lab.yaml
     ├── openshift/         # Route-based, like production
     │   ├── kustomization.yaml
     │   ├── routes.yaml           (lab hostnames)
@@ -165,6 +166,7 @@ kubectl apply -k k8s/overlays/ghcr              # production shape, GHCR images
 | Sentinel PV | 1Gi | **256Mi** |
 | CPU/memory per pod | full | **tiny** (see §3.3) |
 | `FW_WAIT_REPLICAS` (http-ingress, ws-gateway) | 1 | **0** (`stream-lab.yaml`) |
+| `SENTINELS` (ingress, worker, gateway, bridge) | 3 hosts | **1 host** (`sentinels-lab.yaml`) |
 | Monitoring (exporters, ServiceMonitors, PrometheusRules incl. `fire-watch-stream`) | present | **deleted** (`delete-monitoring.yaml`) |
 | HPA | 3..12 gateway | **removed**, fixed 1 |
 | NetworkPolicies | absent (deliberate, shared namespace) | **absent** — nothing to remove |
@@ -229,6 +231,7 @@ patches:
   - path: sentinel-lab.yaml
   - path: bridge-lab.yaml
   - path: stream-lab.yaml
+  - path: sentinels-lab.yaml
 ```
 
 ```yaml
@@ -322,6 +325,28 @@ only some leaves the lab permanently broken in a way that looks like a credentia
 `maxmemory-policy noeviction` is **not** a lab relaxation: it is repeated unchanged
 because dropping it would silently reintroduce defect D9
 ([fault-tolerance.md](fault-tolerance.md) §3.9).
+
+`sentinels-lab.yaml` handles a fourth lab-only mismatch that is unrelated to the
+write guard: the base lists **three** Sentinel hosts because production runs
+three, while the lab pins `sentinel` to one replica. `sentinel-1` and
+`sentinel-2` therefore have no endpoint, and every Sentinel-aware client walks
+the list until one answers. `ValkeyClient.resolveMaster` tolerates that (it
+iterates and moves on), but each dead host costs its 2 s `connectTimeout` first,
+so a resolve takes seconds and the logs fill with `ENOTFOUND` lines that read
+like a broken cluster when nothing is broken:
+
+```
+{"level":"warn","msg":"valkey socket error","err":"Error: getaddrinfo ENOTFOUND sentinel-1.sentinel-headless..."}
+```
+
+The patch reduces the list to the host that exists, for all four consumers
+(`http-ingress`, `worker`, `ws-gateway`, `sentinel-bridge`). `sentinel-bridge`
+keeps the `$(POD_NAMESPACE)` interpolation so its value keeps the same shape as
+the base.
+
+This is deliberately a separate file from `stream-lab.yaml`: that one disables a
+guard, this one removes addresses that were never created. Both are lab-only and
+neither belongs in the base.
 
 ### 3.5 Applying it
 

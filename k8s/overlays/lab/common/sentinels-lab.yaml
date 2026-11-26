@@ -1,0 +1,63 @@
+# The lab runs ONE Sentinel (replicas.yaml pins sts/sentinel to 1), but the base
+# manifests list all three hosts because prod has three.
+#
+# Left uncorrected, every Sentinel-aware client walks the list: `sentinel-1` and
+# `sentinel-2` have no endpoint, so each resolve attempt burns its 2 s connect
+# timeout before falling through to `sentinel-0` — which is first only by luck of
+# ordering, so a resolve costs seconds and the logs fill with lookup failures
+# that look like a broken cluster but are only absent pods.
+#
+# This is NOT the same switch as stream-lab.yaml. That one disables the WAIT on
+# replicas; this one removes hosts that do not exist. Both are lab-only and both
+# must be reverted by moving to a non-lab overlay, never by editing the base.
+#
+# sentinel-bridge keeps $(POD_NAMESPACE) interpolation so the string stays
+# namespace-agnostic and identical in shape to the base.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-ingress
+spec:
+  template:
+    spec:
+      containers:
+        - name: ingress
+          env:
+            - { name: SENTINELS, value: "sentinel-0.sentinel-headless:26379" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          env:
+            - { name: SENTINELS, value: "sentinel-0.sentinel-headless:26379" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          env:
+            - { name: SENTINELS, value: "sentinel-0.sentinel-headless:26379" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-bridge
+spec:
+  template:
+    spec:
+      containers:
+        - name: bridge
+          env:
+            - name: SENTINELS
+              value: "sentinel-0.sentinel-headless.$(POD_NAMESPACE):26379"

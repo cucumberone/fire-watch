@@ -31,3 +31,6 @@ patches:
   - path: sentinel-lab.yaml
   - path: bridge-lab.yaml
   - path: stream-lab.yaml
+  # One Sentinel exists, so the three-host lists in the base are two dead
+  # entries per resolve. Applied AFTER the others so it does not fight them.
+  - path: sentinels-lab.yaml

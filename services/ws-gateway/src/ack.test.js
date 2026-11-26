@@ -285,3 +285,44 @@ test('a malformed record key is not echoed', () => {
     assert.equal('key' in evt, false, `${String(bad)} must not be echoed`);
   }
 });
+
+test('a close keeps the record fields the operator has no opinion about', () => {
+  // THE FOLD REPLACES `payload`, it does not merge it. So anything the close event
+  // omits is WIPED from the record. Building the payload from scratch erased
+  // `EVT_EventKey`, and the Event key column rendered blank on the one row the
+  // operator had just closed — while the record's own `type` still held the value.
+  const record = {
+    key: 'c'.repeat(32),
+    source: 'uniq-03',
+    type: 'unique.test',
+    summary: 'unique condition 3',
+    payload: {
+      msg: 'unique condition 3',
+      EVT_Severity: 'CRITICAL',
+      EVT_Device: 'uniq-03',
+      EVT_EventKey: 'unique.test',
+      EVT_AgentOwner: 'lab',
+      EVT_Environment: 'production',
+      EVT_URL: 'https://example.invalid/1',
+      EVT_Identifier: 'uniq-id-3',
+    },
+  };
+  const evt = operatorCloseEvent(record, 'gunnar', 1);
+
+  assert.equal(evt.payload.EVT_EventKey, 'unique.test', 'the event key survives');
+  assert.equal(evt.payload.EVT_AgentOwner, 'lab', 'and every other inherited field');
+  assert.equal(evt.payload.EVT_Environment, 'production');
+  assert.equal(evt.payload.EVT_URL, 'https://example.invalid/1');
+  assert.equal(evt.payload.EVT_Identifier, 'uniq-id-3', 'the identifier is not deleted');
+
+  // The close's own values still win over the inherited ones.
+  assert.equal(evt.payload.EVT_Severity, 'CLOSED');
+  assert.equal(evt.payload.EVT_ClosedBy, 'gunnar');
+  assert.equal(evt.payload.EVT_Agent, 'gunnar', 'the last thing that happened')
+});
+
+test('a close of a record with no payload still produces a usable one', () => {
+  const evt = operatorCloseEvent({ source: 'd', summary: 's', type: 't' }, 'g', 1);
+  assert.equal(evt.payload.EVT_EventKey, 't', 'type is the fallback source');
+  assert.equal(evt.payload.msg, 's');
+});

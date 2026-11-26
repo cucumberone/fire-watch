@@ -502,6 +502,20 @@ export function toViewEvent(evt) {
   for (const field of ENRICHED_FIELDS) {
     view[field.key] = asText(firstPresent(payload, field.wire));
   }
+
+  // The event key also lives on the RECORD as `type`, and a close has to fall back
+  // to it.
+  //
+  // An operator close builds its own envelope, and until it copied `type` into
+  // `payload.EVT_EventKey` a closed row rendered a blank Event key — while the
+  // record's own `type` field held exactly that value. The payload is the primary
+  // source (it is what the producer sent), but the record field is the same fact and
+  // must be used when the payload has no copy.
+  //
+  // This also repairs rows closed BEFORE that fix: they are already stored without
+  // the field, and re-deriving it on display is cheaper and safer than rewriting
+  // history.
+  if (!view.eventKey) view.eventKey = asText(evt?.type);
   return view;
 }
 

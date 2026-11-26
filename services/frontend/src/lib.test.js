@@ -1443,3 +1443,36 @@ test('the dev harness live generator emits a new condition per tick', () => {
   assert.match(src, /payload: \{ msg: `live condition #\$\{n\}` \}/,
     'each tick needs its own summary so it is its own condition');
 });
+
+test('a closed row still shows its Event key, from the record field', () => {
+  // An operator close builds its own envelope, and until it copied `type` into
+  // `payload.EVT_EventKey` a closed row rendered a blank Event key while the
+  // record's `type` held exactly that value. This is the display half of the fix, and
+  // it also repairs rows closed BEFORE the fix without rewriting history.
+  const closedOld = {
+    key: 'a'.repeat(32),
+    type: 'unique.test',
+    source: 'uniq-03',
+    severity: 'CLOSE',
+    payload: {
+      msg: 'unique condition 3',
+      EVT_Severity: 'CLOSED',
+      EVT_Device: 'uniq-03',
+      EVT_Summary: 'unique condition 3',
+      EVT_Agent: 'anonymous',
+      EVT_ClosedBy: 'anonymous',
+    },
+  };
+  const v = toViewEvent(closedOld);
+  assert.equal(v.eventKey, 'unique.test', 'falls back to the record field');
+  assert.equal(v.device, 'uniq-03', 'the other enriched fields are unaffected');
+});
+
+test('the payload copy wins over the record field when both exist', () => {
+  // The payload is what the producer sent; `type` is the record's derived column. They
+  // agree in practice, but the payload must not be overridden by a derived value.
+  const v = toViewEvent({
+    type: 'from-record', payload: { EVT_EventKey: 'from-payload', msg: 'm' },
+  });
+  assert.equal(v.eventKey, 'from-payload');
+});

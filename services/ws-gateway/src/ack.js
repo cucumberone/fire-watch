@@ -191,6 +191,24 @@ export function operatorCloseEvent(record, by, nowMs, eventId = `operator-close-
     severity: 'CLOSE',
     ts: new Date(nowMs).toISOString(),
     payload: {
+      // ---- inherited from the record being closed.
+      //
+      // The fold REPLACES `payload` on every applied event, so whatever this
+      // object omits is wiped from the record — not merged, replaced. Building it
+      // from scratch therefore erased the producer's identifying fields: the
+      // operator's own close left a record with no `EVT_EventKey`,
+      // `EVT_AgentOwner`, `EVT_Environment`, `EVT_URL` or `EVT_Identifier`, and the
+      // Event key column rendered blank on the one row an operator had just
+      // touched.
+      //
+      // Measured on the lab: a closed record's payload was
+      //   {msg, EVT_Severity, EVT_Device, EVT_Summary, EVT_Agent, EVT_ClosedBy}
+      // while its `type` field still said `unique.test`. The data was there; the
+      // payload just never carried it.
+      //
+      // Spreading the record's payload keeps every field the close has no opinion
+      // about, and the explicit keys below still win.
+      ...(record?.payload && typeof record.payload === 'object' ? record.payload : {}),
       // `msg` is the summary the KEY is built from. Never reword it.
       msg: summary,
       // The DISPLAY label only. Deliberately distinct from a source `CLEAR`, so an
@@ -198,6 +216,11 @@ export function operatorCloseEvent(record, by, nowMs, eventId = `operator-close-
       EVT_Severity: 'CLOSED',
       EVT_Device: source,
       EVT_Summary: summary,
+      // The event key is the record's `type`. It is not recoverable from the key
+      // hash, so it has to come from the record itself.
+      EVT_EventKey: String(record?.type ?? ''),
+      // Who ended it. Deliberately overwrites the original agent: on this record
+      // the last thing that happened is that a human closed it.
       EVT_Agent: by,
       EVT_ClosedBy: by,
     },

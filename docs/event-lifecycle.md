@@ -571,3 +571,35 @@ worker
 | Ordering | the close gets a fresh entry ID, so it is newer than anything already folded and retires the current episode; a re-fire appended after it opens a new one |
 | Acknowledgement to the operator | only after `XADD` + `WAIT` succeeded, or after the fallback write succeeded |
 | History | one `hist:` row, like any delivery |
+
+### 11.1 The close must INHERIT the record's payload, not rebuild it
+
+The fold **replaces** `payload` on every applied event — it does not merge. So a
+close event that builds its payload from scratch deletes every field it does not
+name, from the very record it is closing.
+
+That is what happened: `operatorCloseEvent` set only `msg`, `EVT_Severity`,
+`EVT_Device`, `EVT_Summary`, `EVT_Agent` and `EVT_ClosedBy`, so a closed record lost
+`EVT_EventKey`, `EVT_AgentOwner`, `EVT_Environment`, `EVT_URL` and `EVT_Identifier`.
+The visible symptom was the **Event key column rendering blank on the one row the
+operator had just closed**, while the record's own `type` field still held
+`unique.test` — the value was in the hash, just not in the payload.
+
+So the close spreads the record's payload first and overrides only what a close has
+an opinion about:
+
+| Field | Source | Why |
+|---|---|---|
+| everything else | the record's payload | the close is an edit of a condition, not a replacement of its facts |
+| `msg` | the record's summary | it is what the key is derived from; rewording it would move the record |
+| `EVT_Severity` | `CLOSED` | the DISPLAY label, distinct from a source `CLEAR` |
+| `EVT_EventKey` | the record's `type` | not recoverable from the key hash |
+| `EVT_Agent` | the operator | on this record the last thing that happened is that a human closed it |
+| `EVT_ClosedBy` | the operator | who ended it |
+
+`EVT_Agent` is the one inherited field a close deliberately overwrites: the row
+should say a person closed it, not the tool that first reported it.
+
+**A display fallback covers rows already affected.** `toViewEvent` falls back to the
+record's `type` when `payload.EVT_EventKey` is missing, so records closed before this
+fix show their event key without any rewrite of history.

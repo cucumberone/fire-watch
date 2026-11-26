@@ -1598,6 +1598,22 @@ function useSocket(config) {
   }, []);
 
   /**
+   * Change the All events window WITHOUT fetching.
+   *
+   * State only, like `setHistoryQuery`. The picker used to call `loadAllEvents`
+   * directly while the tab effect also fired on `allEvents.range`, so one range
+   * change sent TWO identical `allEvents` frames — measured in the browser, and on
+   * the pre-fix build too, so it predates the re-click fix. Two identical queries is
+   * wasted work and, on a 7-day window, real load.
+   *
+   * Letting the effect be the only fetcher makes the paths symmetric with History,
+   * and keeps the "one query per entered tab" rule in one place.
+   */
+  const setAllEventsRange = useCallback((range) => {
+    setAllEvents((prev) => ({ ...prev, range: range || '24h' }));
+  }, []);
+
+  /**
    * Ask for every event in a time window.
    *
    * A QUERY, not a stream: the window is bounded, it changes slowly relative to a
@@ -1720,7 +1736,7 @@ function useSocket(config) {
 
   return {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadAllEvents, allEvents,
+    loadAllEvents, allEvents, setAllEventsRange,
     loadHistory, setHistoryQuery, history,
     columns, loadColumns, saveColumns,
     ingestContract, loadIngestSchema, saveIngestSchema,
@@ -2832,7 +2848,8 @@ function App() {
   const { config, error } = useConfig();
   const {
     status, events, alerts, acks, notice, bulk, deleteEvent,
-    loadAllEvents, allEvents, loadHistory, setHistoryQuery, history,
+    loadAllEvents, allEvents, setAllEventsRange,
+    loadHistory, setHistoryQuery, history,
     columns, loadColumns, saveColumns, dbUp,
     ingestContract, loadIngestSchema, saveIngestSchema,
     journals, loadJournal, addJournalEntry,
@@ -2844,9 +2861,25 @@ function App() {
     const saved = readPref(TAB_KEY, 'alerts');
     return TABS.some((t) => t.id === saved) ? saved : 'alerts';
   });
+  // Bumped when a QUERY-BACKED tab is clicked while it is ALREADY showing.
+  //
+  // That click is a natural "refresh this" gesture, but MUI refuses to report it:
+  // `Tab.handleClick` only calls `onChange` when `!selected`, so our `setTab` never
+  // runs and the signature the two effects key on (`status|range`) is unchanged.
+  // Measured in the browser: one `allEvents` frame for the first click, none for the
+  // second. `Tab` DOES always call the `onClick` prop, so that is where a re-click is
+  // caught — see the `onClick` on each `Tab` below.
+  //
+  // Kept as a counter rather than a boolean so two re-clicks in a row each produce a
+  // new value; a boolean would fetch once and then stop.
+  const [tabNonce, setTabNonce] = useState(0);
   const setTab = useCallback((id) => {
     setTabState(id);
     writePref(TAB_KEY, id);
+  }, []);
+  const onTabClick = useCallback((id) => {
+    // Only the query-backed tabs need it: the live ones stream their own updates.
+    if (id === 'all' || id === 'history') setTabNonce((n) => n + 1);
   }, []);
   // Signature of the last query each query-backed tab issued, so entering a tab
   // fetches exactly once. Without it the effect would re-fire on its own response:
@@ -2963,11 +2996,15 @@ function App() {
       return;
     }
     if (status !== 'connected') return;
-    const sig = `${status}|${allEvents.range}`;
+    // `tabNonce` is in the signature, not just `status|range`: clicking the tab
+    // that is already showing is a refresh request, and without it the value
+    // would be unchanged and nothing would be fetched. Measured in the browser:
+    // one frame for the first click, zero for the second.
+    const sig = `${status}|${allEvents.range}|${tabNonce}`;
     if (allEventsReqRef.current === sig) return;
     allEventsReqRef.current = sig;
     loadAllEvents(allEvents.range);
-  }, [tab, status, allEvents.range, loadAllEvents]);
+  }, [tab, tabNonce, status, allEvents.range, loadAllEvents]);
 
   // History is fetched every time the tab is SELECTED, not just the first time.
   //
@@ -2985,11 +3022,13 @@ function App() {
       return;
     }
     if (status !== 'connected') return;
-    const sig = `${status}|${history.range}|${history.limit}`;
+    // `tabNonce` for the same reason as All events: a click on the tab that is
+    // already showing must re-read, and the rest of the signature cannot change.
+    const sig = `${status}|${history.range}|${history.limit}|${tabNonce}`;
     if (historyReqRef.current === sig) return;
     historyReqRef.current = sig;
     loadHistory(history.range, { limit: history.limit });
-  }, [tab, status, history.range, history.limit, loadHistory]);
+  }, [tab, tabNonce, status, history.range, history.limit, loadHistory]);
 
   // Snapshot on the transition into pause, so the frozen list is exactly what
   // was on screen at that moment and does not creep forward.
@@ -3174,6 +3213,15 @@ function App() {
                   value={t.id}
                   id={`tab-${t.id}`}
                   aria-controls={`panel-${t.id}`}
+                  // A click on the ALREADY-SELECTED tab is a refresh request, and
+                  // MUI will not report it through `onChange`: `Tab.handleClick`
+                  // only fires `onChange` when `!selected`. It always fires the
+                  // `onClick` prop, so that is where the re-click is caught.
+                  //
+                  // Without this, clicking "All events" a second time sent no
+                  // `allEvents` frame at all (measured in the browser), so the pane
+                  // kept whatever it had while looking freshly opened.
+                  onClick={() => onTabClick(t.id)}
                   label={(
                     <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
                       <span>{t.label}</span>
@@ -3448,7 +3496,10 @@ function App() {
               labelId="all-range-label"
               label="Window"
               value={allEvents.range}
-              onChange={(e) => loadAllEvents(e.target.value)}
+              // State only: the tab effect is the single fetcher, so this cannot
+              // race it into a second identical query. It used to call
+              // `loadAllEvents` here as well, which sent two frames per change.
+              onChange={(e) => setAllEventsRange(e.target.value)}
             >
               {ALL_RANGES.map((r) => (
                 <MenuItem key={r.id} value={r.id}>{r.label}</MenuItem>

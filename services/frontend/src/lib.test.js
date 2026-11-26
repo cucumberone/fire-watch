@@ -1363,3 +1363,83 @@ test('the identifier policy text names the legacy behaviour when nothing is pick
   assert.match(identifierPolicyText(null), /device \+ summary/);
   assert.match(identifierPolicyText(['EVT_Device', 'EVT_EventKey']), /EVT_Device \+ EVT_EventKey/);
 });
+
+// ------------------------------------------------- query-backed tab refresh
+// `app.jsx` is JSX and has no unit-test harness, so these pin the behaviour
+// statically. They exist because the failure mode is invisible: the pane looks
+// freshly opened while showing rows from minutes ago.
+const appSrc = readFileSync(new URL('./app.jsx', import.meta.url), 'utf8');
+
+test('a click on the already-selected tab refreshes it', () => {
+  // MUI will not report this through onChange: `Tab.handleClick` only calls it when
+  // `!selected`. Measured in the browser: one `allEvents` frame for the first click,
+  // none for the second. `onClick` is always called, so the tab must use it.
+  //
+  // Matched as `<Tab\n` (the element open tag inside the Tabs map) because a plain
+  // `<Tab` search hits `<Tabs` first and would assert against the wrong tag.
+  const openTag = appSrc.indexOf('<Tab\n');
+  assert.ok(openTag > 0, 'the per-tab <Tab> element should still exist');
+  assert.match(appSrc.slice(openTag, openTag + 1500), /onClick=\{\(\) => onTabClick\(t\.id\)\}/,
+    'the Tab element must report re-clicks through onClick');
+  assert.match(appSrc, /if \(id === 'all' \|\| id === 'history'\) setTabNonce/,
+    'only the query-backed tabs need the nonce');
+});
+
+test('the query-backed tab effects key on the nonce', () => {
+  // Keyed on `tab` alone, a re-click changes nothing and the effect never runs —
+  // which is exactly how the pane kept stale rows.
+  assert.match(appSrc, /const sig = `\$\{status\}\|\$\{allEvents\.range\}\|\$\{tabNonce\}`/,
+    'the All events signature must include tabNonce');
+  assert.match(appSrc, /const sig = `\$\{status\}\|\$\{history\.range\}\|\$\{history\.limit\}\|\$\{tabNonce\}`/,
+    'the History signature must include tabNonce');
+  assert.match(appSrc, /\}, \[tab, tabNonce, status, allEvents\.range, loadAllEvents\]\);/);
+  assert.match(appSrc, /\}, \[tab, tabNonce, status, history\.range, history\.limit, loadHistory\]\);/);
+});
+
+test('changing the window does not fetch on its own', () => {
+  // One interaction must not produce two identical queries. The picker used to call
+  // `loadAllEvents` while the effect also fired on `allEvents.range` — measured as
+  // two frames per range change, on the pre-fix build too.
+  assert.match(appSrc, /onChange=\{\(e\) => setAllEventsRange\(e\.target\.value\)\}/,
+    'the Window picker must only set state');
+  assert.doesNotMatch(appSrc, /onChange=\{\(e\) => loadAllEvents\(e\.target\.value\)\}/,
+    'the Window picker must not fetch directly');
+  // History already worked this way; keep the two symmetric.
+  assert.match(appSrc, /onChange=\{\(e\) => setHistoryQuery\(\{ range: e\.target\.value \}\)\}/);
+});
+
+// ---------------------------------------------- All events counts CONDITIONS
+// `op: allEvents` reads `idx:event:all`, whose members are record keys: the worker
+// ZADDs the same condition again instead of adding a second member. So a repeat does
+// NOT move the badge, and the live tail (per-arrival) legitimately runs ahead of it.
+// Verified on the cluster: 3 repeats of one condition + 1 new one -> total 2,
+// idx:history +4.
+test('insertAllEvent folds a repeat instead of appending it', () => {
+  // The badge is derived from what the list actually gained, so this is the rule the
+  // frozen badge follows.
+  let list = [];
+  list = insertAllEvent(list, { key: 'a', brokerTs: 10 }, 100);
+  list = insertAllEvent(list, { key: 'a', brokerTs: 20 }, 100);
+  assert.equal(list.length, 1, 'a repeat of one condition is one row');
+
+  list = insertAllEvent(list, { key: 'b', brokerTs: 30 }, 100);
+  assert.equal(list.length, 2, 'a new condition adds a row');
+});
+
+test('the dev harness answers allEvents per CONDITION, like the gateway', () => {
+  // The harness answering per ARRIVAL was the reason a frozen All events badge could
+  // not be reproduced locally. If it ever regresses, local testing starts lying about
+  // the one behaviour this tab is subtle about.
+  const src = readFileSync(new URL('../devserver.js', import.meta.url), 'utf8');
+  assert.match(src, /const byCondition = new Map\(\);/, 'the harness must fold by record key');
+  assert.match(src, /One MEMBER PER CONDITION|ONE MEMBER PER CONDITION/i);
+});
+
+test('the dev harness live generator emits a new condition per tick', () => {
+  // It rotated 4 sources x 6 summaries on the same period, so it could only ever
+  // produce 12 distinct record keys and All events looked stuck for a different
+  // reason than production's.
+  const src = readFileSync(new URL('../devserver.js', import.meta.url), 'utf8');
+  assert.match(src, /payload: \{ msg: `live condition #\$\{n\}` \}/,
+    'each tick needs its own summary so it is its own condition');
+});

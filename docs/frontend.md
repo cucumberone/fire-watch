@@ -604,6 +604,21 @@ survives a reload, reaches the full 7-day retention, and can be asked for a spec
 window. Search is over the fetched page (bounded, so it stays instant); the window
 is applied server-side, so a 1-hour query is cheaper than a 7-day one.
 
+**All events lists CONDITIONS, not arrivals, and its badge therefore stands still
+under a repeat.** `op: allEvents` reads `idx:event:all`, whose members are record
+keys — the worker `ZADD`s the same condition again rather than adding a second
+member ([valkey.md](valkey.md) §2). So three repeats of one alarm leave the badge
+and the table exactly where they were, while Live events climbs by three and the
+row's Count goes up. Measured on the cluster to settle it: 3 repeats of one
+condition + 1 new one → `idx:event:all` = 2, `idx:history` = +4.
+
+This is why the two badges legitimately diverge, and why **History** is the tab that
+counts arrivals. It is also a trap for anyone testing locally: the dev harness used
+to answer `op: allEvents` from its per-arrival log, so a frozen All events badge
+could never be reproduced there — the harness grew while production would not. The
+harness now folds by record key, and its live generator emits a new condition per
+tick rather than cycling 12 fixed ones.
+
 **The State column answers "is this incident open now".** An event record is immutable
 — it carries no state of its own. Open/closed is a property of the **alert**
 (the 32-hex record key), which the fold maintains on `event:<key>`, and every frame carries it
@@ -730,6 +745,24 @@ A growing field consumes all the slack and drags whatever follows it to the far
 edge, which is how the button ended up a screen away from the box it re-reads. Query-backed tabs also re-read on **every tab
 entry** ([history.md](history.md) §5.1) — a pane whose content silently ages is
 worse than an empty one, because it reads as current.
+
+**A click on the ALREADY-SELECTED tab also re-reads it**, and that took a workaround.
+MUI will not report it: `Tab.handleClick` only calls `onChange` when `!selected`, so
+`setTab` never runs, the effect's signature is unchanged, and no query is sent.
+Measured in the browser on All events: **one `allEvents` frame for the first click,
+none for the second** — the pane kept its rows while looking freshly opened, which is
+the exact failure the entry-refresh rule exists to prevent. `Tab` *does* always call
+the `onClick` prop, so the tabs report re-clicks there and a `tabNonce` counter is
+bumped; both query effects key on it (`status|range|nonce`). Only All events and
+History do — the live tabs stream their own updates.
+
+**One interaction, one query.** The window picker used to call `loadAllEvents`
+directly while the tab effect also fired on `allEvents.range`, so a single range
+change sent **two identical frames** — measured on the pre-fix build as well, so it
+predates the re-click fix. The picker now only sets state (`setAllEventsRange`) and
+the effect is the single fetcher, which is how History already worked. Verified:
+each tab click adds exactly one frame, a range change adds one, the Refresh button
+adds one.
 
 **Two chips joined by a line: connection → database.** They are separate because
 they fail separately — the socket can be perfectly healthy while the gateway's reads

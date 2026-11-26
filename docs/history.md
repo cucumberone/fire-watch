@@ -201,10 +201,19 @@ screen saying they were old — on a trail whose entire value is recency. A page
 rows now, so refreshing is cheap enough to do unconditionally.
 
 The guard that replaced it is a **request signature** (`tab`, `status`, `range`,
-`limit`), held in a ref and cleared on leaving the tab. It fetches once per entry and
-does not re-fire on its own response — the failure mode without it is a loop:
-`loading` goes false, the effect runs, `total` resets to null, and the table sits
-beside a "showing 50 of 0" notice forever.
+`limit`, `tabNonce`), held in a ref and cleared on leaving the tab. It fetches once
+per entry and does not re-fire on its own response — the failure mode without it is a
+loop: `loading` goes false, the effect runs, `total` resets to null, and the table
+sits beside a "showing 50 of 0" notice forever.
+
+`tabNonce` is there because signature-on-`tab` alone left one gesture dead: clicking
+the tab that is **already showing** produced no fetch at all. MUI's `Tab.handleClick`
+only calls `onChange` when `!selected`, so the tab state never changed and nothing
+re-ran. Measured in the browser: one `history` frame for the first click, none for
+the second. The tabs report re-clicks through `onClick` instead and bump a counter,
+so every click on this tab re-reads it — which is what an operator pressing History
+expects, since the whole value of the trail is recency. All events needed the same
+fix; see [frontend.md](frontend.md) §5.5.
 
 **Page size is a separate control from the window.** The window is "how far back",
 the page is "how many rows"; conflating them would force an operator who wants more

@@ -1,38 +1,39 @@
 /**
- * http-ingress — external nginx (HTTP) → RabbitMQ (AMQP 0-9-1).
+ * http-ingress — external nginx (HTTP) → Valkey stream.
  *
  * Position in the system:
  *
- *   producer ──HTTP──> external nginx ──HTTP──> [http-ingress] ──AMQP──> q.event.ingest
+ *   producer ──HTTP──> external nginx ──HTTP──> [http-ingress] ──XADD──> fw:stream:ingest
  *
- * This is a *producer*, not a consumer. It exists because the upstream side
- * speaks plain HTTP and RabbitMQ speaks AMQP 0-9-1. It converts one to the other
- * and, critically, it does not answer 202 until the broker has confirmed the
- * message is durably on a quorum queue.
+ * This is a *producer*, not a consumer. It validates and normalises, appends the
+ * batch to the ingest stream, and does not answer 202 until the master has
+ * accepted the XADD (min-replicas-to-write satisfied) and WAIT has seen the
+ * replicas acknowledge it.
  *
  * Status codes are a contract with nginx:
  *
- *   202  accepted and durably queued       -> nginx may discard its buffer
+ *   202  accepted and replicated           -> nginx may discard its buffer
  *   400  malformed body                    -> not retryable, fix the producer
  *   401  bad or missing token              -> not retryable
  *   405  method other than POST            -> not retryable
  *   413  body too large                    -> not retryable
- *   429  channel pool saturated            -> retryable
- *   503  broker unavailable or unconfirmed  -> retryable, THIS IS THE IMPORTANT ONE
+ *   503  Valkey unavailable or unreplicated -> retryable, THIS IS THE IMPORTANT ONE
  *
  * A 503 means "I did not accept it". nginx must retry. Answering 202 and losing
- * the message would break the no-data-loss requirement just as surely as a
- * dropped AMQP publish.
+ * the event would break the no-data-loss requirement.
  */
 import http from 'node:http';
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
-import { ConfirmPool } from './confirm.js';
-import { normaliseBatch, messageProperties, BadRequest, requiredFields, schemaFields } from './normalise.js';
+import { ValkeyClient } from './valkey.js';
+import { StreamWriter } from './stream.js';
+import { normaliseBatch, streamFields, BadRequest, requiredFields, schemaFields } from './normalise.js';
 
 const cfg = loadConfig();
 const log = createLogger(cfg.logLevel);
-const pool = new ConfirmPool(cfg, log);
+const valkey = new ValkeyClient(cfg, log);
+const stream = new StreamWriter(cfg, valkey, log);
+let valkeyUp = false;
 
 let requests = 0;
 let accepted = 0;
@@ -92,7 +93,7 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/healthz') {
     // Ready only when we can durably accept: an ingress that cannot publish
     // must be taken out of the load balancer, or nginx will get 5xx and buffer.
-    const ok = pool.isReady();
+    const ok = valkeyUp;
     res.writeHead(ok ? 200 : 503, { 'content-type': 'text/plain' })
        .end(`${ok ? 'ready' : 'not ready'}\n`);
     return;
@@ -103,7 +104,7 @@ const server = http.createServer(async (req, res) => {
       `# TYPE fw_ingress_accepted_total counter\nfw_ingress_accepted_total ${accepted}\n` +
       `# TYPE fw_ingress_rejected_total counter\nfw_ingress_rejected_total ${rejected}\n` +
       `# TYPE fw_ingress_unavailable_total counter\nfw_ingress_unavailable_total ${unavailable}\n` +
-      `# TYPE fw_ingress_ready gauge\nfw_ingress_ready ${pool.isReady() ? 1 : 0}\n`,
+      `# TYPE fw_ingress_ready gauge\nfw_ingress_ready ${valkeyUp ? 1 : 0}\n`,
     );
     return;
   }
@@ -159,22 +160,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ---- publish, and only then answer
+  // ---- append, and only then answer
   const correlationId = req.headers['x-request-id'] || undefined;
   try {
-    await pool.publishBatch(events, (evt) => messageProperties(evt, correlationId), cfg.confirmTimeoutMs);
+    await stream.appendBatch(events.map((evt) => streamFields(evt, { src: 'http', correlationId })));
   } catch (err) {
     unavailable += 1;
-    const busy = err.code === 'BUSY';
-    log.error('publish failed', {
+    log.error('stream append failed', {
       err: String(err),
       count: events.length,
-      status: busy ? 429 : 503,
       durationMs: Date.now() - started,
     });
-    // Both are retryable. 429 says "back off", 503 says "I cannot accept".
-    json(res, busy ? 429 : 503, {
-      error: busy ? 'saturated' : 'broker_unavailable',
+    json(res, 503, {
+      error: 'store_unavailable',
       message: 'event was NOT accepted; retry',
     });
     return;
@@ -215,9 +213,9 @@ async function main() {
   log.info('http-ingress starting', {
     port: cfg.port,
     path: cfg.eventPath,
-    exchange: cfg.exchange,
-    routingKey: cfg.routingKey,
-    channels: cfg.channels,
+    stream: cfg.streamKey,
+    waitReplicas: cfg.waitReplicas,
+    sentinels: cfg.sentinels.length,
     maxBatch: cfg.maxBatch,
     authEnabled: Boolean(cfg.ingestToken),
   });
@@ -226,31 +224,25 @@ async function main() {
     log.info('listening', { port: cfg.port, path: cfg.eventPath });
   });
 
-  // Connect eagerly so readiness is truthful immediately, and keep retrying
-  // without taking the process down: a restart would not help a broker that is
-  // still starting.
-  const connectLoop = async () => {
-    while (true) {
-      try {
-        await pool.connect();
-        log.info('connected to rabbitmq');
-        return;
-      } catch (err) {
-        log.error('rabbitmq connect failed, retrying in 3s', { err: String(err) });
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    }
+  // Probe eagerly and keep probing so readiness follows Valkey without a
+  // restart: a restart would not help a master that is still failing over.
+  const probe = async () => {
+    const up = await valkey.ping();
+    if (up !== valkeyUp) log[up ? 'info' : 'warn'](up ? 'valkey reachable' : 'valkey unreachable');
+    valkeyUp = up;
   };
-  connectLoop();
+  await probe();
+  setInterval(probe, 5000).unref();
 }
 
 async function shutdown(signal) {
   log.info('shutting down', { signal });
-  // Stop accepting first, then drain the pool: in-flight requests get their
-  // confirm and answer 202 rather than being cut off.
-  server.close();
-  await pool.close();
-  process.exit(0);
+  // Stop accepting first; in-flight requests finish their XADD/WAIT and answer.
+  server.close(async () => {
+    await valkey.quit();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 15000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

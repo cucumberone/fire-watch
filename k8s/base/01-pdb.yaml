@@ -10,18 +10,6 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: rabbitmq
-  labels:
-    app.kubernetes.io/name: rabbitmq
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: rabbitmq
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
   name: valkey
   labels:
     app.kubernetes.io/name: valkey

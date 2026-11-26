@@ -8,7 +8,7 @@ import {
   extractEvents,
   normaliseEvent,
   normaliseBatch,
-  messageProperties,
+  streamFields,
   BadRequest,
   ingestSchema,
   requiredFields,
@@ -136,23 +136,18 @@ test('a valid batch is all-or-nothing', () => {
   assert.deepEqual(out.map((e) => e.id), ['a', 'b']);
 });
 
-// ------------------------------------------------------------------ properties
-test('message properties mark the message persistent', () => {
-  // deliveryMode 2 is what makes a durable quorum queue keep it across restart.
-  const p = messageProperties({ id: 'x', type: 't', source: 's', severity: 'CRITICAL' }, 'corr-1');
-  assert.equal(p.deliveryMode, 2);
-  assert.equal(p.persistent, true);
-  assert.equal(p.contentType, 'application/json');
-  assert.equal(p.messageId, 'x');
-  assert.equal(p.correlationId, 'corr-1');
-  assert.equal(p.appId, 'http-ingress');
+// --------------------------------------------------------------- stream entry
+test('stream fields carry the envelope as JSON under `evt`', () => {
+  const evt = { id: 'x', type: 't', source: 's', severity: 'CRITICAL', payload: { msg: 'm' } };
+  const f = streamFields(evt, { correlationId: 'corr-1' });
+  assert.deepEqual(f, ['evt', JSON.stringify(evt), 'src', 'http', 'cid', 'corr-1']);
+  assert.deepEqual(JSON.parse(f[1]), evt);
 });
 
-test('source and severity are exposed as headers for routing and debugging', () => {
-  const p = messageProperties({ id: 'x', type: 't', source: 'sensor-a', severity: 'FATAL' });
-  assert.equal(p.headers['x-event-source'], 'sensor-a');
-  assert.equal(p.headers['x-event-severity'], 'FATAL');
-  assert.equal(p.headers['x-ingress-source'], 'http');
+test('stream fields omit `cid` when there is no correlation id', () => {
+  const f = streamFields({ id: 'x' }, { src: 'operator' });
+  assert.deepEqual(f.filter((_, i) => i % 2 === 0), ['evt', 'src']);
+  assert.equal(f[3], 'operator');
 });
 
 // ------------------------------------------------- upstream schema (EVT_*)

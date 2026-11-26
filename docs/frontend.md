@@ -117,11 +117,11 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 | Requirement | Detail |
 |---|---|
 | Reconnect | jittered exponential backoff, 0.5s → 30s cap, infinite retries |
-| Resume | on reconnect, send `subscribe` with `since` = last received event broker timestamp minus 5s overlap |
+| Resume | on reconnect, send `subscribe` with `since` = last received event arrival timestamp (`brokerTs`) minus 5s overlap |
 | Resync | send `resync` every `resyncSeconds`, on every reconnect, and when the tab becomes visible. A snapshot **replaces** the alert map, including when it is empty — merging would keep rows that have already retired ([websocket-server.md](websocket-server.md) §3.3) |
 | De-duplication (transport) | keyed on event `id` (overlap + at-least-once delivery can duplicate) |
 | De-duplication (occurrence) | render `count` from `op: alert` frames; never increment it per received event — the worker coalesces ([event-lifecycle.md](event-lifecycle.md) §5.4) |
-| Ordering | sort by broker timestamp, not arrival order and not producer `ts` — cross-worker delivery can invert ([event-lifecycle.md](event-lifecycle.md) §2) |
+| Ordering | sort by `brokerTs` (stream entry timestamp), not receive order and not producer `ts` — cross-worker delivery can invert ([event-lifecycle.md](event-lifecycle.md) §2) |
 | `applied` code | **must** be honoured: `0` dropped (duplicate or stale) / `1` applied / `3` closed. `2` is a retired alias for `1`. Treating `0` as an applied event double-counts redeliveries ([event-lifecycle.md](event-lifecycle.md) §9) |
 | Alert state | render from `op: alert` frames and, on connect, from the `op: snapshot` frame; never derive "is it open" or the count from the event list ([websocket-server.md](websocket-server.md) §3.1) |
 | Initial load | `op: snapshot` **replaces** the alert map, it is not merged: it is the complete open set, so an omitted row is genuinely closed. Merging would resurrect rows retired while the socket was down |
@@ -139,7 +139,7 @@ nginx serves `config.json` with `Cache-Control: no-store`; `index.html` also `no
 
 ### 4.1 Wire names vs. UI names
 
-The message contract, Valkey and the audit WAL all use `payload.msg` and `payload.msgc` ([payload-and-compression.md](payload-and-compression.md) §1). Those names do not belong on a screen: `msgc` decodes to nothing useful to an operator, and calling the field "Message" collides with the event as a whole.
+The message contract, the ingest stream and Valkey all use `payload.msg` and `payload.msgc` ([payload-and-compression.md](payload-and-compression.md) §1). Those names do not belong on a screen: `msgc` decodes to nothing useful to an operator, and calling the field "Message" collides with the event as a whole.
 
 | Wire | UI | Where |
 |---|---|---|
@@ -181,7 +181,7 @@ The UI shows four fields that the workers add to `payload` before the event reac
 | Wire key(s) | UI column | Notes |
 |---|---|---|
 | `FirstOccurrence`, `firstOccurrence`, `first_occurrence` | First occurrence | epoch ms or ISO 8601 |
-| `LastOccurrence`, `lastOccurrence`, `last_occurrence` | Last occurrence | falls back to the event's broker timestamp |
+| `LastOccurrence`, `lastOccurrence`, `last_occurrence` | Last occurrence | falls back to the event's arrival timestamp (`brokerTs`) |
 | `Count`, `count` | *(no column)* | parsed for the alert rollup's sake but **no longer displayed**: the `EVT_*` schema has no such field and the ingress never adds one, so it was a constant `1` in every event row. Removed for that reason — see §5.6 |
 | `CIF` | CIF | acronym, arrives uppercase |
 | `AlarmIDKey` | Alarm ID key | `ID` stays uppercase; all four other casings accepted |

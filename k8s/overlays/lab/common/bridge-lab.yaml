@@ -4,7 +4,8 @@
 # disabled or it would withhold its own endpoint forever (docs/kustomize.md §3.6).
 #
 # Valkey's own `min-replicas-to-write` is set to 0 for the same reason — see
-# valkey-lab.yaml. Both halves have to be off or the lab silently refuses writes.
+# valkey-lab.yaml — and the stream writers WAIT for 0 replicas (stream-lab.yaml).
+# All three have to be off or the lab silently refuses writes.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

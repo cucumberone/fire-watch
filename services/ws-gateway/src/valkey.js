@@ -905,6 +905,27 @@ export class ValkeyReader {
   }
 
   /**
+   * Append one canonical envelope to the ingest stream, exactly as http-ingress
+   * does, so the worker processes it through the ordinary pipeline. Used only by
+   * an operator close (docs/event-lifecycle.md §11).
+   *
+   * Same durability as an ingest 202: the master refuses the XADD when
+   * min-replicas-to-write is unsatisfied, and WAIT confirms the replicas have it.
+   * Returns the entry ID; throws when the event is not durably queued.
+   */
+  async enqueueEvent(event, { waitReplicas = 1, timeoutMs = 5000 } = {}) {
+    const c = await this.connect();
+    const id = await c.xadd(this.cfg.streamKey, '*', 'evt', JSON.stringify(event), 'src', 'operator');
+    if (waitReplicas > 0) {
+      const acked = Number(await c.wait(waitReplicas, timeoutMs));
+      if (acked < waitReplicas) {
+        throw new Error(`only ${acked}/${waitReplicas} replicas acknowledged ${id}`);
+      }
+    }
+    return id;
+  }
+
+  /**
    * Append one journal entry and return the stored entry.
    *
    * An APPEND, never a SET. Two operators annotating the same incident must both keep

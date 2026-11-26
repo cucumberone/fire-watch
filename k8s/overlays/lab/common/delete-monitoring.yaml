@@ -9,11 +9,6 @@
 #
 # Both exporters go too: they exist only to feed the ServiceMonitors, and they
 # cost three pods for no benefit in a lab.
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: rabbitmq
-$patch: delete
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -30,7 +25,7 @@ $patch: delete
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: fire-watch-rabbitmq
+  name: fire-watch-stream
 $patch: delete
 ---
 apiVersion: monitoring.coreos.com/v1

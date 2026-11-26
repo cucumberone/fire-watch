@@ -1,7 +1,9 @@
 # Valkey
 
-Primary datastore. **1 master + 2 replicas in production, 1 pod in the lab**, manifests
-only, no operator.
+Primary datastore **and the ingest queue**. **1 master + 2 replicas in production, 1 pod in the lab**, manifests
+only, no operator. It holds the records, their indexes, the `hist:` trail, the journal
+and the ingest stream `fw:stream:ingest` that http-ingress appends to and workers
+consume (§2.4).
 
 This replaces Valkey. The reasons are collected in §1; the important ones are
 that Valkey **implements AOF** (so the durability requirement is finally satisfiable
@@ -15,18 +17,19 @@ enforced by the engine, not only by routing).
 | Requirement (AGENTS.md) | Valkey | Valkey |
 |---|---|---|
 | AOF, rotated at 32 MB | **not implemented** — snapshots only | `appendonly yes` + `auto-aof-rewrite-min-size 32mb` |
-| "always find 2 replicas before accepting writes" | no equivalent flag; had to be enforced by emptying a Service endpoint | `min-replicas-to-write 2` |
+| "always find replicas before accepting writes" (split-brain protection) | no equivalent flag; had to be enforced by emptying a Service endpoint | `min-replicas-to-write 1` (§3.1, §5) |
 | 3 replicas, no operator | yes | yes |
 | RESP compatibility with Sentinel and every client | yes | yes |
 
 The Valkey design worked, but two of its most important guarantees were
 approximations:
 
-- **Durability** came from `q.audit.events` in RabbitMQ, because Valkey could not
-  persist writes between snapshots. That is still the WAL of record (§4.5) — it is
-  simply no longer the *only* line of defence.
+- **Durability** came from an audit queue in the former message broker, because the datastore could not
+  persist writes between snapshots. With AOF on every pod and writers that `WAIT 1`,
+  that external copy was dropped together with the broker
+  ([persistence-and-durability.md](persistence-and-durability.md) §3).
 - **Split-brain protection** was a routing gate: `sentinel-bridge` withheld the
-  Service endpoint when the master could not see two replicas. A client talking to a
+  Service endpoint when the master had lost its replicas. A client talking to a
   pod IP could still write. Valkey's `min-replicas-to-write` closes that hole in the
   engine itself.
 
@@ -59,7 +62,7 @@ The two cases that used to need separate machinery collapse:
 
 | Case | Before | Now |
 |---|---|---|
-| **Transport** duplicate: the same MESSAGE delivered twice | `SET fw:evt:{id} NX` rejected it (the old model) | the fold's `(brokerTs, id)` watermark returns `0` |
+| **Transport** duplicate: the same stream entry delivered twice | `SET fw:evt:{id} NX` rejected it (the old model) | the fold's `(brokerTs, id)` watermark returns `0` |
 | **Content** duplicate: the same CONDITION re-reported with a new id | `SET event:{fp} NX` claimed it, then the copy was folded into the owner | it hashes to the same key, so there is no second key to create |
 
 A content duplicate can no longer *be* stored as a separate record. That removes an
@@ -74,23 +77,19 @@ is nothing left to reconcile.
 individual arrivals: the record is updated in place, so after 400 repeats it looks
 like it did after the first apart from those three fields.
 
-Two things answer per-delivery questions, and they are different tools:
+Per-delivery questions are answered by the `hist:` trail, written by the worker
+before the fold ([history.md](history.md)):
 
-| | `q.audit.events` (RabbitMQ) | `hist:` + `idx:history` (Valkey) |
-|---|---|---|
-| purpose | the durable WAL, replayable | a read model for the UI |
-| retention | the full 7 days | 3 days (`FW_HISTORY_TTL`) |
-| queryable | by draining it | `op: history`, bounded |
-| on a total PVC loss | the source of truth | gone with the data |
-
-The Valkey copy exists only because "how many times did this fire, and when"
-should not require draining a broker queue. Nothing is replayed from it — the WAL
-is still what a rebuild reads ([history.md](history.md) §6,
-[persistence-and-durability.md](persistence-and-durability.md) §4).
+| | `hist:` + `idx:history` |
+|---|---|
+| purpose | a read model for the UI: "how many times did this fire, and when" |
+| retention | 3 days (`FW_HISTORY_TTL`) |
+| queryable | `op: history`, bounded |
+| on a total PVC loss | gone with the data — there is no copy outside Valkey ([persistence-and-durability.md](persistence-and-durability.md) §4) |
 
 ```text
 hist:<deliveryId>   hash  ONE delivery, immutable, no state
-idx:history         zset  <deliveryId> -> broker timestamp
+idx:history         zset  <deliveryId> -> stream entry timestamp (brokerTs)
 ```
 
 The id is a per-delivery UUID, and the CONDITION key travels inside the hash — so a
@@ -115,6 +114,30 @@ Device and summary are stored as hash **fields** instead, so nothing is lost for
 display or filtering. The trade-off is that `valkey-cli KEYS 'event:*'` tells you
 nothing about what a row is; `HGETALL` does.
 
+### 2.4 The ingest stream
+
+| Key | Type | Written by | Removed by |
+|---|---|---|---|
+| `fw:stream:ingest` | stream, consumer group `workers` | http-ingress (`src http`), gateway operator close (`src operator`) — `XADD ... *` + `WAIT 1` | the worker, `XACK`+`XDEL` in one `MULTI` after the fold write |
+| `fw:stream:dlq` | stream | the worker, for entries that can never succeed (`origId`, `reason` added) | an operator |
+
+Entry fields: `evt` (the JSON envelope), `src`, optional `cid` (the request's
+`x-request-id`). The entry ID `<ms>-<seq>` is assigned by the master and its ms part
+is the event's `brokerTs` ([event-lifecycle.md](event-lifecycle.md) §2).
+
+Rules:
+
+- **Never trimmed.** No `MAXLEN`/`MINID`: a trim deletes unprocessed entries. The
+  stream holds only in-flight entries, so `XLEN` is the backlog
+  ([workers.md](workers.md) §6.4).
+- **`noeviction` protects it.** An evicted stream entry is an event that was
+  answered 202 and never processed (§4.4).
+- **The group and its PEL are part of the key**, so they replicate and are in every
+  pod's AOF; a failover or restart keeps track of what was delivered but not
+  acknowledged.
+- It is a normal key, so it inherits every guarantee in §3–§5: `min-replicas-to-write
+  1`, `WAIT 1`, AOF on every pod, Sentinel failover.
+
 ---
 
 ## 3. Topology
@@ -135,11 +158,38 @@ exists.
 There is **no admin/metrics port**. Valkey has no HTTP endpoint at all, so metrics go
 through `redis_exporter` (§7).
 
+### 3.1 Writes: `min-replicas-to-write 1` + `WAIT 1`
+
+| Setting | Production | Lab |
+|---|---|---|
+| `min-replicas-to-write` | **1** | 0 |
+| `min-replicas-max-lag` | 10 | 10 |
+| `FW_WRITE_GUARD_MIN_REPLICAS` (sentinel-bridge) | 1 — must equal `min-replicas-to-write` | 0 |
+| `FW_WAIT_REPLICAS` (http-ingress, ws-gateway) | 1 | 0 |
+
+- The master refuses every write with `NOREPLICAS` while it sees **no** replica
+  that acknowledged within 10 s. An isolated master therefore cannot accept writes.
+- Producers (`XADD` at http-ingress and at the operator close) then issue `WAIT 1`
+  and only acknowledge once a replica has the write. That closes the "master dies in
+  the replication gap" loss that asynchronous replication otherwise allows.
+- **Why 1, not 2.** With 2, losing **either** replica stopped every write, so one
+  Valkey pod down meant ingest down. With 1, any one Valkey pod can be lost and writes
+  continue. The cost is a bounded partition window — an old master that keeps one
+  replica on its side can accept writes until clients re-resolve — documented in
+  [fault-tolerance.md](fault-tolerance.md) §4.1 and [redis-sentinel.md](redis-sentinel.md) §6.
+
+`minAvailable: 2` on the Valkey PDB keeps a voluntary drain from ever taking the
+master below one replica.
+
 ---
 
 ## 4. Persistence
 
 ### 4.1 Configuration
+
+Every pod — master and both replicas — loads the same `valkey.conf`, so AOF is on
+everywhere. A replica persists the replication stream to its own AOF on its own PVC,
+and a promoted replica restarts from its own disk.
 
 ```text
 dir /data
@@ -229,62 +279,59 @@ hourly sidecar), and it was made because the requirement names a size.
 
 ### 4.3 RPO
 
-| Design | Loss window |
+| Event | Loss window |
 |---|---|
-| AOF `everysec` | ≤ 1 s |
-| `q.audit.events` replay | 0 for events acked by RabbitMQ, within a 24 h window |
+| One pod restarts | 0 — the other pods hold the data; it resyncs |
+| Master dies | 0 for acknowledged writes (`WAIT 1` put them on a replica) |
+| All pods restart at once (power loss) | ≤ 1 s of writes per pod not yet fsynced (`everysec`); an acknowledged write is in two pods' AOFs |
+| All three PVCs lost | everything — no copy outside Valkey ([persistence-and-durability.md](persistence-and-durability.md) §4) |
 
-The AOF closes the "up to one hour" window that snapshots left. The WAL is still
-authoritative, because it is the only copy that is **not** a cache: it holds the
-producer's original bytes for the full retention window (§4.5).
+The AOF closes the "up to one hour" window that snapshots left.
 
 ### 4.4 What is still true from the Valkey design
 
 - **`maxmemory-policy noeviction` is mandatory.** Any other policy silently deletes
-  live events at `maxmemory`, breaking the 7-day retention promise with no signal.
-  With `noeviction`, writes fail loudly, the worker requeues, and the backlog becomes
-  visible ([fault-tolerance.md](fault-tolerance.md) §3.9).
+  live events — and ingest stream entries — at `maxmemory`, breaking the 7-day
+  retention promise with no signal. With `noeviction`, writes fail loudly: the
+  ingress answers 503, workers leave entries pending, and the backlog becomes visible
+  ([fault-tolerance.md](fault-tolerance.md) §3.9).
 - **`maxmemory` must sit ABOVE the working set.** This inverts the usual "leave 20 %
-  free for eviction" advice, and is only tolerable because the WAL can refill.
+  free for eviction" advice: hitting it stops ingest, so the sizing headroom in
+  [sizing.md](sizing.md) §3.4 is what keeps it from happening.
 - **`--requirepass` is mandatory.** Sentinel's `auth-pass` and every client
   authenticate; without it Sentinel's `PING` is rejected, the master is permanently
   "down", and failover loops without converging
   ([fault-tolerance.md](fault-tolerance.md) §3.6).
 
-### 4.5 The WAL of record
-
-`q.audit.events` is plain JSON, published with a publisher confirm **before** the ack.
-It is the only copy that survives total loss of the datastore, and the only place
-per-delivery history still exists (§2.2). See
-[persistence-and-durability.md](persistence-and-durability.md) §4.
-
 ---
 
 ## 5. Split-brain protection
 
-Two layers, and the engine one is new.
+Three layers, and the engine one is new.
 
 ### Layer 1 — `min-replicas-to-write` (engine)
 
 ```text
-min-replicas-to-write 2
+min-replicas-to-write 1
 min-replicas-max-lag 10
 ```
 
-A master that cannot see two replicas with an ack within 10 s **refuses writes**:
+A master that cannot see at least one replica with an ack within 10 s **refuses writes**:
 
 ```
 -NOREPLICAS Not enough good replicas to write.
 ```
 
-That is the AGENTS.md rule enforced by the thing doing the writing. The worker maps
-the error to `nack(requeue=true)` and does **not** retry it in-process — retrying
-would spin against a master that is correctly refusing
-([workers.md](workers.md) §6).
+That is the split-brain rule enforced by the thing doing the writing. The ingress
+answers 503 (nginx retries); the worker leaves the entry pending and re-reads it after
+`FW_RETRY_MS` ([workers.md](workers.md) §6).
 
-**This is why the lab sets it to `0`.** One pod has no replica; `2` would make every
+Producers add `WAIT 1` on top (§3.1): the engine flag says "a replica is connected",
+`WAIT` says "a replica has *this* write".
+
+**This is why the lab sets it to `0`.** One pod has no replica; `1` would make every
 write fail, and the lab would come up permanently broken in a way that looks like a
-credential problem.
+credential problem. The lab also sets `FW_WAIT_REPLICAS=0` (`stream-lab.yaml`).
 
 ### Layer 2 — the endpoint gate (routing)
 
@@ -296,9 +343,9 @@ slave  -> [ "slave", ip, port, state, offset ]
 ```
 
 - If the pod Sentinel designates as master reports `master` with fewer than
-  `FW_WRITE_GUARD_MIN_REPLICAS` (default 2) connected replicas → **withhold the
+  `FW_WRITE_GUARD_MIN_REPLICAS` (1, equal to `min-replicas-to-write`) connected replicas → **withhold the
   endpoint**.
-- Withholding means `Endpoints/valkey` is set to zero addresses, workers see an empty
+- Withholding means `Endpoints/valkey` is set to zero addresses, clients see an empty
   endpoint list, and the pod gets label `fire-watch.io/writable=false` for humans and
   alerts.
 - When the replica count recovers the endpoint is published again on the next cycle
@@ -311,14 +358,17 @@ not.
 
 Accepted limitation, unchanged from the Valkey design: this is a **routing** gate.
 A client that bypasses the Service and talks to a pod IP can still attempt a write —
-and will be refused by the engine if the master is a minority. Workers and gateways
+and will be refused by the engine if the master sees no replica. Ingress, workers and gateways
 are forbidden from using pod IPs, enforced by review, since K8s cannot enforce it.
 
 ### Layer 3 — Sentinel quorum
 
-`quorum = 2` with majority promotion. A partitioned-off master cannot be promoted
-while the side holding 2 of 3 sentinels elects a new master; the old master is demoted
-via `REPLICAOF` on rejoin and discards its divergent tail. Full walkthrough in
+`quorum = 2` with majority promotion: 2 of 3 sentinels must agree to fail over. A
+partitioned-off master cannot be promoted while the side holding 2 of 3 sentinels
+elects a new master; the old master is demoted via `REPLICAOF` on rejoin and discards
+its divergent tail. With `min-replicas-to-write 1` that tail can be non-empty if the
+old master kept one replica on its side — the bounded window in
+[fault-tolerance.md](fault-tolerance.md) §4.1. Full walkthrough in
 [redis-sentinel.md](redis-sentinel.md) §6.
 
 ---
@@ -337,7 +387,7 @@ with `EVAL`/`EVALSHA` so the read-modify-write is atomic across three workers.
    `KEYS` — `ERR Script attempted to access a non local key`. A key minted inside Lua
    cannot be declared up front, so the script could only ever access keys the caller
    already computed.
-2. **Reproducibility.** The frontend, the verification scripts and any replay job must
+2. **Reproducibility.** The frontend, the verification scripts and any repair script must
    derive the same key from the same event. A key that exists only inside a
    server-side script cannot be reproduced outside the server.
 3. **It is pure.** Key generation is a hash of two input fields: no reads, no server
@@ -379,7 +429,7 @@ they answer different questions and one cannot be asked through the other:
 | Exporter | Target | Answers |
 |---|---|---|
 | `redis-exporter` | Sentinel (`26379`) | is quorum intact, is the master flapping — `redis_sentinel_*` |
-| `valkey-exporter` | `valkey:6379` (the master) | memory, eviction, replica count, AOF status — `redis_*` |
+| `valkey-exporter` | `valkey:6379` (the master) | memory, eviction, replica count, AOF status — `redis_*`; plus `fw:stream:ingest` and `fw:stream:dlq` length and group pending (`REDIS_EXPORTER_CHECK_SINGLE_STREAMS`) |
 
 A Sentinel-mode scrape never issues `INFO` against the data node, so it has no
 `used_memory`, no `evicted_keys` and no `connected_slaves`. Rules built on those would
@@ -390,7 +440,11 @@ Alerts are in [`k8s/base/60-monitoring.yaml`](../k8s/base/60-monitoring.yaml):
 
 | Signal | Alert condition |
 |---|---|
-| `redis_connected_slaves` | `< 2` for 2 min — the write gate is refusing writes |
+| `redis_connected_slaves` | `< 1` for 2 min — the write gate is refusing writes (`ValkeyWriteGateClosed`, critical) |
+| `redis_connected_slaves` | `< 2` for 5 min — one replica down, writes still succeed (`ValkeyReplicaDown`, warning) |
+| `redis_stream_length{stream="fw:stream:ingest"}` | `> 0` and not falling for 15 min — workers are not keeping up |
+| `redis_stream_group_messages_pending{stream="fw:stream:ingest",group="workers"}` | `> 1000` for 10 min — entries are stuck |
+| `redis_stream_length{stream="fw:stream:dlq"}` | `> 0` for 5 min — entries were dead-lettered |
 | `redis_evicted_keys_total` | **`> 0` — page immediately**, retention is already broken |
 | `redis_memory_used_bytes / redis_memory_max_bytes` | `> 0.98` for 5 min — writes are being rejected |
 | `redis_aof_last_write_status` | `== 0` for 5 min — durability is broken |
@@ -415,13 +469,20 @@ kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" 
 kubectl -n fire-watch exec valkey-1 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" INFO replication
 # role:slave, master_link_status:up
 
-# the write gate is ARMED (production only — a lab reports 0 by design)
+# the write gate is ARMED (production: 1 — a lab reports 0 by design)
 kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" CONFIG GET min-replicas-to-write
 
-# AOF is on and healthy
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" INFO persistence \
-  | grep -E 'aof_enabled|aof_last_write_status|aof_last_bgrewrite_status'
+# AOF is on and healthy — on EVERY pod, not just the master
+for i in 0 1 2; do
+  kubectl -n fire-watch exec valkey-$i -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" INFO persistence \
+    | grep -E 'aof_enabled|aof_last_write_status|aof_last_bgrewrite_status'
+done
 kubectl -n fire-watch exec valkey-0 -- ls -la /data/appendonlydir
+
+# the ingest stream: backlog, group, pending, dead letters
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" XLEN fw:stream:ingest
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" XINFO GROUPS fw:stream:ingest
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" XLEN fw:stream:dlq
 
 # a record, end to end
 kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 -a "$VALKEY_PASSWORD" \

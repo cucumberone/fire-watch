@@ -157,7 +157,7 @@ in every version that accepts it.
 
 ## 5. Client behaviour
 
-Workers and gateways connect through a Sentinel-aware client:
+http-ingress, workers and gateways connect through a Sentinel-aware client:
 
 | Language | Library | Mechanism |
 |---|---|---|
@@ -173,7 +173,13 @@ Hard rules:
 
 ## 6. Split-brain walkthrough
 
-Scenario: `node1` is partitioned from `node2` and `node3`. `valkey-0` runs on `node1`.
+Settings that decide the outcome: 3 sentinels, `quorum 2` (2 must agree to fail
+over), `min-replicas-to-write 1` + `min-replicas-max-lag 10` on every Valkey pod,
+`FW_WRITE_GUARD_MIN_REPLICAS 1` on the bridge, `WAIT 1` at every producer.
+
+### 6.1 Master isolated from both replicas
+
+Scenario: `node1` is partitioned from `node2` and `node3`. `valkey-0` (master) runs on `node1`.
 
 ```mermaid
 sequenceDiagram
@@ -182,29 +188,53 @@ sequenceDiagram
   participant S3 as sentinel on node3
   participant New as valkey-1 (node2)
 
-  Note over Old: clients on node1 side can still write
+  Note over Old: sees 0 replicas within 10 s<br/>-> NOREPLICAS on every write
   S2->>Old: PING (timeout)
   S3->>Old: PING (timeout)
   S2->>S3: is master down? (quorum 2/3 reached)
   S3->>S2: yes
   S2->>New: SLAVEOF NO ONE
-  Note over New: promoted, now accepts writes
+  Note over New: promoted, sees valkey-2 -> accepts writes
   S2->>S2: publish new master = valkey-1
-  Note over Old: write-guard trips after 30s<br/>(connected_slaves = 0)
+  Note over Old: write-guard trips<br/>(connected_slaves = 0)
   Note over Old: old master removed from Service
-  Note over Old: on rejoin -> REPLICAOF valkey-1,<br/>divergent tail discarded
+  Note over Old: on rejoin -> REPLICAOF valkey-1,<br/>tail discarded (empty: it refused writes)
 ```
 
 Outcomes:
 
 | Guarantee | Status |
 |---|---|
-| Two masters accepting routed writes | Prevented (quorum 2/3 + write guard) |
-| Writes on the minority side reachable from workers | Prevented (workers use Sentinel/Service) |
-| Writes on the minority side that bypass routing | **Possible** — accepted, documented in [valkey.md](valkey.md) §3 |
-| Data loss on the minority side | Yes, by design: un-replicated writes are discarded on rejoin. This is the correct choice under R1, since keeping them would require conflicting merge semantics. |
-| Data loss for events already in RabbitMQ | None ([persistence-and-durability.md](persistence-and-durability.md) §4) |
+| Two masters accepting writes | Prevented — the engine refuses on the isolated side (`min-replicas-to-write 1`), quorum 2/3 promotes on the other |
+| Writes on the minority side reachable from clients | Prevented (clients use Sentinel/Service; the engine refuses anyway) |
+| Writes on the minority side that bypass routing | Refused by the engine (`NOREPLICAS`) |
+| Ingest during the switch | http-ingress answers 503 until it re-resolves; nginx retries; workers leave entries pending |
+| Data loss | None for acknowledged events: every 202 waited for a replica (`WAIT 1`), and that replica is on the majority side |
 
+### 6.2 Master keeps one replica on its side
+
+Scenario: `node1` and `node2` (with `valkey-0` master and `valkey-1` replica) are cut
+off from `node3`, but **two sentinels** end up on the `node3` side (e.g. a sentinel
+pod was rescheduled there, or the partition is asymmetric).
+
+1. The `node3`-side sentinels reach quorum and promote `valkey-2`.
+2. `valkey-0` still sees `valkey-1` with a fresh ack, so `min-replicas-to-write 1`
+   is satisfied and it **keeps accepting writes** from any client still connected to it.
+   `WAIT 1` also succeeds there, because `valkey-1` acknowledges.
+3. The bridge (following Sentinel) points `Endpoints/valkey` at `valkey-2`; clients
+   that reconnect or re-resolve through Sentinel move to `valkey-2`.
+4. On heal, `valkey-0` and `valkey-1` are made replicas of `valkey-2`; writes they
+   accepted in steps 2–3 are **discarded**.
+
+This is the window `min-replicas-to-write 1` accepts in exchange for surviving the
+loss of any one Valkey pod. It is bounded by client re-resolution, the bridge's
+endpoint withholding, nginx retrying 503s, and worker redelivery of entries that
+were not `XACK`ed on the new master. With the earlier setting of 2, step 2 would have
+refused — but losing either replica would also have stopped ingest. Full reasoning:
+[fault-tolerance.md](fault-tolerance.md) §4.1.
+
+Normal placement (one sentinel per node, required anti-affinity) makes 6.2 need two
+faults at once; 6.1 is the single-partition case.
 ## 7. Monitoring
 
 Sentinel speaks RESP on 26379 and has **no HTTP endpoint**, so Prometheus cannot scrape it directly. A `redis-exporter` Deployment bridges that ([k8s/base/33-redis-exporter.yaml](../k8s/base/33-redis-exporter.yaml)). Rules are in [k8s/base/60-monitoring.yaml](../k8s/base/60-monitoring.yaml).

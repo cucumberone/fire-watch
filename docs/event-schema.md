@@ -32,7 +32,7 @@ curl -X POST http://<ingress>/events \
     "EVT_AgentOwner": "AM-000042",
     "EVT_Environment": "production"
   }'
-# 202 {"accepted":1}   — only after the broker confirms
+# 202 {"accepted":1}   — only after XADD fw:stream:ingest + WAIT 1 succeeded
 ```
 
 Three shapes are accepted:

@@ -17,7 +17,7 @@ Node.js gateway that streams events to browser clients over WebSocket. Stateless
 
 Anti-affinity is **required**, not preferred. The earlier reasoning ("preferred, because required spread would leave pods Pending on a 2-node cluster") does not apply: the target is 3 nodes ([sizing.md](sizing.md) §3.2), so required spread always schedules. Preferred affinity would allow all three pods to land on one node, and losing that node would take the gateway to **zero replicas** — the opposite of the H/A requirement ([fault-tolerance.md](fault-tolerance.md) §3.4).
 
-Accepted consequence: after a node loss the third pod stays `Pending`, because no node may hold two copies. Same behaviour as RabbitMQ and Valkey, and the correct one.
+Accepted consequence: after a node loss the third pod stays `Pending`, because no node may hold two copies. Same behaviour as Valkey and Sentinel, and the correct one.
 
 ## 2. Why stateless works
 
@@ -53,7 +53,7 @@ Server → client:
 
 Rules:
 
-- `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **broker timestamp** index, so they stay correct even when producer clocks are skewed.
+- `since` bounds the backfill. A missing `since` means live-only — never an unbounded scan, which would stall the pod. Backfill ranges use the **arrival timestamp** (`brokerTs`) index, so they stay correct even when producer clocks are skewed.
 
   **With no source filter it reads `idx:event:all`.** It used to be skipped entirely in that case, on the grounds that without a source there was no bounded index to read and scanning every source is the unbounded scan this design forbids. That reasoning predates the global index. The worker writes every event to one timeline, so "everything since T" is a single bounded `ZRANGEBYSCORE` — the same read `op: allEvents` already does.
 
@@ -492,7 +492,7 @@ Two lessons are encoded as tests in `subscription.test.js`:
 | Pub/sub | `SUBSCRIBE fw:ch:events` on the **master**, since Valkey propagates pub/sub from the primary |
 | Backfill reads | `ZRANGEBYSCORE` + `MGET` against the master by default |
 | Read scaling (later) | point backfill reads at a replica Service once replica lag is monitored; not needed at current scale |
-| Write access | **exactly one method**: `ackAlert` ([acknowledge.md](acknowledge.md) §4) |
+| Write access | `ackAlert` ([acknowledge.md](acknowledge.md) §4), plus `enqueueEvent` for the operator close: `XADD fw:stream:ingest * evt <closeEvent> src operator` + `WAIT FW_WAIT_REPLICAS 5000`, falling back to the direct `closeAlert` write if either fails ([event-lifecycle.md](event-lifecycle.md) §8.2). Env: `FW_STREAM_KEY` (`fw:stream:ingest`), `FW_WAIT_REPLICAS` (1; 0 in the lab) |
 
 There is no general write surface. `valkey.js` has no `set`, `del` or generic `eval`, so the gateway cannot modify events, indexes or alert state beyond the two ack fields. The absence of a method is a stronger guarantee than a comment.
 
@@ -544,7 +544,7 @@ The gateway is a **byte pipe** for payload fields: `payload.msgc` may be gzip, a
 | memory churn | inflated strings for every subscriber, then discarded |
 | pointless | the browser can decompress natively with `DecompressionStream` |
 
-The gateway *does* need the plain envelope (`id`, `source`, `type`, `severity`, broker ts), which is never compressed — that is what makes filtering and subscription matching possible without touching the payload ([payload-and-compression.md](payload-and-compression.md) §4).
+The gateway *does* need the plain envelope (`id`, `source`, `type`, `severity`, `brokerTs`), which is never compressed — that is what makes filtering and subscription matching possible without touching the payload ([payload-and-compression.md](payload-and-compression.md) §4).
 
 ## 6. OpenShift Route
 
@@ -597,9 +597,10 @@ kubectl -n fire-watch get route ws-gateway -o jsonpath='{.spec.host}{"\n"}'
 websocat -t "wss://$(kubectl -n fire-watch get route ws-gateway -o jsonpath='{.spec.host}')" \
   <<< '{"op":"subscribe","sources":["probe"],"since":"2026-11-09T00:00:00Z"}'
 
-# publish an event and confirm it arrives on the socket
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin publish exchange=fx.events routing_key=event.ingest \
-  payload='{"id":"t2","source":"probe","type":"test","ts":"2026-11-09T00:10:00Z","payload":{}}'
+# post an event through the ingress and confirm it arrives on the socket
+curl -sS -X POST "http://<node-ip>:30900/events" -H "X-Ingest-Token: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"EVT_Device":"probe","EVT_EventKey":"test","EVT_Severity":"CRITICAL","EVT_Summary":"ws check","EVT_Agent":"curl","EVT_AgentOwner":"AM-1"}'
 
 # scale-out check
 kubectl -n fire-watch scale deploy/ws-gateway --replicas=6

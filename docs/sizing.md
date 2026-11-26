@@ -60,8 +60,9 @@ Measure it:
 
 ```bash
 ZCARD idx:event:all     # records in the window
-# and compare with the delivery rate from RabbitMQ
-rabbitmqctl list_queues name message_stats.publish_details.rate
+# and compare with the delivery rate: http-ingress accepted batches, or the stream
+# entry IDs over a minute (XINFO STREAM fw:stream:ingest -> entries-added)
+XINFO STREAM fw:stream:ingest
 ```
 
 ## 2. Working set
@@ -108,7 +109,7 @@ The event size varies. Do **not** plan with the average:
 | 4 KiB | ≈ 54 GiB | ≈ 162 GiB |
 | 8 KiB | ≈ 105 GiB | ≈ 315 GiB |
 
-`message_bytes / messages` from `rabbitmqctl list_queues` gives the true mean; use a histogram if the tail matters.
+`MEMORY USAGE event:<key>` over a sample of records gives the true mean ([§6](#6-verification)); use a histogram if the tail matters.
 
 ### 2.3 Storm headroom
 
@@ -149,40 +150,44 @@ gateway: pass the bytes through — never decompress
 browser: DecompressionStream -> plain text
 ```
 
-Trade-off: the stored `msgc` is no longer readable in `valkey-cli`, and it is no longer substring-searchable in Valkey. The audit queue stays plain, so history searches go through RabbitMQ instead ([payload-and-compression.md](payload-and-compression.md) §6). **Compression is the right move if storm headroom or node RAM gets expensive** — it is roughly a 3x hardware reduction.
+Trade-off: the stored `msgc` is no longer readable in `valkey-cli`, and it is no longer substring-searchable in Valkey ([payload-and-compression.md](payload-and-compression.md) §6). **Compression is the right move if storm headroom or node RAM gets expensive** — it is roughly a 3x hardware reduction.
 
 ## 3. Per-component resources
 
 ### 3.1 Resource table
 
+Verified against `kustomize build k8s/base` (Prometheus is not in the base and is listed for completeness).
+
 | Component | Reps | CPU req | CPU lim | Mem req | Mem lim | PV |
 |---|---|---|---|---|---|---|
-| RabbitMQ | 3 | 250m | 1 | 512Mi | 1Gi | 96Gi |
-| Valkey | 3 | 500m | 4 | 8Gi | **52Gi** | 64Gi |
-| Sentinel | 3 | 20m | 200m | 64Mi | 128Mi | — |
+| Valkey (server) | 3 | 500m | 4 | 8Gi | **52Gi** | 64Gi |
+| Valkey (`aof-rewriter` sidecar) | 3 | 10m | 100m | 16Mi | 64Mi | — |
+| Sentinel | 3 | 20m | 200m | 64Mi | 128Mi | 1Gi |
 | sentinel-bridge | 2 | 20m | 200m | 64Mi | 192Mi | — |
 | redis-exporter | 1 | 10m | 100m | 32Mi | 96Mi | — |
+| valkey-exporter | 2 | 10m | 100m | 32Mi | 96Mi | — |
 | http-ingress | 3 | 100m | 500m | 128Mi | 384Mi | — |
 | Workers | 3 | 100m | 500m | 256Mi | 512Mi | — |
 | WS gateway | 3 | 200m | 1 | 256Mi | 768Mi | — |
 | Frontend | 3 | 20m | 200m | 64Mi | 128Mi | — |
 | Prometheus (optional) | 1 | 200m | 1 | 512Mi | 1Gi | 50Gi |
-| **Sum** | **25 pods** | **≈ 3.8 CPU** | **≈ 23.7 CPU** | **≈ 28.4 GiB** | **≈ 154 GiB** | **530Gi** |
+| **Sum** | **24 pods** | **≈ 3.1 CPU** | **≈ 21.2 CPU** | **≈ 27.0 GiB** | **≈ 163.5 GiB** | **245Gi** |
 
-Valkey dominates both columns: `3 × 8Gi` of requests and `3 × 52Gi` of limits, i.e. 24 of the 28 GiB requested and 156 of the 166 GiB of limits. Everything else is noise by comparison, which is why the node-size decision in §3.3 is the only one that really matters.
+Without Prometheus the base is 23 pods, 2.92 / 20.2 CPU, 26.5 / 162.5 GiB, 195Gi of PV.
 
-PV total: `3 × 96 (RabbitMQ) + 3 × 64 (Valkey) + 50 (Prometheus) = 530 GiB`.
+Valkey dominates both columns: `3 × 8Gi` of requests and `3 × 52Gi` of limits, i.e. 24 of the 27 GiB requested and 156 of the 163.5 GiB of limits. Everything else is noise by comparison, which is why the node-size decision in §3.3 is the only one that really matters.
+
+PV total: `3 × 64 (Valkey) + 3 × 1 (Sentinel) + 50 (Prometheus) = 245 GiB`. The ingest stream adds no PV of its own: it is a Valkey key, inside the Valkey AOF (§3.6).
 
 ### 3.2 Cluster recommendation
 
-**3 worker nodes, each 8 vCPU / 128 GiB RAM / ~200 GiB storage.**
+**3 worker nodes, each 8 vCPU / 128 GiB RAM / ~200 GiB storage** (room for a second Valkey PV after a node loss, plus Prometheus).
 
-Per node: one Valkey (500m req / 4 CPU lim, 8Gi req / 52Gi lim), one RabbitMQ
-(250m / 1 CPU, 512Mi / 1Gi), one Sentinel, one worker, one gateway, one frontend.
-**Requests** ≈ 1.1 CPU / 9.1 GiB per node; **limits** ≈ 6.9 CPU / 54.5 GiB per node.
+Per node: one Valkey (510m req / 4.1 CPU lim, ~8Gi req / ~52Gi lim incl. the sidecar),
+one Sentinel, one http-ingress, one worker, one gateway, one frontend.
+**Requests** ≈ 0.95 CPU / 8.8 GiB per node; **limits** ≈ 6.7 CPU / 53.9 GiB per node.
 Two Valkey pods (104 GiB of limits) fit on a 128 GiB node, which is what §3.3
 requires.
-
 ### 3.3 The node-loss rule (get this right)
 
 To **reschedule** an evicted Valkey pod, a surviving node must host **two** Valkey pods, because it already runs one:
@@ -200,7 +205,7 @@ This general rule is the single most consequential hardware decision at this sca
 | 64 GiB | evicted Valkey pod stays **Pending** | 3 → 2, permanently, until the node returns |
 | **128 GiB** | pod reschedules onto a survivor | **3 → 3**, full redundancy restored |
 
-Data safety holds in both cases (master + replica + audit WAL), but only 128 GiB nodes keep the R3 promise of 3 replicas on 3 nodes through a node loss. Any smaller node size is a deliberate trade of redundancy for cost, and must be recorded in [roadmap.md](roadmap.md) §3.2.
+Data safety holds in both cases (master + one replica, `min-replicas-to-write 1`, AOF on each), but only 128 GiB nodes keep the R3 promise of 3 replicas on 3 nodes through a node loss. Any smaller node size is a deliberate trade of redundancy for cost, and must be recorded in [roadmap.md](roadmap.md) §3.2.
 
 ### 3.4 Valkey memory detail
 
@@ -218,10 +223,11 @@ Request is 8 GiB so the scheduler places it realistically; the limit is 52 GiB a
 what must fit on a node.
 
 `maxmemory` must sit **above** the expected 7-day working set or writes start being
-REFUSED with an OOM error (`noeviction`, [valkey.md](valkey.md) §4.1). This is the
-opposite of the usual "leave 20 % free for eviction" advice, and it is only tolerable
-because the audit WAL can refill anything the datastore loses
-([persistence-and-durability.md](persistence-and-durability.md) §4).
+REFUSED with an OOM error (`noeviction`, [valkey.md](valkey.md) §4.4). This is the
+opposite of the usual "leave 20 % free for eviction" advice: a refusal stops ingest
+(http-ingress answers 503 and nginx buffers) but loses nothing, whereas eviction would
+silently delete records and unprocessed stream entries. The gap between the 33.4 GiB
+expected peak and `maxmemory 40gb` is also what absorbs a stream backlog (§3.6).
 
 The extra headroom over the Dragonfly figure is for the **AOF rewrite**: `BGREWRITEAOF`
 forks, and the child's copy-on-write pages grow with write volume during the rewrite
@@ -254,31 +260,34 @@ rewrite write rate      ≈ 33 GiB / 3 600 s ≈ 9.4 MiB/s sustained while rewri
 - The 64 GiB PV is sized for *two* copies during a rewrite (the old file still exists
   until the switch), which 32 MB of growth does not change.
 
-### 3.6 RabbitMQ detail
+### 3.6 Ingest stream
 
-At 1 000/min the daily volume is small enough that the audit WAL covers the **full 7-day retention**:
+`fw:stream:ingest` holds only **in-flight** entries: each is deleted (`XACK`+`XDEL`) as soon as a worker has folded it, so in steady state its length is near zero and its memory negligible. It is never trimmed, so it grows only while workers cannot keep up or cannot write.
 
 ```text
-audit volume = 1 000/min × 1 440 min × 2 048 B ≈ 2.95 GB/day ≈ 2.75 GiB/day
-7 days       ≈ 19.3 GiB
+per entry ≈ 2 048 B evt + ~150 B (src, cid, stream node overhead, PEL entry) ≈ 2.2 KiB
+backlog growth, workers down, Valkey up:
+  sustained 1 000/min  -> 60 000 entries/h   ≈ 130 MiB/h
+  storm     500/s      -> 1.8 M entries/h    ≈ 3.8 GiB/h
 ```
 
-| Volume | Size | Driver |
+| Backlog source | Grows? | Why |
 |---|---|---|
-| `q.event.ingest` journal | ≈ 8 GiB | transient backlog; absorbs a 500/s storm (~1 GiB/h) |
-| `q.audit.events` | 64 GiB cap | 7-day window ≈ 19.3 GiB, **3.3x slack** |
-| `q.event.ingest.dlq` | 8 GiB cap | poison messages, should stay near zero |
-| headroom | 16 GiB | compaction, memory spill, alarms |
-| **Total** | **96 GiB** | |
+| Workers down / not ready | yes | ingress keeps appending; nothing removes entries |
+| Valkey refusing writes (`NOREPLICAS`, OOM) | **no** | the `XADD` is refused too — ingress answers 503 and the backlog moves to nginx's buffer |
+| Worker fold failing (script error) | yes, in the PEL | entries stay pending and are retried forever |
 
-Throughput: 16.7 msg/s sustained, 500 msg/s peak. RabbitMQ is far from its limits; disk I/O for the quorum journal is the only meaningful cost.
+The backlog comes out of the same `maxmemory` as the records: with the §3.4 numbers (33.4 GiB expected peak, `maxmemory 40gb`) there is room for ~50 h of sustained backlog or ~1.7 h of storm backlog before Valkey starts refusing writes. `IngestStreamBacklogGrowing` fires after 15 minutes ([monitoring.md](monitoring.md)). Entries are also in every pod's AOF, so a backlog makes the next AOF rewrite proportionally larger — not a capacity concern at these sizes.
 
+`fw:stream:dlq` should stay at zero; it is never trimmed and is alerted on while non-empty.
+
+There is no separate audit-queue storage any more: the 7-day audit WAL (≈19.3 GiB per broker node) was dropped with the message broker ([persistence-and-durability.md](persistence-and-durability.md) §3.1).
 ## 4. Scaling levers
 
 | Pressure | Lever | Ceiling |
 |---|---|---|
 | Storm headroom exhausted (evictions) | raise `maxmemory` + pod limit + node RAM together, or compress values, or shorten TTL | one node's RAM |
-| Queue backlog rising | add workers on queue depth | consumer-bound |
+| Stream backlog rising | add workers on `redis_stream_length{stream="fw:stream:ingest"}` | consumer-bound |
 | WebSocket connections | add gateways on connection count | linear, stateless |
 | Retention window | TTL is the only lever; RAM scales linearly | §2.2 |
 | Write throughput | none needed — 500/s peak is a small fraction of one Valkey main thread | n/a |
@@ -287,7 +296,6 @@ Throughput: 16.7 msg/s sustained, 500 msg/s peak. RabbitMQ is far from its limit
 
 | Component | Why fixed at 3 |
 |---|---|
-| RabbitMQ | quorum queues with 3 members |
 | Valkey | 1 master + 2 replicas; more pods do not add redundancy value and complicate Sentinel ranking |
 | Sentinel | 3 is the canonical odd quorum |
 | Frontend | static; 3 exists purely for node-loss tolerance |
@@ -295,9 +303,9 @@ Throughput: 16.7 msg/s sustained, 500 msg/s peak. RabbitMQ is far from its limit
 ## 6. Verification
 
 ```bash
-# true event size and both rates (sustained vs storm)
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqctl list_queues name messages message_bytes \
-  message_stats.publish_details.rate
+# arrival rate and backlog (sustained vs storm): entries-added grows with every XADD,
+# length is the backlog not yet folded
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 XINFO STREAM fw:stream:ingest
 
 # actual per-record cost in Valkey — compare with the 2 590 B model
 kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 MEMORY USAGE event:<32-hex-key>

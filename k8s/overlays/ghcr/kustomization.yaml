@@ -50,8 +50,8 @@ images:
     newName: ghcr.io/cucumberone/fire-watch/sentinel-bridge
     newTag: latest
 
-# Attach the pull secret to every pod that runs one of our images. RabbitMQ,
-# Valkey and Sentinel come from docker.io and need no credential.
+# Attach the pull secret to every pod that runs one of our images. Valkey and
+# Sentinel come from docker.io and need no credential.
 patches:
   - target:
       kind: Deployment

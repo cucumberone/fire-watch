@@ -1,5 +1,7 @@
-# Valkey StatefulSet — 1 master + 2 replicas, manifests only, no operator.
-# See docs/valkey.md. OrderedReady so replicas never attempt replication before
+# Valkey StatefulSet — 1 master + 2 replicas (3 pods), manifests only, no operator.
+# See docs/valkey.md. Every pod runs the same config, so every pod — master and
+# replicas — writes its own AOF to its own PVC.
+# OrderedReady so replicas never attempt replication before
 # valkey-0 exists. Roles are applied at runtime by sentinel-bridge, never
 # hard-coded here: a restarted pod must not assume a master that may since have
 # been demoted (docs/redis-sentinel.md §4).
@@ -24,7 +26,7 @@ spec:
         # Bumped by hand whenever `valkey.conf` changes in a way that must be
         # picked up by a restart (the file is read at boot only, unlike the
         # event-fold script which the worker re-reads).
-        fire-watch/valkey-config-checksum: "1"
+        fire-watch/valkey-config-checksum: "2"
     spec:
       terminationGracePeriodSeconds: 120
       securityContext:

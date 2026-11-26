@@ -16,10 +16,10 @@ This repo sets up an event server.
 ## Deployment
 
 - Create manifests that fit OpenShift (i.e. **routes instead of ingress**) in the `k8s` directory.
-- **RabbitMQ:** 3 replicas of the latest RabbitMQ server with quorum queues and affinity so they never run on the same node.
-- **Valkey:** 3 replicas. They need the "always find 2 replicas" setting to receive writes — split brain protection. That is `min-replicas-to-write 2`, enforced by the engine; the lab runs **1 replica** with it set to `0`.
+- **No RabbitMQ.** The HTTP ingress writes straight to a Valkey stream (`XADD fw:stream:ingest`, then `WAIT 1`) and answers 202 only after that; workers read it with a consumer group.
+- **Valkey:** 3 pods (1 master + 2 replicas) on different nodes, **AOF on every pod**. `min-replicas-to-write 1`, enforced by the engine — one Valkey pod can be lost and writes continue, an isolated master refuses writes. Sentinel quorum is 2. The lab runs **1 pod** with it set to `0`.
 - **One record per condition.** The Valkey key is derived from `EVT_Device` + `EVT_Summary` (`event:<sha256[0:32]>`), so a duplicate is dropped by updating `lastSeen` / `count` on the existing hash instead of storing a second record.
-- **Workers:** 3 replicas getting messages from RabbitMQ. For now, write a small JavaScript service that writes whatever comes to the worker into Valkey.
+- **Workers:** 3 replicas reading `fw:stream:ingest` with `XREADGROUP` (group `workers`), running the same validate → compress → history → fold logic, and removing an entry with `XACK` + `XDEL` (one MULTI) only after Valkey confirmed the write. Failed entries stay pending and are retried; a dead worker's entries are taken over with `XAUTOCLAIM`; unprocessable ones go to `fw:stream:dlq`.
 - **Probes:** if you see the need for readiness probes, create them and handle them.
 - **Valkey persistence:** use the AOF feature, but refresh that file with a new one from what's left in Valkey once it reaches 32 MB. This is to make restart and reread fast. Implemented as `appendonly yes` + `appendfsync everysec`, with rotation at 32 MB of AOF growth enforced by the `aof-rewriter` sidecar (the engine has no "N bytes of growth" setting, and `auto-aof-rewrite-percentage 0` disables its own trigger rather than relaxing it).
 - **Redis Sentinels:** needed for the workers, I think.
@@ -35,21 +35,20 @@ This repo sets up an event server.
 - [Architecture](docs/architecture.md) — components, data flow, message contract, failure matrix
 - [Event Schema](docs/event-schema.md) — the producer contract (`EVT_*`), severity mapping, validation rules
 - [Fault Tolerance Audit](docs/fault-tolerance.md) — per-component H/A and split-brain verification, 9 defects found and fixed
-- [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, broker-timestamp ordering, content-keyed dedup, redelivery safety
+- [Event Lifecycle](docs/event-lifecycle.md) — severities, close semantics, stream-entry-ID ordering, content-keyed dedup, redelivery safety
 - [Acknowledgement](docs/acknowledge.md) — operator ack, the one gateway write, cleared on re-fire
-- [Operator Journal](docs/journal.md) — right-click notes per incident, append-only, signed, and the audit copy that makes them durable
+- [Operator Journal](docs/journal.md) — right-click notes per incident, append-only, signed
 - [Payload & Compression](docs/payload-and-compression.md) — `msg` / `msgc`, gzip at the worker, `DecompressionStream` in the browser
-- [RabbitMQ](docs/rabbitmq.md) — 3-node quorum cluster, peer discovery, anti-affinity, probes
-- [Valkey](docs/valkey.md) — master + 2 replicas, `min-replicas-to-write`, AOF, the `event:<key>` record model, the Lua fold, sizing
+- [Valkey](docs/valkey.md) — master + 2 replicas, `min-replicas-to-write 1`, AOF on every pod, the ingest stream, the `event:<key>` record model, the Lua fold, sizing
 - [Redis Sentinel](docs/redis-sentinel.md) — failover, `sentinel-bridge`, split-brain walkthrough
 - [Persistence & Durability](docs/persistence-and-durability.md) — how "no data loss" is met (**read §3**)
 - [Configuration](docs/configuration.md) — the left nav and Data to columns: global mapping of `EVT_*` keys to column names, `config:columns` in Valkey, locked core columns
 - [History](docs/history.md) — the per-delivery audit trail: `hist:` + `idx:history`, 3-day retention, why it is written inside the fold, `op: history`, the History tab
-- [Workers](docs/workers.md) — consume, write, ack-last ordering, idempotency
+- [Workers](docs/workers.md) — consumer group, write then XACK+XDEL, retry, XAUTOCLAIM, DLQ stream, idempotency
 - [WebSocket Server](docs/websocket-server.md) — stateless gateway, subscription protocol, windowed event queries, HPA
 - [Frontend](docs/frontend.md) — static React + MUI app, two Routes, CSP
 - [Networking](docs/networking.md) — Services, Routes, ports, why NetworkPolicies are omitted
-- [HTTP Ingress](docs/http-ingress.md) — external nginx → AMQP, the 202 contract, publisher confirms
+- [HTTP Ingress](docs/http-ingress.md) — external nginx → Valkey stream, the 202 contract, `XADD` + `WAIT`
 - [Monitoring](docs/monitoring.md) — the alert set, the two exporters (Sentinel and master), and the metric names that were wrong before
 - [Kustomize](docs/kustomize.md) — base + overlays, the `lab` single-replica overlay, the `ghcr` image overlay
 - [Images](docs/images.md) — manual GitHub Actions build/push to GHCR, tag derivation under `workflow_dispatch`, pull secret, pinning, weekly version purge, repo variables vs secrets for deploy

@@ -58,7 +58,7 @@ free.
 | `FW_VALKEY_STATEFULSET` | `valkey` | pod label selector value |
 | `FW_VALKEY_PORT` | `6379` | data port |
 | `VALKEY_PASSWORD` | *required* | from Secret |
-| `FW_WRITE_GUARD_MIN_REPLICAS` | `2` | below this, withhold the endpoint |
+| `FW_WRITE_GUARD_MIN_REPLICAS` | `1` | below this, withhold the endpoint |
 | `FW_WRITABLE_LABEL` | `fire-watch.io/writable` | label set on each pod |
 | `FW_RECONCILE_INTERVAL` | `5s` | loop period |
 | `FW_LEASE_NAME` | `sentinel-bridge-leader` | leader election lease |

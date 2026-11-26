@@ -35,8 +35,8 @@
 # event" — and it makes storage grow with CONDITIONS, not deliveries
 # (docs/sizing.md §1.1).
 #
-# Per-delivery history is NOT lost: it is in `q.audit.events`
-# (docs/persistence-and-durability.md §4).
+# Per-delivery history is NOT lost: every delivery is forked into `hist:` before
+# this script runs (docs/history.md).
 #
 # KEYS[1] = event:<key>          (hash: the record)
 # KEYS[2] = idx:event:all        (zset: key -> last broker ts)
@@ -49,7 +49,7 @@
 # never drift from the state it indexes — a crash between an HSET and a separate
 # ZADD would otherwise leave a phantom row on every operator's screen forever.
 #
-# ARGV[1] = broker_ts_ms
+# ARGV[1] = broker_ts_ms (the ms part of the ingest stream entry ID)
 # ARGV[2] = arrival event id (identity of THIS delivery; becomes lastId/closedBy)
 # ARGV[3] = severity
 # ARGV[4] = bare event key (the index member)
@@ -61,7 +61,7 @@
 # Returns: 0 stale/redelivery | 1 applied | 3 closed
 #
 # THE AUDIT TRAIL IS NOT HERE. Every delivery is forked into `hist:` by the worker
-# BEFORE this script runs, so the trail records what the broker handed us rather
+# BEFORE this script runs, so the trail records what the stream handed us rather
 # than what the dedup accepted (docs/history.md §3, services/worker/src/store.js
 # recordDelivery). Nothing in this script knows or cares about it.
 apiVersion: v1

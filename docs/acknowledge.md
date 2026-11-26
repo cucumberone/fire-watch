@@ -139,14 +139,14 @@ The menu carries **Acknowledge**, **Close** and **Information**. Close is an
 operator-initiated retirement, and it ends in the *same state a CLEAR event from
 the source produces* — because it IS an event.
 
-**The gateway injects a real event** into the ingest exchange
+**The gateway injects a real event** into the ingest stream
 ([event-lifecycle.md](event-lifecycle.md) §8.2); the worker then retires the record
 through the ordinary fold. Nothing is written directly.
 
 | What happens | Where |
 |---|---|
-| an event with `severity: CLOSE` is published, broker-confirmed | gateway → `fx.events` |
-| it is validated, compressed, folded, forked into the audit trail | worker |
+| an event with `severity: CLOSE` is appended (`XADD fw:stream:ingest ... src operator`) and replicated (`WAIT 1`) | gateway → `fw:stream:ingest` |
+| it is validated, compressed, forked into the `hist:` trail, folded | worker |
 | the fold sets `state=closed`, `severity=CLOSE`, `closedBy`, `closedAt` | worker |
 | `ZREM idx:event:open` | worker |
 | `ZADD idx:event:closed` | worker |
@@ -170,7 +170,7 @@ monitoring resolved. Both render green, both are retirements.
 already retired gets `status: 'already'` from the direct-write check, and the first
 close wins — nobody overwrites the record of who actually closed it.
 
-**Broker outage.** The publish is broker-confirmed. If it fails, the gateway falls
+**Stream append refused.** The append waits for a replica (`WAIT`). If either step fails, the gateway falls
 back to the direct write (`closeAlert`) so an operator can still clear an incident;
 that path is logged at `warn` because it is the only case where a close leaves no
 event behind ([event-lifecycle.md](event-lifecycle.md) §8.2.3).
@@ -264,11 +264,12 @@ What it does **not** touch, and why:
 |---|---|
 | `event:<key>` and its `count` | The fold owns that number. A second writer decrementing it would race the fold and produce a count that disagrees with the stored state. The row's count therefore still includes the deleted event until the next fold write — an honest visible artefact rather than a silent corruption. |
 | `journal:{key}` | Keyed by the record, and a LIST beside it rather than fields on it. The fold owns the hash and rewrites it atomically, so the notes live elsewhere and survive a record delete ([journal.md](journal.md) §2.1). |
-| The RabbitMQ audit copy (`q.audit.events`) | It is a plain-text log written before the ack. There is no operator path to delete from it, so the event is **not** fully erased — only the queryable record is gone. Anyone relying on delete for compliance (GDPR-style erasure) must know this. |
-| The Valkey AOF | The append log still holds the write that created the record until the next `BGREWRITEAOF`, which now happens at 32 MB of growth rather than on a clock — so the window is bounded by write volume, not time. AOF replay after a crash inside that window can therefore resurrect a just-deleted record ([valkey.md](valkey.md) §4.2). |
+| The ingest stream | Nothing to touch: an entry is removed from `fw:stream:ingest` as soon as it has been folded. Only an arrival still in the backlog at delete time would re-create the record when it is processed. |
+| The Valkey AOF | Every pod's append log still holds the write that created the record until its next `BGREWRITEAOF`, which now happens at 32 MB of growth rather than on a clock — so the window is bounded by write volume, not time. AOF replay after a crash inside that window can therefore resurrect a just-deleted record ([valkey.md](valkey.md) §4.2). |
 
-So: gone from the board and from history, recoverable from the audit log by anyone
-with broker access.
+So: gone from the board and from history, but present in each Valkey pod's AOF until
+that pod's next rewrite. Anyone relying on delete for compliance (GDPR-style erasure)
+must know this.
 
 ### 10.2 All three verbs address the same object
 

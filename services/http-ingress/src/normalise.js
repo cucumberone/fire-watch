@@ -291,27 +291,15 @@ function defaultId(now) {
 }
 
 /**
- * The AMQP message properties we set.
+ * The field/value pairs of one ingest stream entry (`XADD fw:stream:ingest * ...`).
  *
- * `persistent` matters: the queue is a quorum queue and the event must survive a
- * broker restart. Without deliveryMode 2 the message can be dropped from memory
- * on restart even in a durable queue.
+ * `evt` is the canonical envelope as JSON; the worker parses only that field.
+ * `src` and `cid` are for debugging (`XRANGE`) and are never used for routing.
+ * No timestamp is sent: the arrival time is the entry ID, which Valkey assigns
+ * (docs/event-lifecycle.md §2).
  */
-export function messageProperties(event, correlationId) {
-  return {
-    persistent: true,
-    deliveryMode: 2,
-    contentType: 'application/json',
-    contentEncoding: 'identity',
-    type: event.type,
-    messageId: event.id,
-    correlationId,
-    timestamp: Math.floor(Date.now() / 1000),
-    appId: 'http-ingress',
-    headers: {
-      'x-ingress-source': 'http',
-      'x-event-source': event.source,
-      'x-event-severity': event.severity,
-    },
-  };
+export function streamFields(event, { src = 'http', correlationId } = {}) {
+  const fields = ['evt', JSON.stringify(event), 'src', src];
+  if (correlationId) fields.push('cid', String(correlationId));
+  return fields;
 }

@@ -17,7 +17,7 @@ Rule quoted from the spec: **a `HARMLESS` or `CLOSE` always closes the others if
 These are the *internal* severities. A producer does not send them: it sends the
 `EVT_Severity` scale (`CRITICAL`/`MAJOR`/`MINOR`/`WARNING`/`INDETERMINATE`/
 `INFORMATION`/`CLEAR`/`HARMLESS`) which the HTTP ingress maps down onto these five
-before the event ever enters the broker. In particular a producer's `CLEAR` becomes
+before the event ever enters the ingest stream. In particular a producer's `CLEAR` becomes
 `CLOSE`, and `INFORMATION` becomes `HARMLESS` — see
 [event-schema.md](event-schema.md) §3. The producer's original value is preserved as
 `payload.EVT_Severity` but **nothing downstream reads it**; the fold only ever sees
@@ -37,35 +37,38 @@ The cluster must answer that question with **one total order all three workers a
 | Clock source | Problem |
 |---|---|
 | Producer clock (`ts` in the payload) | Every producer host has its own clock. Skew of a few seconds between hosts reorders events. Unfixable without PTP/NTP discipline across all producers. |
-| **RabbitMQ broker clock** | A single authority per message, assigned when RabbitMQ accepts the message. All workers read the same value. |
+| **Valkey stream entry ID** | A single authority per event, assigned by the master when it accepts the `XADD`. All workers read the same value. |
 
-Therefore: **ordering uses the RabbitMQ-assigned arrival timestamp, never the producer timestamp.** The producer's `ts` is retained for display and for producer-side correlation only.
+Therefore: **ordering uses the stream-assigned arrival timestamp, never the producer timestamp.** The producer's `ts` is retained for display and for producer-side correlation only. The value is stored as `brokerTs` — the field name predates the stream and is kept everywhere (record, indexes, live frames, history).
 
-## 3. Getting a broker timestamp
+## 3. Getting the arrival timestamp
 
-AMQP 0-9-1 has a `timestamp` message property, but it is **seconds** granularity and producers may set it themselves (or leave it empty). For millisecond ordering with no producer trust, have RabbitMQ stamp on arrival:
-
-```ini
-# rabbitmq.conf — required
-message_interceptors.incoming.set_header_timestamp.overwrite = true
-```
-
-This sets both:
-
-- the `timestamp` property (POSIX **seconds**), and
-- the `timestamp_in_ms` header (**milliseconds**)
-
-The default for `overwrite` is `false`, which *preserves* a producer-supplied value. **Set it to `true`**: with `false`, a producer with clock skew — or a malicious one — can forge its position in the ordering, and an old CLOSE could be made to look newer than a FATAL. Overwriting removes that entire class of problem.
-
-This is the built-in replacement for the deprecated `rabbitmq_message_timestamp` plugin. That plugin targeted RabbitMQ ≤ 3.11 and the repository is archived; on 3.12+ use the config above. Never enable both — two interceptors on `basic.publish` break channel creation for every AMQP 0-9-1 connection.
-
-Ordering key used by the worker:
+Producers append with an auto-generated ID:
 
 ```
-broker_ts_ms = headers.timestamp_in_ms    (fallback: properties.timestamp * 1000)
+XADD fw:stream:ingest * evt <envelope> src http [cid <x-request-id>]
 ```
 
-If neither is present the message is a schema violation → `nack(requeue=false)` → DLQ.
+`*` makes the **master** assign the ID `<ms>-<seq>`: `<ms>` is the master's clock in
+milliseconds, `<seq>` disambiguates entries within the same millisecond. Valkey
+guarantees IDs are strictly increasing within a stream — if the clock goes backwards
+it reuses the last `<ms>` and bumps `<seq>` — and a failover keeps that property for
+everything the promoted replica received, because it has the stream's last ID and continues
+after it. Across a failover the new master's wall clock takes over, so the three Valkey
+nodes must be NTP-disciplined — three cluster nodes, not hundreds of producer hosts.
+
+No producer can choose its position: http-ingress and the gateway's operator close
+always pass `*`.
+
+Ordering key used by the worker (`entryTsMs()` in
+[`services/worker/src/event.js`](../services/worker/src/event.js)):
+
+```
+brokerTs = Number(entryId.split('-')[0])
+```
+
+If the ID carries no timestamp (malformed), the entry can never succeed → moved to
+`fw:stream:dlq` ([workers.md](workers.md) §6.1).
 
 ## 4. The hazard: a redelivered CLOSE can kill a newer CRITICAL
 
@@ -73,37 +76,36 @@ This is the scenario the design must survive, written out precisely.
 
 ```mermaid
 sequenceDiagram
-  participant P as Producer
-  participant RMQ as RabbitMQ
+  participant P as http-ingress
+  participant ST as fw:stream:ingest
   participant W as Worker
-  participant DF as Valkey
+  participant DF as Valkey records
 
-  P->>RMQ: CRITICAL (t=1000)
-  RMQ->>W: deliver CRITICAL (t=1000)
-  W->>DF: SET alert state = CRITICAL @1000
-  W->>RMQ: ack
+  P->>ST: XADD CRITICAL (id 1000-0)
+  ST->>W: XREADGROUP CRITICAL (1000)
+  W->>DF: fold: state = CRITICAL @1000
+  W->>ST: XACK + XDEL
 
-  P->>RMQ: CLOSE (t=1500)
-  RMQ->>W: deliver CLOSE (t=1500)
-  W--xDF: WRITE FAILS (master failover / guard tripped)
-  W->>RMQ: nack(requeue=true)  --> CLOSE goes back to the queue
+  P->>ST: XADD CLOSE (id 1500-0)
+  ST->>W: XREADGROUP CLOSE (1500)
+  W--xDF: WRITE FAILS (master failover / NOREPLICAS)
+  Note over W,ST: CLOSE stays in this worker's PEL
 
-  P->>RMQ: CRITICAL (t=2000)
-  RMQ->>W: deliver CRITICAL (t=2000) to a *different* worker
-  W->>DF: SET alert state = CRITICAL @2000
-  W->>RMQ: ack
+  P->>ST: XADD CRITICAL (id 2000-0)
+  ST->>W: XREADGROUP CRITICAL (2000) to a *different* worker
+  W->>DF: fold: state = CRITICAL @2000
+  W->>ST: XACK + XDEL
 
-  RMQ->>W: redeliver CLOSE (t=1500)
+  ST->>W: re-read CLOSE (1500) from the PEL
   W->>DF: apply CLOSE??  <-- would wrongly close the t=2000 CRITICAL
 ```
 
-The bug is applying the CLOSE by *arrival* order instead of by *broker timestamp*. An old CLOSE redelivered late would retire a newer FATAL/CRITICAL/WARNING — silently losing an active alarm.
+The bug is applying the CLOSE by *processing* order instead of by *arrival timestamp*. An old CLOSE retried late would retire a newer FATAL/CRITICAL/WARNING — silently losing an active alarm.
 
-Note the same hazard exists without any failure at all: with **3 consumers on one quorum queue, RabbitMQ does not guarantee delivery order**. Two events published 10 ms apart can be delivered to different workers in the opposite order. Broker timestamps are what make the fold order-independent.
-
+Note the same hazard exists without any failure at all: with **3 consumers in one group, entries of a batch are processed concurrently and batches on different workers race**. Two events appended 10 ms apart can be folded in the opposite order. Stream-assigned timestamps are what make the fold order-independent.
 ## 5. The fix: monotonic watermark per alert key
 
-Every event carries a **broker timestamp**. The alert state for a given key is only advanced by an event whose timestamp is strictly newer than the last applied one.
+Every event carries an **arrival timestamp** (`brokerTs`, from the stream entry ID). The alert state for a given key is only advanced by an event whose timestamp is strictly newer than the last applied one.
 
 ### 5.1 Keys
 
@@ -111,9 +113,9 @@ Every event carries a **broker timestamp**. The alert state for a given key is o
 |---|---|---|---|
 | `event:<32 hex>` | hash | the WHOLE record: payload fields, `state`, `severity`, `count`, `firstSeen`, `lastSeen`, `lastId`, ack/closure fields, `watermark` | 7d (rolling) |
 | `idx:event:open` | zset | member = bare key, score = last activity ms. The open set, so a client can be given a snapshot without `SCAN event:*` ([websocket-server.md](websocket-server.md) §3.1) | members removed by the fold on retirement |
-| `idx:event:all` | zset | member = bare key, score = **broker** timestamp ms. The global timeline, written in the same step as the per-device index so it can never be missing a record that index has. Backs the All Events tab, which cannot be answered from `idx:source:*` without a SCAN | 7d, via the worker's index prune |
+| `idx:event:all` | zset | member = bare key, score = **arrival** timestamp ms (`brokerTs`). The global timeline, written in the same step as the per-device index so it can never be missing a record that index has. Backs the All Events tab, which cannot be answered from `idx:source:*` without a SCAN | 7d, via the worker's index prune |
 | `idx:event:closed` | zset | member = bare key, score = `closedAt` ms. The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two. Removed again when a condition re-opens ([frontend.md](frontend.md) §5.6) | 7d, via the worker's index prune |
-| `idx:source:{device}` | zset | member = bare key, score = broker ts ms. Per-device timeline for the filtered tail | 7d, via the worker's index prune |
+| `idx:source:{device}` | zset | member = bare key, score = `brokerTs` ms. Per-device timeline for the filtered tail | 7d, via the worker's index prune |
 
 **There is no fingerprint key and no second record key.** The record used to be two
 objects — `fw:evt:<id>` per delivery and `fw:alert:<source>:<type>` for the rollup —
@@ -132,8 +134,8 @@ hashes to the same address and there is nothing to detect ([valkey.md](valkey.md
 | `source`, `type` | `EVT_Device` and `EVT_EventKey`, as fields — the key itself is opaque |
 | `msg` | `EVT_Summary`, normalised. Half of the key derivation, so it never varies within a record |
 | `payload` | JSON string of the compressed payload object |
-| `firstSeen` | broker ts of the first event in the **current open episode** |
-| `lastSeen` | broker ts of the **most recent** applied event — the "last occurrence" |
+| `firstSeen` | arrival ts (`brokerTs`) of the first event in the **current open episode** |
+| `lastSeen` | arrival ts (`brokerTs`) of the **most recent** applied event — the "last occurrence" |
 | `count` | events applied in the current episode. Every applied event counts; a redelivery never gets here (the watermark drops it, §5.4.1) |
 | `ackedBy`, `ackedAt` | operator who acknowledged this episode, cleared on a new episode ([acknowledge.md](acknowledge.md) §6) |
 | `lastId` | event id of the most recent applied arrival |
@@ -235,7 +237,7 @@ redelivery of the same message (and is dropped). See §5.4.3.
 
 ### 5.3 Tie-break within the same millisecond
 
-Two events can share a millisecond, and RabbitMQ gives no ordering guarantee between them across consumers. The fold needs a deterministic winner so all workers agree, which is why the watermark is the **pair** `(broker_ts_ms, event_id)` compared lexicographically (lines 6–9 above).
+Two events can share a millisecond (their entry IDs differ only in `<seq>`), and concurrent workers give no ordering guarantee between them. The fold needs a deterministic winner so all workers agree, which is why the watermark is the **pair** `(broker_ts_ms, event_id)` compared lexicographically (lines 6–9 above).
 
 Without the tie-break, a CRITICAL and a CLOSE stamped in the same millisecond could resolve differently on different workers depending on delivery order — a race that appears only under load and is nearly impossible to reproduce afterwards.
 
@@ -249,15 +251,15 @@ machinery, because the record is keyed by the condition.
 | | **Transport duplicate** | **Content duplicate** |
 |---|---|---|
 | Question | "is this the same *message* again?" | "is this the same *condition*, reported again?" |
-| Cause | at-least-once delivery, worker crash before ack, replay | a producer re-reporting the same alarm with a fresh id |
+| Cause | at-least-once delivery, worker crash before `XACK`, `XAUTOCLAIM` | a producer re-reporting the same alarm with a fresh id |
 | Identity | `(brokerTs, id)` | the record KEY (§5.4.2) |
 | Detection | the fold's ordering guard returns `0` | the arrival hashes to an EXISTING key, so there is no second record to write |
 | Result | **nothing at all happens** | `count` +1 and `lastSeen` moves **on the same hash** |
 
-#### 5.4.1 Transport duplicate — same message id twice
+#### 5.4.1 Transport duplicate — same stream entry twice
 
-A RabbitMQ redelivery is the same message, keeping its original id and its original
-broker timestamp. It must be a no-op:
+A redelivery is the same stream entry, keeping its entry ID — so its original
+`brokerTs` — and its original `evt.id`. It must be a no-op:
 
 - The fold's `(ts, id)` watermark returns `0` for anything not newer, so no field
   changes.
@@ -359,61 +361,51 @@ wants them distinguished must vary the summary, which is what a real one does.
 There is no separate "event" and "alert" object to guard differently. The record is
 the condition, so the fold IS the write: an event that the watermark rejects changes
 nothing, and an event it accepts is counted and indexed in one atomic step
-([valkey.md](valkey.md) §6). The per-delivery history that is no longer queryable from
-Valkey lives in `q.audit.events`.
+([valkey.md](valkey.md) §6). Per-delivery history lives in the `hist:` trail, written
+before the fold ([history.md](history.md)).
 
 ## 6. Why redelivery is safe
 
-RabbitMQ preserves message properties and headers across requeue. A redelivered CLOSE therefore arrives with its **original** `timestamp_in_ms`, not a fresh one:
+A stream entry keeps its ID while it sits in a consumer's pending list, whether it is re-read by the same worker (`XREADGROUP ... 0` after `FW_RETRY_MS`) or taken over by another (`XAUTOCLAIM`). A redelivered CLOSE therefore arrives with its **original** `brokerTs`, not a fresh one:
 
 | Scenario | Redelivered CLOSE timestamp | Fold result |
 |---|---|---|
-| CLOSE requeued, newer CRITICAL written meanwhile | old (e.g. 1500) | watermark is 2000 → **stale, dropped** ✓ |
-| CLOSE requeued, nothing newer happened | old (e.g. 1500) | watermark 1000 → **applied** ✓ |
-| CLOSE requeued twice | old, twice | first applies, second is stale → **idempotent** ✓ |
-| Two workers process the same CLOSE concurrently | old, both | atomic script → applied once ✓ |
+| CLOSE retried, newer CRITICAL written meanwhile | old (e.g. 1500) | watermark is 2000 → **stale, dropped** ✓ |
+| CLOSE retried, nothing newer happened | old (e.g. 1500) | watermark 1000 → **applied** ✓ |
+| CLOSE folded, `XACK` lost, delivered again | old, twice | first applies, second is stale → **idempotent** ✓ |
+| Two workers process the same CLOSE concurrently (claim race) | old, both | atomic script → applied once ✓ |
 
-**Critical operational rule:** never *republish* a message to move it, because a republish is a new publish and gets a new timestamp. Use `nack(requeue=true)` (which returns the message to the same queue with properties intact) or, when moving between queues deliberately, preserve the timestamp by copying `x-original-ts`:
+**Critical operational rule:** never *re-append* an entry to move it, because a new `XADD` gets a new ID and therefore a new, newer timestamp. Retries stay in the PEL; nothing in the system re-appends. An operator who re-injects an entry from `fw:stream:dlq` creates a **new arrival** — acceptable only after checking that nothing newer exists for that condition.
 
-```text
-if republishing (DLQ -> ingest):
-  set headers['x-original-ts'] = headers['timestamp_in_ms']  # MUST be preserved
-worker preference order for broker_ts_ms:
-  headers['x-original-ts'] > headers['timestamp_in_ms'] > properties.timestamp*1000
-```
+## 7. Duplicate safety
 
-The `replay-gap` job must apply the same preference, otherwise a replay would re-stamp history with "now" and could close newer alerts.
+Not every duplicate is a redelivery of the same entry:
 
-## 7. Replay safety
+| Duplicate | Same entry ID? | Result |
+|---|---|---|
+| Worker crash after the fold, before `XACK`+`XDEL` | yes | watermark returns `0`; entry removed; one extra `hist:` row |
+| `XACK`+`XDEL` `MULTI` failed after the writes | yes | same |
+| nginx re-POSTs after a 503 whose `EXEC` had succeeded (`WAIT` short) | **no** — a new `XADD` | a new arrival on the same condition key: `count` +1, `lastSeen` moves; never a second record |
+| Producer re-sends the same event | no | same as above |
 
-The same watermark protects replay from the audit queue:
-
-- Replaying 7 days of history re-runs every fold. Each event either advances the watermark or is dropped as stale — so the final state after a full replay is **identical** to the state before the wipe, regardless of the order records come back.
-- Replay from the audit queue is therefore order-insensitive by construction. The replay job does not need to sort, batch by key, or single-thread.
-- The one thing replay must not do is invent timestamps (§6).
+The first two are invisible. The last two are counted, because from the stream's point of view they *are* new arrivals; the content key keeps them on one record ([valkey.md](valkey.md) §2), which is the "drop the duplicate, update last occurrence" behaviour the board needs.
 
 ## 8. Alert state is derived, not authoritative
 
 | Data | Authority | Recovery |
 |---|---|---|
-| Records (`event:*`, `idx:*`) | RabbitMQ audit queue | replay |
-| Alert state (`event:*`) | the fold | recompute by replaying the window |
+| Arrivals not yet folded | `fw:stream:ingest` (replicated, AOF on every pod) | workers fold them after any restart or failover |
+| Records (`event:*`, `idx:*`) | Valkey (replicated, AOF on every pod) | AOF reload; no copy outside Valkey ([persistence-and-durability.md](persistence-and-durability.md) §4) |
+| Alert state (`event:*`) | the fold | recomputed by the fold for every arrival, in any order |
 
-The whole record can be deleted at any time and rebuilt from the audit WAL without
-loss. This is why no extra durability machinery is needed for the datastore — it is a
-cache over `q.audit.events` ([persistence-and-durability.md](persistence-and-durability.md)
-§4).
-
-One caveat that comes from the content key: replay reconstructs state, but it cannot
-reconstruct **per-delivery history in Valkey**, because that no longer exists there.
-`count` comes back correctly (it is recomputed from the arrivals), but the individual
-deliveries are read from the WAL.
-
+Because the fold is order-insensitive (§5), re-applying any set of arrivals — a
+backlog after an outage, a claimed PEL, entries a worker processed twice — converges
+on the same state regardless of the order they are processed in.
 ## 8.1 Transport vs semantic dedup — where each lives
 
 | Concern | Mechanism | Owner | Effect if missing |
 |---|---|---|---|
-| Same *message* redelivered | `(ts, id)` watermark returns `0` | worker (§5.2) | a repeat is counted twice |
+| Same *stream entry* redelivered | `(ts, id)` watermark returns `0` | worker (§5.2) | a repeat is counted twice |
 | Same *message* re-published to the browser | gateway LRU on `id@brokerTs` | gateway ([websocket-server.md](websocket-server.md) §5) | duplicate UI rows |
 | Same *message* arriving out of order | watermark fold | worker (§5.2) | an old CLOSE retires a newer CRITICAL |
 | Same *condition* reporting repeatedly | the CONTENT KEY: a repeat hashes to the same record | worker ([valkey.md](valkey.md) §2) | it cannot happen — there is no second key |
@@ -425,8 +417,10 @@ stream from looking like an outage.
 ## 8.2 An operator close IS an event
 
 Closing an alert from the UI does not flip a state flag. The gateway **injects a
-real event** into the ingest exchange, and the worker processes it through the
-ordinary pipeline — validate, compress, fold, audit fork.
+real event** into the ingest stream (`XADD fw:stream:ingest * evt <closeEvent> src operator`,
+then `WAIT FW_WAIT_REPLICAS 5000` — `enqueueEvent()` in
+[`services/ws-gateway/src/valkey.js`](../services/ws-gateway/src/valkey.js)), and the
+worker processes it through the ordinary pipeline — validate, compress, `hist:` fork, fold.
 
 Why it is done that way:
 
@@ -434,8 +428,8 @@ Why it is done that way:
 |---|---|
 | **One code path** | A closure a human made and a closure a source reported go through the same fold. A second, special-cased write is a second definition of "closed", and the two drift. |
 | **It correlates for free** | The injected event echoes the record's own `source` and `payload.msg`, so it hashes onto the SAME condition key ([valkey.md](valkey.md) §2). No key is passed between the two writes, so nothing can disagree about which alert was retired. |
-| **It is a real record** | The closure appears in All events, in History (as its own delivery), in the audit trail, and in `q.audit.events` — so "who ended this, and when" is answerable from storage rather than from a transient frame. |
-| **Durability** | The event is broker-confirmed before the operator is told it worked. |
+| **It is a real record** | The closure appears in All events and in History (as its own delivery, `src operator` on the stream entry) — so "who ended this, and when" is answerable from storage rather than from a transient frame. |
+| **Durability** | The `XADD` succeeded and `WAIT` saw a replica acknowledge before the operator is told it worked — the same rule as the ingress 202. |
 
 ### 8.2.1 The two fields that must not be reworded
 
@@ -464,17 +458,18 @@ can tell at a glance that a human ended the incident rather than the monitoring.
 `isRetirement()` and `colourSeverity()` accept both spellings, because a caller
 holds whichever one its path produced.
 
-### 8.2.3 Broker unavailable — the fallback
+### 8.2.3 Stream append failed — the fallback
 
-If the ingest publish fails, the gateway falls back to the direct write
+If the `XADD` or the `WAIT` fails, the gateway falls back to the direct write
 (`closeAlert`), which retires the record without producing an event. That exists
-because an operator must be able to end an incident during a broker outage; the
-alternative is a board full of alerts nobody can clear.
+because an operator must be able to end an incident while the stream append is
+refused; the alternative is a board full of alerts nobody can clear. (A `WAIT` that
+returned short after a successful `XADD` can leave the close event in the stream
+as well; the fold then sees an already-closed record — harmless.)
 
 It is the narrow, older path, it is logged at `warn` when taken, and it is the only
-case where a close leaves no event behind. `fw_journal_audit_enabled` reports
-whether replication is working at all; a close taken through the fallback shows up
-in the gateway log rather than a metric, because it is an outage symptom rather
+case where a close leaves no event behind. A close taken through the fallback shows
+up in the gateway log rather than a metric, because it is an outage symptom rather
 than a steady state.
 
 ## 9. UI implications
@@ -498,20 +493,44 @@ A UI that ignores `applied` will show alerts closing and immediately reopening (
 ## 10. Verification
 
 ```bash
-# 1. broker timestamps are present on every message
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin get queue=q.event.ingest count=5 \
-  | grep -E 'timestamp_in_ms|severity'
+vk() { kubectl -n fire-watch exec valkey-0 -c valkey -- sh -c "valkey-cli -a \"\$VALKEY_PASSWORD\" --no-auth-warning $*"; }
+
+# 1. entry IDs carry the arrival time; brokerTs on the record equals the ms part
+vk XRANGE fw:stream:ingest - + COUNT 5          # only non-empty while a backlog exists
+vk HMGET event:<bare-key> lastSeen watermark
 
 # 2. watermark guard: a stale CLOSE must not retire a newer alert
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 HGETALL event:probe:test
+vk HGETALL event:<bare-key>
 
-# 3. occurrence coalescing: publish the same CRITICAL 5x inside the 5-min window,
-#    then once outside it. Expect count = 2, not 6.
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 HMGET event:probe:test count firstSeen lastSeen
+# 3. occurrence folding: post the same CRITICAL 5x. Expect ONE record, count = 5.
+vk HMGET event:<bare-key> count firstSeen lastSeen
 
-# 4. replay invariance: wipe alert keys, replay, compare
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 --scan --pattern 'event:*'
-kubectl -n fire-watch create job --from=cronjob/replay-gap replay-verify
+# 4. redelivery is a no-op: kill a worker mid-batch, then check count did not jump
+#    and History shows the extra delivery rows (validation.md §6)
 ```
 
 Scenarios are listed in [validation.md](validation.md) §6.
+
+## 11. Operator close through the ingest stream
+
+The gateway's Close (and bulk Close) is an ordinary producer of the ingest stream —
+the full rationale is §8.2; this is the wire-level summary the code refers to.
+
+```text
+gateway (handleClose)
+  closeEvent = operatorCloseEvent(record)            # echoes source + payload.msg verbatim
+  XADD fw:stream:ingest * evt <closeEvent> src operator
+  WAIT <FW_WAIT_REPLICAS> 5000                        # 1 in production, 0 in the lab
+  on any failure -> closeAlert(bareKey, ...)          # direct write, logged at warn (§8.2.3)
+
+worker
+  XREADGROUP -> validate -> brokerTs = entry-ID ms -> hist: fork -> fold (applied 3) -> XACK+XDEL
+```
+
+| Property | Value |
+|---|---|
+| Stream key | `FW_STREAM_KEY` (`fw:stream:ingest`) — the same stream http-ingress writes |
+| `src` field | `operator` (http-ingress writes `http`) |
+| Ordering | the close gets a fresh entry ID, so it is newer than anything already folded and retires the current episode; a re-fire appended after it opens a new one |
+| Acknowledgement to the operator | only after `XADD` + `WAIT` succeeded, or after the fallback write succeeded |
+| History | one `hist:` row, like any delivery |

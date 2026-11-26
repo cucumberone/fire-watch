@@ -3,7 +3,7 @@
 # Valkey reads a conf file, so this patches the config directly rather than a flags
 # list. Three settings change and each has a reason:
 #
-#   min-replicas-to-write 0   There is no replica, so 2 is unsatisfiable and EVERY
+#   min-replicas-to-write 0   There is no replica, so 1 is unsatisfiable and EVERY
 #                             write would be refused with NOREPLICAS. The
 #                             split-brain guard is meaningless with one pod.
 #   maxmemory 512mb           A homelab does not hold a 7-day production window.
@@ -55,7 +55,7 @@ data:
     maxmemory-policy noeviction
 
     # ---- replication / split brain ------------------------------------------
-    # 0, not 2: with a single pod there is no replica to find, and leaving the
+    # 0, not 1: with a single pod there is no replica to find, and leaving the
     # guard on would refuse every write.
     min-replicas-to-write 0
     min-replicas-max-lag 10

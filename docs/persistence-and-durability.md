@@ -1,172 +1,144 @@
 # Persistence and Durability
 
-How R1 ("no data loss") is actually satisfied, and where the original spec cannot be satisfied.
+How R1 ("no data loss") is actually satisfied, and what it does not cover.
 
 ## 1. Where data can be lost
 
 | # | Point | Loss possible | Mitigated by |
 |---|---|---|---|
-| 1 | Producer → RabbitMQ | yes, if no publisher confirms | `confirm.select` + mandatory flag, see [rabbitmq.md](rabbitmq.md) §3 |
-| 2 | RabbitMQ in-memory → journal | no, quorum queues fsync to 2/3 members before confirm | quorum queue + `default_queue_type` |
-| 3 | RabbitMQ → worker in-flight | no, unacked messages are redelivered | manual ack after write |
-| 4 | Worker → Valkey master | no, write happens before ack | [workers.md](workers.md) §3 |
-| 4b | **Redelivered message applied out of order** | yes, if closes are applied by arrival order | broker timestamp + per-key watermark fold ([event-lifecycle.md](event-lifecycle.md) §4–5) |
-| 5 | Valkey master → replicas | yes, async replication | quorum gate + Sentinel |
-| 6 | Valkey memory → disk | **≤ 1 s** with AOF `everysec` | AOF + RabbitMQ replay, §3 |
-| 7 | Valkey disk → restore | yes, if the AOF is truncated | `aof-load-truncated yes`, plus RabbitMQ replay |
-| 8 | Valkey → browser | yes, pub/sub is fire-and-forget | index backfill on reconnect |
+| 1 | Producer → nginx → http-ingress | yes, if 202 were sent early | 202 only after `EXEC` + `WAIT 1`; every failure is a retryable 503 and nginx buffers ([http-ingress.md](http-ingress.md) §2–3) |
+| 2 | Ingress → stream (master memory) | yes, if the master dies before replicating | `WAIT 1` before 202 — the entry is on two pods |
+| 3 | Stream → worker in-flight | no, the entry stays in the PEL until `XACK` | `XACK`+`XDEL` after the write; retry from the PEL; `XAUTOCLAIM` for dead workers ([workers.md](workers.md) §6) |
+| 4 | Worker → fold write | no, the write happens before `XACK`+`XDEL` | [workers.md](workers.md) §3 |
+| 4b | **Redelivered entry applied out of order** | yes, if closes were applied by read order | stream-entry timestamp + per-key watermark fold ([event-lifecycle.md](event-lifecycle.md) §4–5) |
+| 5 | Stream trimmed / evicted | yes, if `MAXLEN` or an eviction policy were used | never trimmed; `maxmemory-policy noeviction` ([valkey.md](valkey.md) §5) |
+| 6 | Valkey master → replicas | yes, async replication | `min-replicas-to-write 1` + `WAIT 1` at both producers + Sentinel; residual window in [fault-tolerance.md](fault-tolerance.md) §4 |
+| 7 | Valkey memory → disk | **≤ 1 s** per pod with AOF `everysec` | AOF on **every** pod; the same write is in two pods' memory (§3) |
+| 8 | Valkey disk → restore | yes, if the AOF is truncated | `aof-load-truncated yes`; the other pods hold the same data |
+| 9 | Valkey → browser | yes, pub/sub is fire-and-forget | index backfill on reconnect |
+| 10 | All three Valkey PVCs lost | **yes** | nothing inside the system — restore from a volume backup (§4) |
 
-Points 1–4 and 8 are closed by design. Point 5 (async replication) is bounded by the
-write gate. Point 6 is now bounded by AOF instead of by the snapshot interval — the
-change Valley made worthwhile.
+Points 1–5 and 9 are closed by design. Point 6 is bounded by `WAIT 1` and the write
+gate. Point 7 is bounded by AOF on every pod. Point 10 is the one deliberate gap:
+there is no copy outside Valkey any more.
 
-## 2. The three-layer durability model
+## 2. The durability model
 
 ```mermaid
 flowchart TB
-  subgraph L3["Layer 3 — browser cache"]
+  subgraph L3["Browser cache"]
     FE[React UI]
   end
-  subgraph L2["Layer 2 — Valkey"]
+  subgraph L2["Valkey — records AND the ingest stream"]
     M[(master)]
     R1[(replica)]
     R2[(replica)]
-    M -->|async| R1
+    M -->|async, WAIT 1 before 202| R1
     M -->|async| R2
-    M -->|AOF everysec, rotates at 32 MB growth| PV[(PVC)]
+    M -->|AOF everysec| PV0[(PVC)]
+    R1 -->|AOF everysec| PV1[(PVC)]
+    R2 -->|AOF everysec| PV2[(PVC)]
   end
-  subgraph L1["Layer 1 — RabbitMQ (source of truth)"]
-    Q[(q.event.ingest<br/>quorum x3)]
-  end
-  Q -->|consume, ack last| M
+  ING[http-ingress] -->|XADD fw:stream:ingest + WAIT 1| M
+  M -->|XREADGROUP, XACK+XDEL last| W[workers]
+  W -->|fold write| M
   M -->|pub/sub| FE
   FE -->|reconnect + backfill| M
 ```
 
-The third copy — the AOF on the PV — is what Dragonfly could not provide.
+Every accepted (202'd) event exists in **at least two pods** at all times:
 
-Every accepted event exists in **at least two independent places** at all times:
+- after 202: the stream entry is in the master and in ≥ 1 replica (`WAIT 1`)
+- after the worker's fold write: the record and its `hist:` row are written on the master, replicated, and only then is the stream entry removed
 
-- after publish: RabbitMQ quorum (2/3 on disk)
-- after worker write: RabbitMQ (unacked) + Valkey memory, and after ack: Valkey memory + 2 replicas
+The only interval where a write exists solely in one pod's memory is between the
+`XADD`/fold write and the `WAIT` / replication — and the producer has not been
+answered yet in that interval. Each pod fsyncs its AOF within one second.
 
-The only interval where a record exists solely in Valkey memory is after the ack and
-before the next AOF fsync. With `appendfsync everysec` that is **at most one second**
-([valkey.md](valkey.md) §4.1) — not the up-to-60-minutes the snapshot design accepted.
+## 3. How "no data loss" is met
 
-## 3. AOF is available again — what changed
+This is the key section.
 
-The Dragonfly-era audit recorded that the requirement
+> **A 202 means: the event is in the ingest stream on the master and on at least
+> one replica, each of which persists it to its own AOF within one second, and it
+> will stay there until a worker has folded it into the record.**
 
-> "use the AOF feature, but every hour refresh that file with a new one from what's
-> left in the datastore"
+The guarantee rests on five mechanisms, all inside Valkey:
 
-could **not** be met, because Dragonfly has no AOF implementation. Valkey does, so the
-requirement is now satisfied as written:
+| # | Mechanism | Setting | What it buys |
+|---|---|---|---|
+| 1 | **AOF on every pod** | `appendonly yes`, `appendfsync everysec` in the one `valkey.conf` that master and both replicas load; each pod writes its own AOF to its own PVC | a restart of any pod, or of all three, reloads from disk; ≤ 1 s per pod not yet fsynced |
+| 2 | **Replication** | 1 master + 2 replicas, anti-affined to different nodes | a lost pod or node loses no data |
+| 3 | **Engine write gate** | `min-replicas-to-write 1`, `min-replicas-max-lag 10` | an isolated master (0 replicas) refuses writes with `NOREPLICAS` instead of accepting writes that a failover would discard |
+| 4 | **Writers wait for a replica** | `WAIT 1` at http-ingress (and at the gateway's operator close) before answering | an acknowledged event is never only in the memory of a master that is about to die |
+| 5 | **Remove last** | worker `XACK`+`XDEL` in one `MULTI` only after the fold write; no `MAXLEN`; `noeviction` | an entry cannot leave the stream unprocessed |
 
-| Spec text | Dragonfly | Valkey |
-|---|---|---|
-| "use the AOF feature" | not implemented | `appendonly yes` |
-| "every hour refresh that file with a new one from what's left" | approximated by `snapshot_cron` | `BGREWRITEAOF` at 32 MB of growth, from the live keyspace ([valkey.md](valkey.md) §4.2) |
-| "to make restart and reread fast" | met (fresh snapshot) | met (compact RDB-preamble base + ≤ 1 h tail) |
-| "No data loss" | only via RabbitMQ replay | AOF bounds it to ≤ 1 s, and RabbitMQ replay still covers a total PV loss |
+What the producer side adds: nginx treats 503 as retryable and buffers, so every
+"not accepted" is retried until it is accepted.
 
-### 3.1 What the AOF does and does not promise
+### 3.1 Why the audit copies were dropped
+
+The former message-broker design kept an audit queue and a journal audit exchange as a
+write-ahead log outside Valkey. With the broker replaced by a Valkey stream, any audit
+copy would live in the same database as the records — no failure independence,
+double the memory. An external copy would need a second stateful system with its own
+H/A and split-brain obligations. The decision was to drop the copies and rest
+durability on mechanisms 1–5 ([roadmap.md](roadmap.md) §4).
+
+What this costs, stated plainly:
+
+| Lost capability | Consequence |
+|---|---|
+| Rebuild after **all three** Valkey PVCs are lost | no longer possible from inside the system; needs a volume backup (§4) |
+| A per-delivery log outside Valkey | the `hist:` trail ([history.md](history.md)) covers 3 days, inside Valkey |
+| A durable copy of journal notes outside Valkey | journal notes are as durable as any record — AOF on every pod + replication ([journal.md](journal.md)) |
+
+### 3.2 What the AOF does and does not promise
 
 | Claim | Holds |
 |---|---|
-| Every write is fsynced within 1 s | yes, `appendfsync everysec` |
+| Every write is fsynced within 1 s, on every pod | yes, `appendfsync everysec` everywhere |
 | A restart replays a small file | yes, because the rewrite rebuilds a compact base and the tail is capped at 32 MB |
 | A torn write at the end of the log is tolerated | yes, `aof-load-truncated yes` |
-| Total PV loss is survivable | **no** — that is what `q.audit.events` is for (§4) |
+| A promoted replica restarts from its own disk | yes, it has written its own AOF all along |
+| Total PV loss (all 3 pods) is survivable | **no** — §4 |
 | Deleted records stay deleted across a crash | **no** — the AOF still holds the write until the next rewrite ([acknowledge.md](acknowledge.md) §10.1) |
 
-The last two are the ones worth remembering. AOF is not a backup, and it is not an
-immediate eraser.
+AOF is not a backup, and it is not an immediate eraser.
 
-## 4. RabbitMQ as write-ahead log
+### 3.3 AOF and the original spec
 
-### 4.1 Design
-
-Events are acknowledged by the worker, so RabbitMQ would normally forget them. To keep a replayable log, the worker publishes a copy to an **audit stream** before acking:
-
-```text
-worker:
-  validate
-  compress payload.msgc (payload-and-compression.md)
-  EVAL event-fold.lua (record + 4 indexes + rollup)   (Valkey master, compressed)
-  publish to fx.audit (stream-backed queue q.audit.events, quorum, PLAIN)
-  ack the ingest message
-```
-
-The audit copy is deliberately **plain**, so the WAL never depends on the application's compression codec ([payload-and-compression.md](payload-and-compression.md) §3.1).
-
-`q.audit.events` properties:
-
-| Property | Value |
+| Spec text | Valkey |
 |---|---|
-| type | quorum queue, durable |
-| `x-message-ttl` | **7 days** — matches Valkey retention exactly |
-| `x-max-length-bytes` | 64GiB — hard backstop (~19.3 GiB of real data at 1 000/min × 2 048 B) |
-| `x-overflow` | `reject-publish` — never silently drop the newest events |
-| consumers | none in steady state |
+| "use the AOF feature" | `appendonly yes` on every pod |
+| "refresh that file with a new one from what's left once it reaches 32 MB" | `BGREWRITEAOF` at 32 MB of growth, from the live keyspace, forced by the `aof-rewriter` sidecar ([valkey.md](valkey.md) §4.2) |
+| "to make restart and reread fast" | compact RDB-preamble base + ≤ 32 MB tail |
+| "No data loss" | §3 above; total PVC loss excepted |
 
-A dedicated **replay job** (a `Job`, not a Deployment) drains `q.audit.events` and re-writes records into Valkey:
+## 4. Total PVC loss
 
-```text
-replay --since <timestamp> --until <timestamp>
-  -> consume non-destructively (basic.consume + nack requeue, or a shadow consumer group)
-  -> EVAL event-fold.lua (one atomic step: hash, indexes, rollup)
-  -> copy timestamp_in_ms into x-original-ts on any republish
-  -> stop, leaving the audit queue intact
-```
+If the PVCs of all three Valkey pods are lost at once, the records, the `hist:`
+trail, the journal and any not-yet-processed stream entries are gone. Nothing in the
+cluster holds another copy. The remedies are outside this repo:
 
-`x-message-ttl: 7d` and `x-overflow: reject-publish` together matter: without the TTL the queue never self-trims (no consumers) and eventually hits the byte cap, stalling ingest permanently; without `reject-publish` a full queue would silently drop the newest events. With both, the WAL is a bounded rolling 7-day window, and overflowing it produces backpressure instead of loss.
+- storage-level snapshots / backups of the Valkey PVCs (CSI `VolumeSnapshot`, Velero), and
+- producers that can re-send their current state.
 
-### 4.2 Replay triggers
-
-| Situation | Action |
-|---|---|
-| Valkey restarted from its AOF | replay nothing — `appendfsync everysec` bounds the gap to ≤ 1 s |
-| Valkey PVC lost / AOF unreadable | replay the **full 7 days** from `q.audit.events` |
-| Replica divergence discovered after failover | replay the failover window |
-| Deliberate rebuild | replay full window, then drain |
-
-### 4.3 Cost
-
-- One extra publish per event (cheap, same broker connection, same confirm).
-- ≈2.75 GiB/day of RabbitMQ storage at 1 000/min × 2 048 B; the 64GiB cap is ~3.3x slack.
-- A periodic replay is not required in steady state; only on recovery.
-
-Rejected alternative: a separate WAL database (Kafka, another Postgres). It adds a fourth stateful component with its own H/A and split-brain obligations, for a job RabbitMQ already does with quorum queues.
-
-### 4.3.1 Replay must preserve timestamps
-
-A replay that stamps records with "now" would make seven days of old CLOSE events look newer than any live alert and could retire active alarms. The replay job therefore copies the original broker timestamp into `x-original-ts` on republish, and workers prefer that header ([event-lifecycle.md](event-lifecycle.md) §6). Combined with the per-key watermark fold, a replay is **order-insensitive**: it reconstructs the same alert state regardless of record order.
-
-### 4.4 WAL and retention now have the same window
-
-Because the sustained rate is 1 000/min, the audit queue can afford to keep history for the **full 7 days**, which means the two promises finally line up:
-
-| Promise | Held where | Window | Survives |
-|---|---|---|---|
-| **No accepted event is lost** (R1) | RabbitMQ audit queue | 7 days | master loss, replica loss, full cluster power loss, AOF corruption, **total PVC loss** |
-| **7 days of history is queryable** (product) | Valkey RAM + AOF | 7 days | pod restart, master failover, and (via replay) PVC loss |
-
-This is a meaningful improvement over the higher-rate design: a complete wipe of all three Valkey PVCs is now fully recoverable, not partially. The cost is ≈19.3 GiB of RabbitMQ disk.
-
-Constraint to keep in mind: **if the sustained rate grows, this parity breaks.** At 5 000/min the WAL needs ≈96 GiB, at 10 000/min ≈193 GiB. Re-check [sizing.md](sizing.md) §3.6 whenever the rate assumption changes.
+Anti-affinity (3 nodes) and `minAvailable: 2` make the loss of all three volumes a
+storage-backend failure, not an operational one.
 
 ## 5. Persistence strategy summary
 
 | Setting | Value |
 |---|---|
-| Mechanism | AOF (`appendonly yes`) |
-| fsync policy | `appendfsync everysec` — ≤ 1 s RPO |
+| Mechanism | AOF (`appendonly yes`) on master **and** replicas |
+| fsync policy | `appendfsync everysec` — ≤ 1 s per pod |
 | Base format | RDB preamble (`aof-use-rdb-preamble yes`) so replay starts from a compact image |
 | Rewrite trigger | **32 MB of AOF growth** (`aof_current_size - aof_base_size`), enforced by the `aof-rewriter` sidecar |
 | Engine auto-rewrite | **off** (`auto-aof-rewrite-percentage 0`). The engine has no "N bytes of growth" setting, and `0` disables rather than relaxes it ([valkey.md](valkey.md) §4.2) |
 | RDB snapshots | **disabled** (`save ""`) — redundant with AOF, and each fork is a memory spike |
+| Write gate | `min-replicas-to-write 1`, `min-replicas-max-lag 10` |
+| Producer ack | `WAIT 1` (`FW_WAIT_REPLICAS`) before 202 |
 | Restore | automatic on start: Valkey loads `/data/appendonlydir` |
 | Torn tail | tolerated (`aof-load-truncated yes`), which is the correct trade at a 1 s fsync interval |
 
@@ -177,34 +149,33 @@ history and a restart would replay all of it.
 ## 6. Restore procedure
 
 ```bash
-# 1. stop writers so the replay is the single writer
-kubectl -n fire-watch scale deploy/worker --replicas=0
-
-# 2. start Valkey: the AOF auto-loads
+# 1. restart Valkey: every pod loads its own AOF
 kubectl -n fire-watch rollout restart statefulset/valkey
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 ZCARD idx:event:all
+kubectl -n fire-watch rollout status statefulset/valkey
 
-# 3. replay the gap from the audit queue — only needed if the AOF was lost
-kubectl -n fire-watch create job --from=cronjob/replay-gap replay-$(date +%s)
+# 2. confirm data and the ingest stream came back
+vk() { kubectl -n fire-watch exec valkey-0 -c valkey -- sh -c "valkey-cli -a \"\$VALKEY_PASSWORD\" --no-auth-warning $*"; }
+vk ZCARD idx:event:all
+vk XLEN fw:stream:ingest           # backlog left from before the restart
+vk XINFO GROUPS fw:stream:ingest   # group 'workers' and its pending count survived
 
-# 4. verify counts against the audit queue's expected window, then resume writers
-kubectl -n fire-watch scale deploy/worker --replicas=3
+# 3. workers drain the backlog on their own: pending entries of the old pods are
+#    XAUTOCLAIMed, new entries are read with '>'
 ```
 
-Verification metric: `ZCARD idx:event:all` after replay must be >= the number of
-distinct conditions read from `q.audit.events` for the same window. Note that it can
-be **smaller** than the number of MESSAGES, because a repeat folds onto the same
-record ([valkey.md](valkey.md) §2).
+The consumer group and its PEL are part of the stream key, so they are in the AOF
+too: a restart does not lose track of which entries were delivered but not
+acknowledged.
 
 ## 7. Durability acceptance checklist
 
-- [ ] Publishers use confirms (verified by a deliberate broker kill during publish)
-- [ ] `q.event.ingest` is a quorum queue with 3 members (verified in [rabbitmq.md](rabbitmq.md) §9)
-- [ ] Worker acks only after the Valkey write returns OK (unit test + kill-during-write test)
-- [ ] `q.audit.events` receives a copy before ack (verified by inspecting queue depth growth)
-- [ ] AOF is enabled and healthy: `INFO persistence` shows `aof_enabled:1` and
-      `aof_last_write_status:ok` ([valkey.md](valkey.md) §8)
+- [ ] http-ingress answers 503, never 202, when no replica can acknowledge (drill in [validation.md](validation.md) §5)
+- [ ] `WAIT` is issued with `FW_WAIT_REPLICAS=1` in production (`kubectl get deploy http-ingress -o yaml`)
+- [ ] `CONFIG GET min-replicas-to-write` returns `1` on every pod, and `sentinel-bridge` has `FW_WRITE_GUARD_MIN_REPLICAS=1`
+- [ ] Worker removes an entry only after the fold write returns OK (unit test + kill-during-write drill)
+- [ ] `fw:stream:ingest` has no `MAXLEN` anywhere; `maxmemory-policy` is `noeviction`
+- [ ] AOF is enabled and healthy **on every pod**: `INFO persistence` shows `aof_enabled:1` and
+      `aof_last_write_status:ok` on valkey-0, -1 and -2 ([valkey.md](valkey.md) §8)
 - [ ] Rotation runs: `aof_last_bgrewrite_status:ok`, the `aof-rewriter` sidecar's
       liveness probe is green, and its log shows the growth figure every interval
-- [ ] A full Valkey PVC wipe can be recovered from `q.audit.events` ([validation.md](validation.md) §5)
-- [ ] RPO deviation (if option 2 is chosen instead) is recorded and signed off
+- [ ] A volume backup for the Valkey PVCs exists, or the total-PVC-loss gap (§4) is signed off

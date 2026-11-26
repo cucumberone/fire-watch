@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Consumes events from RabbitMQ, compresses, writes to Dragonfly, keeps an audit WAL, acks last",
+  "description": "Consumes the Valkey ingest stream, compresses, folds into Valkey, XACK+XDEL last",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -13,7 +13,6 @@
     "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
-    "amqplib": "^0.10.5",
     "ioredis": "^5.4.2"
   }
 }

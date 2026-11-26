@@ -62,8 +62,8 @@ export function loadConfig() {
     valkeyPassword: required('VALKEY_PASSWORD'),
     statefulSetName: optional('FW_VALKEY_STATEFULSET', 'valkey'),
 
-    // Write guard
-    minReplicas: integer('FW_WRITE_GUARD_MIN_REPLICAS', 2),
+    // Write guard. Mirrors Valkey's `min-replicas-to-write` (1 with 3 pods).
+    minReplicas: integer('FW_WRITE_GUARD_MIN_REPLICAS', 1),
     writableLabel: optional('FW_WRITABLE_LABEL', 'fire-watch.io/writable'),
 
     // Loop

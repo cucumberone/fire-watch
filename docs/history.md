@@ -17,7 +17,7 @@ fact about the individual arrivals:
 | how bad is it now? | yes | no (it has no state) |
 | how many times did it fire in total? | yes (`count`) | yes, by counting rows |
 | **when** did it fire? | only the last time | **every time** |
-| did the broker deliver this twice? | no — the duplicate never reaches the record | **yes**, as two rows |
+| was this stream entry delivered twice? | no — the duplicate never reaches the record | **yes**, as two rows |
 | what did the source send at 02:14? | only if nothing arrived after | **yes** |
 | how many arrivals in this hour? | no | **yes** |
 
@@ -29,7 +29,7 @@ it is bounded by a shorter retention (§4).
 
 ```text
 hist:<deliveryId>   hash  ONE delivery. Immutable, no state.
-idx:history         zset  <deliveryId> -> broker timestamp
+idx:history         zset  <deliveryId> -> arrival timestamp (brokerTs)
 ```
 
 `<deliveryId>` is a **UUID minted per delivery** (`newDeliveryId()`), not derived
@@ -54,7 +54,7 @@ so the two cannot drift:
 | `key` | the CONDITION this delivery belongs to (`<32 hex>`) |
 | `id` | the producer's message id — repeated across rows when a message is redelivered |
 | `source`, `type`, `msg`, `payload`, `severity`, `displaySeverity` | what arrived |
-| `brokerTs` | when WE received it |
+| `brokerTs` | when WE received it — the ms part of the stream entry ID |
 | `ts` | when the source claims it fired |
 
 Deliberately **absent**: `count`, `firstSeen`, `lastSeen`, `state`, `ackedBy`,
@@ -81,7 +81,7 @@ the fold is the dedup, so a row written inside it could only ever describe the
 arrivals the fold **accepted** (plus redeliveries its watermark happened to
 recognise). The one question an audit trail exists to answer —
 
-> what did the broker actually hand us, and how many times?
+> what did the ingest stream actually hand us, and how many times?
 
 — was still unanswerable for anything the guard dropped.
 
@@ -92,7 +92,7 @@ it. Consequences, all intended:
 |---|---|
 | every accepted message produces exactly one row | including the ones the fold will reject |
 | a delivery never overwrites another | the id is unique per delivery |
-| the write still precedes the ack | a crash after processing but before recording would leave a hole in the log |
+| the write still precedes the `XACK`+`XDEL` | a crash after processing but before recording would leave a hole in the log |
 
 It is one `MULTI` of `HSET` + `PEXPIRE` + `ZADD`, so the row and its index member
 cannot disagree. A per-command error inside the `MULTI` is checked and re-thrown,
@@ -104,7 +104,7 @@ them would leave an index member with no hash behind it, rendering as an empty r
 One thing: the row and the record are no longer written in the same atomic step, so
 a crash between them leaves a recorded delivery whose record was never updated. That
 is the correct trade — a gap in the log is worse than a gap in the cache, and the
-broker will redeliver the message anyway (producing a second audit row, which is
+entry is still pending, so it is delivered again (producing a second audit row, which is
 accurate).
 
 ## 3.2 The one row the worker cannot write: an operator DELETE
@@ -169,7 +169,7 @@ would promise rows that cannot exist.
 | Column | Note |
 |---|---|
 | Severity | the arrival's own severity, coloured the same way as everywhere else (`colourSeverity`) |
-| **Received** | the broker timestamp — when *we* saw it, not when the source claims it fired |
+| **Received** | the arrival timestamp (`brokerTs`, from the stream entry ID) — when *we* saw it, not when the source claims it fired |
 | **Summary**, **Key** | the arrival's summary, and the condition it belongs to (`Key` carries the producer message id as a tooltip) |
 
 No State column and no Count: an arrival has no state, and a per-arrival count
@@ -243,14 +243,14 @@ held 3 of 40.
 
 ## 6. What it does NOT do
 
-- **no replay** — History is a read model. `q.audit.events` in RabbitMQ remains the
-  durable WAL ([persistence-and-durability.md](persistence-and-durability.md) §4),
-  and it is what a rebuild replays from.
+- **no replay** — History is a read model with 3-day retention, not a backup. Nothing
+  is rebuilt from it; there is no copy of the data outside Valkey
+  ([persistence-and-durability.md](persistence-and-durability.md) §3.1).
 - **no ordering guarantee beyond the timestamp** — `brokerTs` comes from the
-  ingress, so two arrivals in the same millisecond sort by zset member, which is
+  stream entry ID (millisecond part only), so two arrivals in the same millisecond sort by zset member, which is
   arbitrary. They are the same instant; nothing downstream depends on their order.
 - **no dedup at all** — a redelivery is a SECOND ROW, and that is deliberate. The
-  trail records what the broker handed us; whether the fold counted it is a
+  trail records what the stream handed us; whether the fold counted it is a
   different question, answered by the condition's `count`.
 - **not part of the resize/selection machinery** — no selection, no bulk actions.
   An audit row is a fact, not a target.

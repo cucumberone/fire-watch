@@ -115,16 +115,18 @@ export function decompressPayload(payload) {
   return out;
 }
 
-/** Read the broker-assigned timestamp, in ms. Ordering depends on this. */
-export function brokerTsMs(msg) {
-  const h = msg.properties?.headers || {};
-  const original = h['x-original-ts'];
-  if (original !== undefined) return Number(original);
-  const ms = h.timestamp_in_ms;
-  if (ms !== undefined) return Number(ms);
-  const secs = msg.properties?.timestamp;
-  if (secs !== undefined) return Number(secs) * 1000;
-  return null;
+/**
+ * The arrival time, in ms, from a stream entry ID (`<ms>-<seq>`).
+ *
+ * Valkey assigns the ID on the master at XADD and guarantees it is monotonic
+ * per stream, even across a clock step backwards — so it is the one timestamp
+ * every worker agrees on, and a redelivery of the same entry keeps it.
+ * Ordering depends on this (docs/event-lifecycle.md §2).
+ */
+export function entryTsMs(entryId) {
+  if (typeof entryId !== 'string') return null;
+  const m = /^(\d+)-\d+$/.exec(entryId);
+  return m ? Number(m[1]) : null;
 }
 
 /*

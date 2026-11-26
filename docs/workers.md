@@ -1,6 +1,6 @@
 # Workers
 
-Consume events from RabbitMQ, persist them to Valkey, acknowledge last.
+Consume events from the Valkey ingest stream, persist them to Valkey, remove the entry last.
 
 ## 1. Topology
 
@@ -10,95 +10,75 @@ Consume events from RabbitMQ, persist them to Valkey, acknowledge last.
 | Image | `image-registry.openshift-image-registry.svc:5000/fire-watch/worker:<sha>` |
 | Runtime | Node.js 22 LTS |
 | Ports | none exposed; HTTP `/healthz` on 8080 for probes only |
-| State | none — everything reconstructible from RabbitMQ + Valkey |
+| State | none — everything reconstructible from Valkey (the ingest stream's pending list survives the pod) |
 | Anti-affinity | required against `app.kubernetes.io/name=worker` on `kubernetes.io/hostname` |
 | PDB | `minAvailable: 1` — workers are throughput, not quorum; pinning at 2 would block legitimate single-pod maintenance |
 
-Workers are stateless, so HPA is safe here (unlike RabbitMQ/Valkey). Start with 3 fixed; scale on queue depth only after a measured need.
+Workers are stateless, so HPA is safe here (unlike Valkey). Start with 3 fixed; scale on stream backlog only after a measured need.
+
+Implemented in [services/worker](../services/worker/); the stream handling is [`src/stream.js`](../services/worker/src/stream.js) (`StreamConsumer`).
 
 ## 2. Responsibilities
 
-1. Open an AMQP connection to `rabbitmq` Service, `confirm.select`, `basic.qos(prefetch)`.
-2. Consume `q.event.ingest`.
-3. Validate the envelope, including `severity` and the presence of a broker timestamp.
-4. Compute `broker_ts_ms` = `x-original-ts` ?? `timestamp_in_ms` ?? `properties.timestamp * 1000` ([event-lifecycle.md](event-lifecycle.md) §3, §6).
-5. **Compress** `payload.msgc` (and any payload field ≥ `FW_COMPRESS_MIN`) with gzip, leaving `msg` and the envelope plain ([payload-and-compression.md](payload-and-compression.md) §3).
-6. Write the event record and index entry to the current Valkey master (resolved via Sentinel).
-7. Apply the alert-state fold via the atomic Lua script ([event-lifecycle.md](event-lifecycle.md) §5.2) — this is the step that is watermark-guarded.
-8. Publish a **plain** copy to `fx.audit` / `q.audit.events` with a publisher confirm — the WAL is never compressed (§3.2).
-9. Publish to `fw:ch:events`, including the fold's `applied` flag, with the same compressed payload that went to Valkey.
-10. `basic.ack` — only now.
-11. On unrecoverable validation failure: `basic.nack(requeue=false)` → DLX → `q.event.ingest.dlq`.
-12. On transient failure (Valkey unavailable, replica lag, audit queue full): `basic.nack(requeue=true)` with backoff, or drop the channel and let redelivery handle it.
+1. Resolve the Valkey master through Sentinel; open **two** connections: a dedicated one for `XREADGROUP ... BLOCK` (it holds the socket for up to `FW_STREAM_BLOCK_MS`) and a shared one for the fold writes, `XACK`/`XDEL` and the DLQ.
+2. Ensure the consumer group: `XGROUP CREATE fw:stream:ingest workers 0 MKSTREAM`. From `0`, so nothing appended before the group existed is skipped; `BUSYGROUP` is ignored; a later `NOGROUP` (stream key lost, e.g. a lab `FLUSHALL`) recreates it.
+3. Read: `XREADGROUP GROUP workers <POD_NAME> COUNT 32 BLOCK 5000 STREAMS fw:stream:ingest >`. The entries of a batch are processed concurrently.
+4. Parse the `evt` field and validate the envelope, including `severity`.
+5. Compute `brokerTs` = the ms part of the entry ID (`<ms>-<seq>`, assigned by the master at `XADD`) — `entryTsMs()` in [`event.js`](../services/worker/src/event.js) ([event-lifecycle.md](event-lifecycle.md) §2).
+6. **Compress** `payload.msgc` (and any payload field ≥ `FW_COMPRESS_MIN`) with gzip, leaving `msg` and the envelope plain ([payload-and-compression.md](payload-and-compression.md) §3).
+7. Fork the delivery into the per-arrival trail (`hist:<deliveryId>` + `idx:history`, [history.md](history.md)).
+8. Write the record, its indexes and the alert-state fold via the atomic Lua script ([event-lifecycle.md](event-lifecycle.md) §5.2) — this is the step that is watermark-guarded.
+9. Publish to `fw:ch:events` (and `fw:ch:alerts` on a state change), including the fold's `applied` flag, with the same compressed payload that went to Valkey. Best effort.
+10. `XACK` + `XDEL` in **one `MULTI`** — only now.
+11. On a permanent failure (unparseable `evt`, invalid envelope, malformed ID): one `MULTI` of `XADD fw:stream:dlq * <original fields> origId <id> reason <text>` + `XACK` + `XDEL`.
+12. On any transient failure: leave the entry in this consumer's pending list (PEL); it is re-read after `FW_RETRY_MS` (§6).
 
 ## 3. Ordering of operations (critical)
 
 ```text
-validate -> COMPRESS msgc -> WRITE valkey (record + index + alert fold) -> PUBLISH audit (plain) -> PUBLISH channel (compressed) -> ack
+XREADGROUP -> parse evt -> validate -> brokerTs = entry-ID ms -> COMPRESS msgc
+           -> hist: fork -> fold write (record + index + state, ONE script)
+           -> PUBLISH channel (compressed, best effort) -> XACK + XDEL (one MULTI)
 ```
 
-Why the write precedes the ack: acknowledging first is a data-loss window. If the process dies between `ack` and the writes, the message is gone from RabbitMQ with nothing in Valkey — a direct R1 violation.
+Why the write precedes the `XACK`+`XDEL`: removing the entry first is a data-loss window. If the process dies between the removal and the write, the event is gone from the stream with nothing in Valkey — a direct R1 violation. Until `XACK` the entry sits in the PEL, where a retry or another worker's `XAUTOCLAIM` finds it.
 
-Why compression is only applied to the Valkey/pub-sub copies: the RabbitMQ original is the recovery source ([§3.2](#32-two-copies-different-encodings)).
+Why `XACK` and `XDEL` are one `MULTI`: separately, a crash between them leaves an entry that is acknowledged but still in the stream (inflating the backlog forever) or deleted but still pending (claimable but unreadable). Together the entry is either pending or gone.
 
-Why the audit publish precedes the ack: Valkey has no AOF, so an acked message that only lives in Valkey memory is lost if the master and both replicas die ([persistence-and-durability.md](persistence-and-durability.md) §3). The audit copy is what makes replay possible.
+Why the `hist:` fork precedes the fold: the trail records every arrival, including the ones the fold rejects. It must also succeed before the `XACK` — a delivery that was processed but not recorded is a hole in the log ([history.md](history.md)).
 
-Why pub/sub is published only after the write: a browser must never see an event that is not yet durable. A subscriber that misses the pub/sub message recovers via the index (`idx:source:<device>`) on reconnect.
+Why pub/sub is published only after the write: a browser must never see an event that is not yet durable. A subscriber that misses the pub/sub message recovers via the index (`idx:source:<device>`) on reconnect. A failed publish is logged and **not** retried — the event is durable already.
+
+Why there is no audit copy any more: the stream entry and the record live in the same replicated, AOF-backed Valkey, and the producer only got 202 after `WAIT 1`. A second copy in the same database adds no failure independence, and an external copy was dropped by decision ([persistence-and-durability.md](persistence-and-durability.md) §3).
 
 ### 3.1 Redelivery does not break closing semantics
 
-A worker failure **after** the Valkey write but **before** the ack causes a redelivery. That is safe by construction, and it is the exact scenario the design was built for:
+A worker failure **after** the fold write but **before** the `XACK`+`XDEL` leaves the entry pending, and it is delivered again — to this worker after `FW_RETRY_MS`, or to another via `XAUTOCLAIM`. That is safe by construction, and it is the exact scenario the design was built for:
 
-1. The record write is the fold itself. On a redelivery the `(ts, id)` watermark
-   already
-   exists, so the write returns `null` and the event is **dropped before anything
-   else runs** — no fold, no index, no audit copy, no live frame. It is still
-   ACKed, because a message that can never succeed must not loop forever.
-2. The index write is idempotent (`ZADD` on a repeated member only moves its
-   score), so a replay produces identical state.
+1. A redelivered entry keeps its **entry ID**, so the same `brokerTs`, and the same `evt.id`. The fold's `(ts, id)` watermark already holds that pair, so it returns `applied 0` and **nothing moves** — no count, no index change, no live frame. The entry is still `XACK`+`XDEL`'d, because an entry that can never apply must not loop forever. The `hist:` fork runs again, so a redelivery is **two history rows** — deliberately ([history.md](history.md)).
+2. The index write is idempotent (`ZADD` on a repeated member only moves its score), so a replay produces identical state.
 3. The fold is an atomic Lua script, so two workers racing on the same key converge on the highest timestamp.
 
-**Why identity is the event id, not the timestamp.** The fold's `(timestamp, id)`
-watermark compares against the broker arrival time, so it catches a redelivery
-(the same message keeps its original timestamp). It does *not* catch a producer
-re-sending an id or two POSTs carrying the same id: each is a new message with a
-new timestamp, so the repeat looks newer and would be counted every time. That is
-what a duplicate storm actually looks like, and it is why the gate lives on the
-event record rather than in the fold.
+**What the watermark does not catch.** A producer re-sending an id, or nginx re-POSTing a batch after a 503 that had in fact been appended, creates a **new** entry with a new ID and therefore a newer `brokerTs`. That is a new arrival: it counts once more (`count++`, `lastSeen` moves) on the same condition key. It never creates a second record, because the key is derived from content ([valkey.md](valkey.md) §2).
 
 Worked example — an old CLOSE must not retire a newer CRITICAL:
 
 | Step | Action | Alert state |
 |---|---|---|
-| 1 | CRITICAL arrives, `ts=1000` | open, watermark 1000 |
-| 2 | CLOSE arrives, `ts=1500`, Valkey write fails → `nack(requeue=true)` | unchanged, watermark 1000 |
-| 3 | new CRITICAL arrives, `ts=2000` | open, watermark 2000 |
-| 4 | CLOSE redelivered with `ts=1500` | fold returns `0` (stale) — **alert stays open** |
+| 1 | CRITICAL entry, `brokerTs=1000` | open, watermark 1000 |
+| 2 | CLOSE entry, `brokerTs=1500`, Valkey write fails → stays pending | unchanged, watermark 1000 |
+| 3 | new CRITICAL entry, `brokerTs=2000` (read by another worker) | open, watermark 2000 |
+| 4 | CLOSE re-read from the PEL with `brokerTs=1500` | fold returns `0` (stale) — **alert stays open** |
 
-Without broker timestamps and the watermark this sequence would silently retire an active alarm. Full treatment in [event-lifecycle.md](event-lifecycle.md) §4–5.
-
-### 3.2 Two copies, different encodings
-
-The worker produces **two** representations of the same event and they must not be confused:
-
-| Copy | Destination | Encoding | Why |
-|---|---|---|---|
-| WAL | `q.audit.events` | **plain** JSON | replay and export must not depend on an app codec ([payload-and-compression.md](payload-and-compression.md) §3.1) |
-| Cache | `event:<key>` + `fw:ch:events` | compressed `msgc` | memory, AOF and network savings |
-
-Consequences to implement carefully:
-
-- The audit publish happens **before** the ack but **after** compression is computed, reusing the original buffer — do not re-serialize the event twice.
-- The compressed value is written to Valkey **before** the audit publish, so a crash in between leaves a cache entry with no WAL entry. That is the safe direction: the message is still unacked and will be redelivered, and the cache write is idempotent.
-- A replay reads plain WAL records and re-runs compression, so replay output is identical to live output.
+Without stream-assigned timestamps and the watermark this sequence would silently retire an active alarm. Full treatment in [event-lifecycle.md](event-lifecycle.md) §4–5.
 
 ## 4. Idempotency
 
-RabbitMQ is at-least-once: a message is redelivered whenever a worker dies before acking. Writes are therefore keyed by `id` and guarded by the broker timestamp:
+Stream consumption is at-least-once: an entry is delivered again whenever a worker dies (or fails) before its `XACK`. Writes are therefore keyed by content and guarded by the arrival timestamp:
 
 ```
 EVAL event-fold.lua 5 event:<key> idx:event:all idx:event:open idx:event:closed idx:source:<device>
-     <broker-ts-ms> <arrival-id> <severity> <bare-key> <device> <ttl-ms> <field> <value> …
+     <entry-ts-ms> <arrival-id> <severity> <bare-key> <device> <ttl-ms> <field> <value> …
 PUBLISH fw:ch:events <json>
 ```
 
@@ -115,8 +95,8 @@ message id) and the rollup key (the condition) were different objects.
 - There is **no coalescing window**. A repeat is counted, not suppressed: the
   duplicate problem is solved by the key, not by a clock
   ([event-lifecycle.md](event-lifecycle.md) §5.4.3).
-- The index score is the **broker timestamp**, not the producer `ts`. A redelivered
-  event therefore keeps its original position in the timeline.
+- The index score is the **stream entry timestamp** (`brokerTs`), not the producer `ts`. A redelivered
+  entry therefore keeps its original position in the timeline.
 
 Fold return codes, forwarded as `applied`:
 
@@ -139,16 +119,16 @@ A repeat of the same CONDITION hashes to the **same key** as the original
 reconcile. What the fold does with the arrival is:
 
 - `count` increments once per arrival;
-- `lastSeen` moves to the newest arrival's broker timestamp;
+- `lastSeen` moves to the newest arrival's stream entry timestamp;
 - `lastId` records the newest arrival's id;
 - `firstSeen` does **not** move — it marks when this episode began.
 
-**Per-delivery history is NOT kept in Valkey.** It used to be, under a separate
+**The record does not keep per-delivery history.** It used to, under a separate
 `fw:evt:<id>` key per delivery (the old model, now gone), and that was reversed once to fix the All events tab.
 The content key makes the reversal unnecessary: All events lists CONDITIONS, which is
-what a row on the board is. The per-delivery log is `q.audit.events`
-([persistence-and-durability.md](persistence-and-durability.md) §4) — that is where a
-dedup investigation reads individual arrivals.
+what a row on the board is. The per-delivery log is the `hist:` trail
+([history.md](history.md), 3-day retention) — that is where a dedup investigation
+reads individual arrivals.
 
 Cost, stated because it is real: the working set now scales with **conditions**, not
 deliveries ([sizing.md](sizing.md) §1.1). A producer that repeats one fault forever
@@ -178,7 +158,7 @@ were unlistable.
 3. for each source index, `missingFromGlobal` (a pure, tested function)
 4. `MGET` each candidate for its `brokerTs` and `ZADD` it at that score
 
-Score is the **record's** broker arrival time, never "now": scoring now would put a
+Score is the **record's** stream arrival time, never "now": scoring now would put a
 week-old event at the top of the All events list, which is worse than leaving it out.
 A record that has already expired, or carries no usable timestamp, is counted as
 skipped rather than given an invented position.
@@ -214,8 +194,8 @@ for different reasons.
 
 | | Transport dedup | Content dedup |
 |---|---|---|
-| Problem | the same **message** arrives twice | the same **condition** is reported 1 000×/min |
-| Cause | at-least-once delivery, crash before ack, replay | a sensor that stays faulted |
+| Problem | the same **stream entry** is delivered twice | the same **condition** is reported 1 000×/min |
+| Cause | at-least-once delivery, crash before `XACK`, `XAUTOCLAIM` | a sensor that stays faulted |
 | Mechanism | the fold's `(brokerTs, id)` ordering guard | the CONTENT KEY: a repeat hashes to the same record |
 | Guarantees | a redelivery changes nothing | one record per condition, `lastSeen` moving, `count` per arrival |
 | Fails if missing | a repeat is counted twice | 10 million rows in a week, unusable UI |
@@ -239,33 +219,74 @@ Verification for all five is in §10 and [validation.md](validation.md) §6.
 
 ## 5. Replica-sync guard (write path)
 
-Per [valkey.md](valkey.md) §3, writes must not land on a master that has lost its replicas. Workers therefore check before writing:
+Per [valkey.md](valkey.md) §3, writes must not land on a master that has lost all of its replicas. Two layers enforce that without the worker checking anything itself:
 
-```text
-if the valkey Service has no ready endpoint -> do not write; nack(requeue=true)
-```
+- **Engine:** `min-replicas-to-write 1` — the master answers `NOREPLICAS` to every write (fold, `XACK`, `XDEL`) while it sees no replica acknowledging within `min-replicas-max-lag 10`.
+- **Routing:** `sentinel-bridge` reads every pod's `ROLE`, and when the designated master has fewer than `FW_WRITE_GUARD_MIN_REPLICAS` (= 1, must equal `min-replicas-to-write`) connected replicas it sets `Endpoints/valkey` to zero addresses and labels the pod `fire-watch.io/writable=false` ([fault-tolerance.md](fault-tolerance.md) §3.7).
 
-The gate is the **Service**, not a key inside Valkey. A degraded Valkey cannot be asked to report its own degradation. `sentinel-bridge` reads every pod's `ROLE`, and when the designated master has fewer than `FW_WRITE_GUARD_MIN_REPLICAS` connected replicas it sets `Endpoints/valkey` to zero addresses and labels the pod `fire-watch.io/writable=false`. Workers observe the empty endpoint list and stop writing ([valkey.md](valkey.md) §3, [fault-tolerance.md](fault-tolerance.md) §3.7).
+The gate is never a key inside Valkey — a degraded Valkey cannot be asked to report its own degradation. Either way the worker sees a failed write, marks the entry `retry`, and the entry stays pending.
 
 This also keeps the rule that the write target must come from the `valkey` Service / Sentinel — never from a pod IP (see [redis-sentinel.md](redis-sentinel.md) §5).
 
-## 6. Connection and failure handling
+## 6. Delivery, retry, claim and dead-letter
+
+### 6.1 Outcomes per entry
+
+| Outcome | When | Stream operations |
+|---|---|---|
+| `ack` | fold write done (any `applied`, including `0` for a redelivery) | `MULTI` `XACK` + `XDEL` `EXEC` |
+| `retry` | **any** transient error: Valkey unreachable, `READONLY`, `NOREPLICAS`, failover in progress, fold script error, unexpected throw | none — the entry stays in this consumer's PEL |
+| `dlq` | can never succeed: `evt` not JSON, envelope fails validation, entry ID carries no timestamp | `MULTI` `XADD fw:stream:dlq * <orig fields> origId <id> reason <text>` + `XACK` + `XDEL` `EXEC` |
+
+An unexpected throw is classed as `retry`, not `dlq`: assuming "permanent" for an unknown error silently discards data. A failed dead-letter `MULTI` is itself retried.
+
+### 6.2 Retry: the pending list, forever
+
+After a batch with any `retry` outcome the loop re-reads its own PEL once `FW_RETRY_MS` (5 000) has passed:
+
+```
+XREADGROUP GROUP workers <pod> COUNT 32 STREAMS fw:stream:ingest 0
+```
+
+There is **no delivery limit**. An event is retried for the entire duration of a Valkey outage without ever being dead-lettered — giving up on a valid event is data loss ([fault-tolerance.md](fault-tolerance.md) §3.1). A fresh process also does one `0` pass at start, in case its pod name already owns pending entries.
+
+### 6.3 Claim: entries left by a dead worker
+
+Every `FW_CLAIM_INTERVAL_MS` (30 000) the worker runs
+
+```
+XAUTOCLAIM fw:stream:ingest workers <pod> 60000 0-0 COUNT 32
+```
+
+and takes over entries that have been pending on any consumer for more than `FW_CLAIM_IDLE_MS` (60 000) — a worker that was killed, evicted, or is wedged. `FW_CLAIM_IDLE_MS` must stay far above the time one entry takes to process, or two live workers would trade an entry back and forth (harmless — the watermark absorbs it — but wasteful).
+
+Workers are a Deployment, so every restart leaves a new consumer name behind. In the same tick the worker removes consumers with **0 pending** and idle longer than `FW_CONSUMER_GC_IDLE_MS` (1 h) via `XGROUP DELCONSUMER`. A consumer that still owns entries is never deleted.
+
+### 6.4 The stream is never trimmed
+
+No `MAXLEN`, no `MINID`. A trim deletes entries regardless of whether they were processed, which is an accepted event lost. Entries leave the stream only through `XDEL` after the fold write (or the DLQ move), so `XLEN fw:stream:ingest` **is** the backlog — nothing else. `maxmemory-policy noeviction` keeps eviction from doing what a trim would ([valkey.md](valkey.md) §5).
+
+`fw:stream:dlq` is never trimmed either; an operator inspects (`XRANGE fw:stream:dlq - +`) and deletes. `IngestDeadLetteredEvents` fires while it is non-empty ([monitoring.md](monitoring.md)).
+
+### 6.5 Failure table
 
 | Failure | Handling |
 |---|---|
-| Valkey master changes | Sentinel-aware client reconnects to the new master; in-flight write retried once, then `nack(requeue=true)` |
-| Valkey returns `READONLY` | This worker is pointed at a demoted node: refresh master from Sentinel, retry once, else `nack(requeue=true)` |
-| RabbitMQ connection lost | Client auto-reconnects; unacked messages are redelivered (at-least-once) |
-| Message fails schema validation | `nack(requeue=false)` → DLX → `q.event.ingest.dlq`, increment `fw_worker_dlq_total` |
-| Valkey Service has no ready endpoint | The master is gone or the write guard tripped it: `nack(requeue=true)`, back off, retry forever |
-| Valkey returns `NOREPLICAS` | `min-replicas-to-write` is refusing writes because the master cannot see two replicas. **Not** retried in-process — it is the intended refusal, not a routing fault — so the message is `nack`ed and RabbitMQ accumulates until the replicas return ([valkey.md](valkey.md) §5) |
-| Pod is evicted mid-write | Unacked message redelivered; the partial write is overwritten idempotently |
+| Valkey master changes | Sentinel-aware client reconnects to the new master; the batch's writes fail → `retry`; the read loop resets its connection and re-reads |
+| Valkey returns `READONLY` | This worker is pointed at a demoted node: refresh master from Sentinel; the entry stays pending and is retried |
+| Valkey returns `NOREPLICAS` | `min-replicas-to-write 1` is refusing writes because the master sees no replica. The intended refusal: entries stay pending, the stream accumulates nothing new (ingress gets the same refusal and answers 503) until a replica returns |
+| Valkey Service has no ready endpoint | The master is gone or the write guard tripped: `retry`, back off, retry forever |
+| Entry fails parsing / validation | moved to `fw:stream:dlq` with `reason` |
+| `XACK`/`XDEL` fails after the writes | entries stay pending and are redelivered; the watermark returns `applied 0` |
+| Pod is evicted or killed mid-batch | its pending entries are `XAUTOCLAIM`ed by another worker after 60 s; the partial write is absorbed by the watermark |
 
-**`nack(requeue=false)` is permitted for validation failures only.** Every transient condition must requeue. The queue deliberately carries **no `x-delivery-limit`**, so an event can be retried for the entire duration of a Valkey outage without ever being dead-lettered ([fault-tolerance.md](fault-tolerance.md) §3.1).
+`FW_STREAM_BATCH` (default 32) is the read size. Higher raises throughput and the number of entries a killed pod leaves pending; keep it modest until throughput requires otherwise.
 
-`prefetch`: default 32. Higher raises throughput and re-delivery blast radius on restart; keep it modest until throughput requires otherwise.
+### 6.6 Shutdown
 
-### 6.1 Valkey client: two bugs that made a healthy database look dead
+On `SIGTERM` the worker stops reading, lets the in-flight batch finish its writes and `XACK`+`XDEL`, then exits; a hard exit fires at 20 s, inside `terminationGracePeriodSeconds`. The blocking read returns within `FW_STREAM_BLOCK_MS`. Anything still pending is `XAUTOCLAIM`ed by another worker — delayed, never lost.
+
+### 6.7 Valkey client: two bugs that made a healthy database look dead
 
 The worker reported `valkey connection ready` and then failed every one of its
 30 startup attempts with `valkey not reachable yet` — against a database that
@@ -301,34 +322,43 @@ master resolving correctly throughout.
 
 | Probe | Endpoint | Notes |
 |---|---|---|
-| startup | `GET /healthz` | returns 200 when the AMQP connection and Valkey client are both established |
-| readiness | `GET /healthz` | must be **false** while the write guard is degraded — a worker that cannot write must not consume |
+| startup | `GET /healthz` | 200 once the consumer group is ensured and the last Valkey write/ping succeeded |
+| readiness | `GET /healthz` | `group ready && last write ok && not draining`; false while Valkey refuses writes — a worker that cannot write should not be counted as capacity |
 | liveness | `GET /livez` | process-only; never fails on dependency loss, or an outage restart-loops all workers simultaneously |
 
-Readiness failing on a degraded write guard is what turns backpressure into a natural pause: the queue retains messages, nothing is lost.
+`last write ok` is re-probed with a Valkey `PING` every 10 s, so readiness recovers without a restart. Readiness failing turns backpressure into a natural pause: entries stay in the stream, visibly (`XLEN`, `IngestStreamBacklogGrowing`), and nothing is lost.
 
 ## 8. Sizing
 
 | Aspect | Value | Rationale |
 |---|---|---|
 | Requests | 100m CPU, 256Mi RAM | I/O-bound |
-| Limits | 500m CPU, 512Mi RAM | JSON parse + two network round trips |
+| Limits | 500m CPU, 512Mi RAM | JSON parse + a few network round trips |
 | Expected throughput | ~1 000–3 000 msg/s per pod at 2 KiB payload | 1 000/min sustained with 500/s storms is met by a single pod; 3 replicas exist for H/A, not capacity ([sizing.md](sizing.md) §1) |
-| HPA (later) | 3..12 on `rabbitmq_quorum_queue_messages_ready` | scale on backlog, not CPU |
+| HPA (later) | 3..12 on `redis_stream_length{stream="fw:stream:ingest"}` | scale on backlog, not CPU |
 
 ## 9. Configuration
 
-| Key | Source | Example |
+| Key | Source | Default |
 |---|---|---|
-| `AMQP_URL` | `Secret/worker-amqp` | `amqp://fw:<pass>@rabbitmq:5672/%2f` |
-| `SENTINELS` | ConfigMap | `sentinel-0.sentinel-headless:26379,sentinel-1...,sentinel-2...` |
-| `VALKEY_MASTER_NAME` | ConfigMap | `fire-watch-valkey` |
-| `VALKEY_PASSWORD` | `Secret/valkey` | injected via `sentinel auth-pass` + client options |
-| `FW_EVENT_TTL` | ConfigMap | `604800` (7 days; retention rationale in [sizing.md](sizing.md) §1) |
-| `FW_INDEX_PRUNE_EVERY` | ConfigMap | `1000` — writes per source between `ZREMRANGEBYSCORE` prunes ([architecture.md](architecture.md) §6.2) |
-| `FW_COMPRESS_MIN` | ConfigMap | `1024` — gzip a payload field only if its UTF-8 length ≥ this ([payload-and-compression.md](payload-and-compression.md) §7) |
-| `FW_COMPRESS_LEVEL` | ConfigMap | `6` — gzip level |
-| `FW_PREFETCH` | ConfigMap | `32` |
+| `SENTINELS` | Deployment env | `sentinel-0.sentinel-headless:26379,sentinel-1...,sentinel-2...` |
+| `VALKEY_MASTER_NAME` | Deployment env | `fire-watch-valkey` |
+| `VALKEY_PASSWORD` | `Secret/fire-watch-valkey` | injected via `sentinel auth-pass` + client options |
+| `POD_NAME` | downward API (`metadata.name`) | consumer name; falls back to the hostname |
+| `FW_STREAM_KEY` | Deployment env | `fw:stream:ingest` |
+| `FW_STREAM_GROUP` | Deployment env | `workers` |
+| `FW_STREAM_DLQ_KEY` | Deployment env | `fw:stream:dlq` |
+| `FW_STREAM_BATCH` | Deployment env | `32` — entries per `XREADGROUP` |
+| `FW_STREAM_BLOCK_MS` | Deployment env | `5000` |
+| `FW_RETRY_MS` | Deployment env | `5000` — delay before re-reading the PEL |
+| `FW_CLAIM_IDLE_MS` | Deployment env | `60000` — pending this long → claimable |
+| `FW_CLAIM_INTERVAL_MS` | Deployment env | `30000` |
+| `FW_CONSUMER_GC_IDLE_MS` | Deployment env | `3600000` |
+| `FW_EVENT_TTL` | Deployment env | `604800` (7 days; retention rationale in [sizing.md](sizing.md) §1) |
+| `FW_HISTORY_TTL` | Deployment env | `259200` (3 days, [history.md](history.md)) |
+| `FW_INDEX_PRUNE_EVERY` | Deployment env | `1000` — writes per source between `ZREMRANGEBYSCORE` prunes ([architecture.md](architecture.md) §6.2) |
+| `FW_COMPRESS_MIN` | Deployment env | `1024` — gzip a payload field only if its UTF-8 length ≥ this ([payload-and-compression.md](payload-and-compression.md) §7) |
+| `FW_COMPRESS_LEVEL` | Deployment env | `6` — gzip level |
 
 `.gitignore` must exclude any `.env`, `*.pem`, `*.key`, `secrets/`.
 
@@ -336,26 +366,23 @@ Readiness failing on a degraded write guard is what turns backpressure into a na
 
 ```bash
 kubectl -n fire-watch logs deploy/worker -f
-# expect: "connected amqp", "sentinel master resolved", "consuming q.event.ingest"
+# expect: "worker starting" with stream/group/consumer, then no "write failed"
 
-# publish a test event and confirm the round trip
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin publish exchange=fx.events routing_key=event.ingest \
-  payload='{"id":"t1","source":"probe","type":"test","severity":"CRITICAL","ts":"2026-11-09T00:00:00Z","payload":{}}'
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 GET event:t1
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 ZRANGE idx:source:probe 0 -1
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 HGETALL event:probe:test
+vk() { kubectl -n fire-watch exec valkey-0 -c valkey -- sh -c "valkey-cli -a \"\$VALKEY_PASSWORD\" --no-auth-warning $*"; }
 
-# idempotency: publish the same id twice, expect one record and one index entry
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 ZCARD idx:source:probe   # -> 1
+# the group exists and every worker pod is a consumer
+vk XINFO GROUPS fw:stream:ingest
+vk XINFO CONSUMERS fw:stream:ingest workers
 
-# close semantics: CLOSE closes, and a stale CLOSE is refused
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin publish exchange=fx.events routing_key=event.ingest \
-  payload='{"id":"t2","source":"probe","type":"test","severity":"CLOSE","ts":"2026-11-09T00:01:00Z","payload":{}}'
-kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 EXISTS event:probe:test     # -> 0
+# post a test event through the ingress (http-ingress.md §9), then:
+vk XLEN fw:stream:ingest                      # -> back to 0 once folded
+vk XPENDING fw:stream:ingest workers          # -> 0 pending
+vk ZRANGE idx:source:probe 0 -1               # -> the bare key
+vk HGETALL event:<bare-key>                   # -> count, lastSeen, state
 
 # kill a worker mid-flight and confirm no loss
 kubectl -n fire-watch delete pod -l app.kubernetes.io/name=worker --field-selector status.phase=Running
-# expect: queue drains again, no messages in q.event.ingest.dlq
+# expect: XPENDING drains within ~60-90 s (XAUTOCLAIM), XLEN fw:stream:dlq stays 0
 ```
 
-The adversarial ordering case (redelivered CLOSE vs newer CRITICAL) is drill 6.3 in [validation.md](validation.md) §6 and cannot be verified by hand-publishing alone.
+The adversarial ordering case (redelivered CLOSE vs newer CRITICAL) is drill 6.3 in [validation.md](validation.md) §6 and cannot be verified by hand-posting alone.

@@ -23,12 +23,20 @@
 #                                    (fault-tolerance.md §3.6)
 #   maxmemory-policy noeviction   -> any other policy silently deletes live
 #                                    events at maxmemory, breaking 7-day
-#                                    retention with no signal (fault-tolerance.md §3.9)
+#                                    retention with no signal (fault-tolerance.md
+#                                    §3.9). Applies to the ingest stream too: an
+#                                    evicted entry is an event that was answered
+#                                    202 and never processed.
 #
 # Split-brain protection is enforced by the ENGINE here, not only by routing:
-# `min-replicas-to-write 2` makes the master refuse writes when it cannot see two
-# replicas. That is the AGENTS.md "always find 2 replicas before accepting
-# writes" rule. The lab overlay sets it to 0 (one pod, no replica).
+# `min-replicas-to-write 1` makes the master refuse writes when it cannot see at
+# least one replica. With 3 pods (master + 2 replicas) that keeps writes going
+# with one replica lost, while an isolated master (0 replicas) still refuses.
+# The lab overlay sets it to 0 (one pod, no replica).
+#
+# EVERY pod loads this same file, so AOF is on for the master AND both replicas:
+# a replica persists the replication stream to its own AOF, and a promoted
+# replica restarts from its own disk (docs/valkey.md §4).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -103,10 +111,13 @@ data:
     maxmemory-policy noeviction
 
     # ---- replication / split brain ------------------------------------------
-    # Refuse writes unless 2 replicas are connected and have acknowledged within
-    # 10 s. This is the engine-level half; sentinel-bridge additionally empties
-    # the Service endpoint so clients cannot reach a minority master at all.
-    min-replicas-to-write 2
+    # Refuse writes unless at least 1 replica is connected and has acknowledged
+    # within 10 s. 1, not 2: with master + 2 replicas, 2 would stop all writes the
+    # moment either replica is lost. An isolated master still sees 0 and refuses.
+    # This is the engine-level half; sentinel-bridge additionally empties the
+    # Service endpoint so clients cannot reach a minority master at all.
+    # Writers also `WAIT 1` before acknowledging (docs/valkey.md §3).
+    min-replicas-to-write 1
     min-replicas-max-lag 10
     replica-read-only yes
     # Replicas must not expire keys on their own read path: the master drives

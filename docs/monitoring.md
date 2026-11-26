@@ -1,6 +1,6 @@
 # Monitoring
 
-`k8s/base/60-monitoring.yaml` — 3 ServiceMonitors and 4 PrometheusRules. Requires the
+`k8s/base/60-monitoring.yaml` — 2 ServiceMonitors (the two exporters) and 4 PrometheusRules (`fire-watch-stream`, `fire-watch-valkey`, `fire-watch-sentinel`, `fire-watch-workloads`). Requires the
 OpenShift monitoring stack or `kube-prometheus-stack` (for the
 `monitoring.coreos.com/v1` CRDs) plus `kube-state-metrics` and cAdvisor.
 
@@ -17,9 +17,8 @@ on 6379 — so an exporter has to translate. `k8s/base/33-redis-exporter.yaml` r
 
 | Component | Metrics source | Port | Answers |
 |---|---|---|---|
-| RabbitMQ | `rabbitmq_prometheus` plugin | 15672 `/metrics` | queue depth, alarms, cluster membership |
 | **redis-exporter** | `redis_exporter --is-sentinel` against `sentinel-0` | 9121 `/metrics` | quorum health, master flapping (`redis_sentinel_*`) |
-| **valkey-exporter** | `redis_exporter` against the `valkey` Service | 9121 `/metrics` | memory, eviction, replica count, AOF (`redis_*`) |
+| **valkey-exporter** | `redis_exporter` against the `valkey` Service | 9121 `/metrics` | memory, eviction, replica count, AOF (`redis_*`), and the ingest/DLQ streams (`redis_stream_*`) |
 | Workloads | kube-state-metrics + cAdvisor | n/a | readiness, restarts, memory limits |
 
 **Why one is not enough.** A Sentinel-mode scrape never issues `INFO` against the data
@@ -31,6 +30,11 @@ knows nothing about quorum.
 `valkey-exporter` targets `redis://valkey:6379`, i.e. the ClusterIP Service whose
 Endpoints `sentinel-bridge` keeps pointed at the CURRENT MASTER. That is what makes
 every `redis_*` rule describe the master rather than an arbitrary replica.
+
+`valkey-exporter` sets `REDIS_EXPORTER_CHECK_SINGLE_STREAMS="db0=fw:stream:ingest,db0=fw:stream:dlq"`,
+which adds `redis_stream_length` and, per consumer group,
+`redis_stream_group_messages_pending` for exactly those two keys. Single-stream mode
+is used instead of a key pattern so the exporter never `SCAN`s the keyspace.
 
 ---
 
@@ -53,24 +57,26 @@ the names against a running exporter before trusting any rule.
 
 ## 3. The alert set
 
-### RabbitMQ
+### Ingest stream (`fire-watch-stream`)
 
 | Alert | Condition | Severity |
 |---|---|---|
-| `RabbitMQQueueBacklogGrowing` | ready messages non-decreasing for 15m | warning |
-| `RabbitMQMemoryAlarm` | `rabbitmq_alarms_memory_used_watermark == 1` | critical |
-| `RabbitMQDiskAlarm` | `rabbitmq_alarms_free_disk_space_watermark == 1` | critical |
-| `RabbitMQUnackedWithNoConsumers` | unacked > 0 **and** consumers == 0 for 5m | critical |
-| `RabbitMQClusterIncomplete` | fewer than 3 `rabbitmq_identity_info` targets | critical |
-| `RabbitMQDeadLetteredEvents` | `q.event.ingest.dlq` non-empty for 5m | warning |
-| `RabbitMQAuditQueueFilling` | audit queue > 70 % of its 64 GiB cap for 30m | warning |
+| `IngestStreamBacklogGrowing` | `redis_stream_length{stream="fw:stream:ingest"} > 0` and not falling for 15m | warning |
+| `IngestStreamPendingStuck` | `redis_stream_group_messages_pending{stream="fw:stream:ingest",group="workers"} > 1000` for 10m | warning |
+| `IngestDeadLetteredEvents` | `redis_stream_length{stream="fw:stream:dlq"} > 0` for 5m | warning |
 
+The stream is never trimmed, so its length **is** the backlog: a stream that stays
+non-empty and does not shrink means workers are down, not ready, or refused by Valkey.
+A large pending count means entries were delivered but not acknowledged — workers are
+failing writes and retrying, or a dead worker's entries have not been claimed yet
+([workers.md](workers.md) §6). A non-empty DLQ means producers are sending entries
+that can never succeed; inspect with `XRANGE fw:stream:dlq - +`.
 ### Valkey
 
 | Alert | Condition | Severity |
 |---|---|---|
-| **`ValkeyWriteGateClosed`** | `redis_connected_slaves < 2` for 2m | **critical** |
-| `ValkeyReplicaDown` | same signal held for 5m — names the lagging side | warning |
+| **`ValkeyWriteGateClosed`** | `redis_connected_slaves < 1` for 2m | **critical** |
+| `ValkeyReplicaDown` | `redis_connected_slaves < 2` for 5m — one replica gone, writes still succeed | warning |
 | `ValkeyReplicaLag` | master/replica offset gap > 100 MB for 5m | warning |
 | **`ValkeyEvictingKeys`** | `increase(redis_evicted_keys_total[5m]) > 0` | **critical, no delay** |
 | `ValkeyOutOfMemory` | `used / max > 0.98` for 5m — writes are being refused | critical |
@@ -82,10 +88,13 @@ the names against a running exporter before trusting any rule.
 Two of these deserve a note:
 
 **`ValkeyWriteGateClosed` is the engine telling you it is refusing writes.** With
-`min-replicas-to-write 2`, the master returns `NOREPLICAS` and the worker correctly
-`nack`s. Events accumulate in RabbitMQ — which is the intended behaviour, not a
-failure. The alert exists so nobody spends that time debugging the worker
-([valkey.md](valkey.md) §5).
+`min-replicas-to-write 1` and no replica connected, the master returns `NOREPLICAS`:
+http-ingress answers 503 (nginx buffers and retries) and workers leave entries
+pending. That is the intended behaviour, not a failure. The alert exists so nobody
+spends that time debugging the ingress or the worker ([valkey.md](valkey.md) §5).
+
+**`ValkeyReplicaDown` is only a warning.** With one replica left, writes and `WAIT 1`
+still succeed; redundancy is reduced until the pod returns.
 
 **`ValkeyEvictingKeys` should be impossible.** `maxmemory-policy noeviction` is
 mandatory ([fault-tolerance.md](fault-tolerance.md) §3.9), so a non-zero eviction
@@ -118,7 +127,7 @@ delay.
 |---|---|
 | `used_memory / maxmemory` as a *warning* threshold | `maxmemory` is sized to the working set on purpose, so this sits near 1.0 permanently. Pure noise. The useful signal is the REFUSAL (`ValkeyOutOfMemory`) and eviction |
 | AOF file age via mtime | requires a custom exporter; `redis_aof_last_bgrewrite_status` covers the same failure |
-| Per-pod restart counts on RabbitMQ | restart-loops are already caught by `PodCrashLooping`, and RabbitMQ restarts legitimately on rolling updates |
+| Per-consumer pending counts | the group total (`IngestStreamPendingStuck`) is the incident; one worker with pending entries is normal mid-batch |
 | Record counts per condition | `ZCARD idx:event:all` is a capacity question ([sizing.md](sizing.md) §6), not an incident |
 
 ---
@@ -136,7 +145,7 @@ kubectl -n fire-watch exec deploy/redis-exporter -- \
 # Valkey data family — confirm every name used in 60-monitoring.yaml
 kubectl -n fire-watch exec deploy/valkey-exporter -- \
   wget -qO- localhost:9121/metrics \
-  | grep -E 'redis_connected_slaves|redis_evicted_keys_total|redis_aof_last_write_status|redis_memory_max_bytes'
+  | grep -E 'redis_connected_slaves|redis_evicted_keys_total|redis_aof_last_write_status|redis_memory_max_bytes|redis_stream_length|redis_stream_group_messages_pending'
 
 # Prometheus picked up the rules
 kubectl -n fire-watch get prometheusrule

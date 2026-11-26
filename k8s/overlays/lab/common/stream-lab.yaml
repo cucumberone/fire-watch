@@ -1,0 +1,30 @@
+# Stream writers in the lab: WAIT for 0 replicas, because there are none.
+#
+# With FW_WAIT_REPLICAS=1 every XADD would wait the full timeout for a replica
+# that does not exist and then answer 503 — the lab would accept nothing. This is
+# the same reason valkey-lab.yaml sets `min-replicas-to-write 0` and
+# bridge-lab.yaml disables the write guard: all three are off together or the lab
+# silently refuses writes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-ingress
+spec:
+  template:
+    spec:
+      containers:
+        - name: ingress
+          env:
+            - { name: FW_WAIT_REPLICAS, value: "0" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          env:
+            - { name: FW_WAIT_REPLICAS, value: "0" }

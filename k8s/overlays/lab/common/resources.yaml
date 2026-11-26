@@ -1,22 +1,8 @@
-# Tiny resources for every container. The base requests 8Gi/52Gi for Valkey
-# and 1Gi/2Gi for RabbitMQ, which cannot fit a homelab.
+# Tiny resources for every container. The base requests 8Gi/52Gi for Valkey,
+# which cannot fit a homelab.
 #
 # Totals after this patch: ~1 CPU requested, ~2.5 GiB requested
 # (docs/kustomize.md §3.3).
----
-# ------------------------------------------------------------------ RabbitMQ
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: rabbitmq
-spec:
-  template:
-    spec:
-      containers:
-        - name: rabbitmq
-          resources:
-            requests: { cpu: 50m,  memory: 128Mi }
-            limits:   { cpu: 300m, memory: 384Mi }
 ---
 # ------------------------------------------------------------------- Valkey
 apiVersion: apps/v1

@@ -3,11 +3,6 @@
 # operation here — omitting 01-pdb.yaml from the overlay's resources would also
 # work but would silently drop it from every future overlay too
 # (docs/kustomize.md §5).
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: rabbitmq
-$patch: delete
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

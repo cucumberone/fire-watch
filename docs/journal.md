@@ -4,7 +4,7 @@ A right-click note on an incident. Small feature, but it touches the two rules t
 project is most careful about — who owns a key, and what "no data loss" actually
 means for a field a human typed.
 
-**Status: implemented** in the gateway (`journal.js`, `audit.js`), the frontend
+**Status: implemented** in the gateway (`journal.js`), the frontend
 (inspector → Journal), and the dev harness. Not yet deployed to the lab.
 
 ---
@@ -96,46 +96,33 @@ alternatives:
 
 ## 3. Durability — and the honest limit
 
-**A note is NOT as durable as an event.** Events pass through RabbitMQ and are copied
-to `q.audit.events` before the ack, so the event log is recoverable from the broker if
-Valkey is lost. Valkey has no AOF. A note written only to Valkey would go
-with it.
+**A note is exactly as durable as an event record** — no more, no less. Both live
+only in Valkey:
 
-So each entry is **also published to `fx.audit` / `event.audit`**, the same exchange
-and routing key the worker uses for the event audit copy:
-
-```json
-{ "kind": "journal", "key": "core-sw-07:link.down",
-  "entry": { "id": "…", "by": "alice", "at": 1794326011520, "text": "…" } }
-```
-
-`messageId` is `journal:{key}:{id}`, so a redelivery after a reconnect is the same
-message rather than a second note.
-
-| Property | Value |
+| Mechanism | Covers |
 |---|---|
-| Broker-confirmed | yes (`createConfirmChannel`) |
-| Persistent | yes (`deliveryMode: 2`) |
-| Blocking the append | **no** |
+| AOF (`appendonly yes`, `appendfsync everysec`) on **every** Valkey pod, each on its own PVC | restart of any pod, or all three: ≤ 1 s per pod not yet fsynced |
+| Replication to 2 replicas, `min-replicas-to-write 1` | loss of any one pod or node; an isolated master refuses the append |
 
-**Why the publish is best-effort.** By the time it runs the note is already stored and
-readable. Failing the request because the broker is unreachable would turn "your note
-may not survive a database loss" into "you cannot write a note" — the wrong trade for
-an annotation, and it would report failure for a write that happened. The failure is
-logged at **`warn`** and surfaced as the `fw_journal_audit_enabled` gauge, so a
-deployment without audit wiring is visible to monitoring rather than living in a
-startup log line.
+There is **no copy outside Valkey**. Notes used to be published to an external audit copy as well; that copy was dropped
+together with the message broker
+([persistence-and-durability.md](persistence-and-durability.md) §3.1), and so was the
+metric that reported whether it was wired.
 
-### What is still true even with audit enabled
+The append itself does not `WAIT` for a replica: it is an `RPUSH` + `LTRIM` +
+`EXPIRE` on the master, answered as soon as the master accepts it. A master crash in
+the replication gap can therefore lose the last note written before it — a window of
+milliseconds, on an annotation, accepted. The append is refused outright
+(`NOREPLICAS`) when the master sees no replica, and the operator gets an error rather
+than a note that silently vanishes on failover.
 
-- The audit copy is **plain text on the broker**. Anyone with broker access can read
-  every operator note. It is not a private channel.
-- A note deleted from `q.audit.events` is gone. There is no operator delete for
-  journal entries at all, by design.
-- The note does **not** survive a Valkey restore *in the UI* until replayed from
-  the audit log. There is no replay tooling; the audit copy is what makes writing one
-  possible.
+What follows from this:
 
+- If all three Valkey PVCs are lost, the journal is lost with the records it
+  annotates ([persistence-and-durability.md](persistence-and-durability.md) §4).
+- There is no operator delete for journal entries at all, by design (§2.1).
+- Notes are plain text in Valkey and in every pod's AOF; anyone with Valkey access
+  can read them.
 ---
 
 ## 4. Wire protocol
@@ -280,9 +267,9 @@ kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \
 kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \
   valkey-cli -a "$PW" --no-auth-warning TTL journal:<32-hex>       # > 0
 
-# durability: the audit copy
-kubectl -n fire-watch-lab exec rabbitmq-0 -- rabbitmqctl list_queues name messages | grep audit
-# the entry is in q.audit.events with kind:"journal"
+# durability: the append is in the AOF of every pod (production: valkey-0..2)
+kubectl -n fire-watch-lab exec valkey-0 -c valkey -- \
+  valkey-cli -a "$PW" --no-auth-warning INFO persistence | grep aof_last_write_status   # ok
 ```
 
 Acceptance:
@@ -290,4 +277,4 @@ Acceptance:
 - a second note from a **different** connection appears without a reload (fan-out)
 - the note is **not** duplicated for the operator who wrote it (`shouldFanOut`)
 - an empty note is refused; a 5000-character note is truncated to 1024
-- `/metrics` reports `fw_journal_audit_enabled 1` once audit env vars are set
+- with the master unable to see a replica (production), the append is refused with an error, never silently accepted

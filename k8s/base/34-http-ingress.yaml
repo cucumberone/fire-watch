@@ -1,8 +1,8 @@
-# http-ingress — HTTP from an external nginx into RabbitMQ.
+# http-ingress — HTTP from an external nginx into the Valkey ingest stream.
 #
 # This is a PRODUCER, not a consumer. It is separate from `worker` because the
 # two have opposite failure semantics: the ingress must answer 5xx when it cannot
-# publish, while a worker must never answer anything at all.
+# append, while a worker must never answer anything at all.
 #
 # Exposure: NodePort, because the traffic originates outside the cluster (an
 # external nginx) and OpenShift Routes speak HTTP but route to a Service — a
@@ -63,7 +63,8 @@ spec:
             - { name: FW_EVENT_PATH,     value: /events }
             - { name: FW_MAX_BODY_BYTES, value: "2097152" }
             - { name: FW_MAX_BATCH,      value: "500" }
-            - { name: FW_CHANNELS,       value: "4" }
+            # Bound on WAIT: how long a request waits for replica acknowledgement
+            # before answering 503.
             - { name: FW_CONFIRM_TIMEOUT_MS, value: "10000" }
 
             # Shared secret the external nginx must send as X-Ingest-Token.
@@ -71,18 +72,15 @@ spec:
               valueFrom:
                 secretKeyRef: { name: fire-watch-ingress, key: token }
 
-            # Publish into the same exchange the producers use, so the queue
-            # topology, DLX and audit path are unchanged.
-            - { name: AMQP_EXCHANGE,    value: fx.events }
-            - { name: AMQP_ROUTING_KEY, value: event.ingest }
-            - { name: AMQP_HOST,        value: rabbitmq }
-            - { name: AMQP_PORT,        value: "5672" }
-            - name: AMQP_USER
+            # ---- the ingest stream on the Valkey master (via Sentinel) ----
+            - { name: SENTINELS,          value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }
+            - { name: VALKEY_MASTER_NAME, value: fire-watch-valkey }
+            - name: VALKEY_PASSWORD
               valueFrom:
-                configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }
-            - name: AMQP_PASS
-              valueFrom:
-                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
+                secretKeyRef: { name: fire-watch-valkey, key: password }
+            - { name: FW_STREAM_KEY,      value: "fw:stream:ingest" }
+            # 202 only after this many replicas acknowledged the XADD (WAIT).
+            - { name: FW_WAIT_REPLICAS,   value: "1" }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 384Mi }
@@ -99,8 +97,8 @@ spec:
             failureThreshold: 24
             timeoutSeconds: 10
           readinessProbe:
-            # False while the broker is unreachable: an ingress that cannot
-            # publish must leave the load balancer so nginx fails over instead
+            # False while Valkey is unreachable: an ingress that cannot
+            # append must leave the load balancer so nginx fails over instead
             # of hammering a pod that will only answer 503.
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
@@ -114,7 +112,7 @@ spec:
             timeoutSeconds: 10
           lifecycle:
             preStop:
-              # Let in-flight requests finish their confirm and answer 202.
+              # Let in-flight requests finish their XADD/WAIT and answer.
               exec:
                 command: ["/bin/sh", "-c", "sleep 10"]
       volumes:

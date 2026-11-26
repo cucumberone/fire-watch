@@ -119,7 +119,9 @@ spec:
             - { name: FW_RECONCILE_INTERVAL,    value: "5s" }
             - { name: FW_SENTINEL_PORT,         value: "26379" }
             - { name: FW_VALKEY_PORT,        value: "6379" }
-            - { name: FW_WRITE_GUARD_MIN_REPLICAS, value: "2" }
+            # Must equal Valkey's `min-replicas-to-write` (1): the bridge withholds
+            # the endpoint from a master that sees fewer replicas than this.
+            - { name: FW_WRITE_GUARD_MIN_REPLICAS, value: "1" }
             - { name: FW_WRITABLE_LABEL,        value: fire-watch.io/writable }
             # Sentinel is the component that decides a master is gone. Leave
             # this false unless you want the bridge to also *request* failovers.

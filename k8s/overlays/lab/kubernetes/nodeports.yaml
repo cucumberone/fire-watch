@@ -4,8 +4,8 @@
 # constant and you do not have to look up an assigned port after every apply.
 # 30000-32767 is the default NodePort range on every distribution.
 #
-# These replace the Routes. Nothing else in the deployment changes: RabbitMQ,
-# Valkey and Sentinel stay ClusterIP-only, exactly as in production.
+# These replace the Routes. Nothing else in the deployment changes: Valkey and
+# Sentinel stay ClusterIP-only, exactly as in production.
 apiVersion: v1
 kind: Service
 metadata:

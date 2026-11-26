@@ -1,6 +1,6 @@
-# Workers — 3 replicas, consume, compress, write, audit, publish, ack last.
+# Workers — 3 replicas, XREADGROUP from the ingest stream, compress, fold, XACK+XDEL.
 # Pipeline order is specified in docs/workers.md §3 and must not be reordered:
-#   validate -> compress msgc -> write -> audit (PLAIN) -> publish -> ack
+#   validate -> compress msgc -> history -> fold -> publish -> XACK+XDEL
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -70,21 +70,23 @@ spec:
           ports:
             - { name: http, containerPort: 8080 }
           env:
-            # ---- AMQP ----------------------------------------------------
-            - name: AMQP_HOST
-              value: rabbitmq
-            - name: AMQP_PORT
-              value: "5672"
-            - name: AMQP_USER
+            # ---- the ingest stream ---------------------------------------
+            - { name: FW_STREAM_KEY,        value: "fw:stream:ingest" }
+            - { name: FW_STREAM_GROUP,      value: workers }
+            - { name: FW_STREAM_DLQ_KEY,    value: "fw:stream:dlq" }
+            # Consumer name = pod name: unique and stable for the pod's life.
+            - name: POD_NAME
               valueFrom:
-                configMapKeyRef: { name: fire-watch-rabbitmq-user, key: AMQP_USER }
-            - name: AMQP_PASS
-              valueFrom:
-                secretKeyRef: { name: fire-watch-rabbitmq, key: password }
-            - { name: AMQP_QUEUE,           value: q.event.ingest }
-            - { name: AMQP_AUDIT_EXCHANGE,  value: fx.audit }
-            - { name: AMQP_AUDIT_KEY,       value: event.audit }
-            - { name: AMQP_PREFETCH,        value: "32" }
+                fieldRef: { fieldPath: metadata.name }
+            # Entries per XREADGROUP, processed concurrently.
+            - { name: FW_STREAM_BATCH,      value: "32" }
+            - { name: FW_STREAM_BLOCK_MS,   value: "5000" }
+            # Failed entries stay pending and are retried after this.
+            - { name: FW_RETRY_MS,          value: "5000" }
+            # Entries pending longer than this belong to a dead worker and are
+            # taken over with XAUTOCLAIM (docs/workers.md §6).
+            - { name: FW_CLAIM_IDLE_MS,     value: "60000" }
+            - { name: FW_CLAIM_INTERVAL_MS, value: "30000" }
 
             # ---- Valkey (Sentinel-aware, never a pod IP) ------------------
             - { name: SENTINELS,          value: "sentinel-0.sentinel-headless:26379,sentinel-1.sentinel-headless:26379,sentinel-2.sentinel-headless:26379" }

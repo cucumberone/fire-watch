@@ -157,6 +157,11 @@ spec:
             # sample keys, which would grow its cost with the keyspace; the memory
             # and eviction numbers we need come from INFO, not from per-key reads.
             - { name: REDIS_EXPORTER_CHECK_SINGLE_KEYS, value: "" }
+            # The two streams, by exact name — a fixed, constant-cost read (XINFO),
+            # unlike a key pattern. Exports redis_stream_length{stream} and
+            # redis_stream_group_messages_pending{stream,group}, which back the
+            # backlog and dead-letter alerts in 60-monitoring.yaml.
+            - { name: REDIS_EXPORTER_CHECK_SINGLE_STREAMS, value: "db0=fw:stream:ingest,db0=fw:stream:dlq" }
             - { name: REDIS_EXPORTER_LOG_FORMAT, value: "json" }
           resources:
             requests: { cpu: 10m, memory: 32Mi }

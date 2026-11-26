@@ -25,22 +25,28 @@ export function loadConfig() {
     ingestToken: optional('FW_INGEST_TOKEN', ''),
     // Refuse bodies larger than this. Must be >= the largest valid event.
     maxBodyBytes: int('FW_MAX_BODY_BYTES', 2 * 1024 * 1024),
-    // How long a request may wait for the broker confirm before we 503. The
-    // caller (nginx) must then treat it as retryable.
+    // How long a request may wait for the replicas to acknowledge (WAIT) before
+    // we 503. The caller (nginx) must then treat it as retryable.
     confirmTimeoutMs: int('FW_CONFIRM_TIMEOUT_MS', 10000),
 
-    // ---- downstream: RabbitMQ
-    amqpHost: required('AMQP_HOST'),
-    amqpPort: int('AMQP_PORT', 5672),
-    amqpUser: required('AMQP_USER'),
-    amqpPass: required('AMQP_PASS'),
-    exchange: required('AMQP_EXCHANGE'),
-    routingKey: required('AMQP_ROUTING_KEY'),
-    // Bounded so one request cannot flood the broker.
+    // ---- downstream: the Valkey ingest stream, master found through Sentinel
+    sentinels: required('SENTINELS')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => {
+        const [host, port] = s.split(':');
+        if (!host || !port) throw new Error(`malformed SENTINELS entry: ${s}`);
+        return { host, port: Number(port) };
+      }),
+    masterName: required('VALKEY_MASTER_NAME'),
+    valkeyPassword: required('VALKEY_PASSWORD'),
+    streamKey: optional('FW_STREAM_KEY', 'fw:stream:ingest'),
+    // Replicas that must acknowledge the XADD before we answer 202. 1 in
+    // production (matches min-replicas-to-write); 0 in the single-pod lab.
+    waitReplicas: int('FW_WAIT_REPLICAS', 1),
+    // Bounded so one request cannot flood the stream.
     maxBatch: int('FW_MAX_BATCH', 500),
-    // Channel pool: confirms are per-channel and serialise, so more than one
-    // channel materially raises throughput under concurrency.
-    channels: int('FW_CHANNELS', 4),
 
     logLevel: optional('FW_LOG_LEVEL', 'info'),
   };

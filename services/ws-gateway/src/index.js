@@ -48,7 +48,6 @@ import {
   journalEntryFrame,
   journalListFrame,
 } from './journal.js';
-import { AuditPublisher } from './audit.js';
 import {
   COLUMN_DEFAULTS,
   mergeColumns,
@@ -71,10 +70,6 @@ const POD_NAME = process.env.POD_NAME || 'local';
 
 const reader = new ValkeyReader(cfg, log);
 const recent = new RecentIds(cfg.dedupeLru);
-// Replicates journal entries to the audit exchange, because Dragonfly alone cannot
-// make a note durable. Logged at startup either way, so a deployment without it
-// knows notes are stored-but-not-recoverable rather than assuming they are safe.
-const audit = new AuditPublisher(cfg, log);
 
 let ready = false;
 let connCount = 0;
@@ -119,12 +114,7 @@ const httpServer = http.createServer((req, res) => {
       // read". A pod that is ready while its reads fail serves a stale board, and
       // that used to be invisible to monitoring.
       `# TYPE fw_db_up gauge\nfw_db_up ${dbUp ? 1 : 0}\n` +
-      `# TYPE fw_db_consecutive_failures gauge\nfw_db_consecutive_failures ${dbFails}\n` +
-      // Whether journal notes are being replicated to the audit exchange. A `0`
-      // here means the feature works but its durability promise does not, and that
-      // must be visible to monitoring rather than living only in a startup log
-      // line nobody reads after a deploy (docs/acknowledge.md §11.3).
-      `# TYPE fw_journal_audit_enabled gauge\nfw_journal_audit_enabled ${audit.isEnabled() ? 1 : 0}\n`,
+      `# TYPE fw_db_consecutive_failures gauge\nfw_db_consecutive_failures ${dbFails}\n`,
     );
     return;
   }
@@ -514,16 +504,24 @@ async function handleClose(conn, frame, send) {
   // can see at a glance that a human ended this one rather than the monitoring.
   const closeEvent = operatorCloseEvent(record, verdict.by, nowMs,
     `operator-close-${bareKey}-${nowMs}`);
-  const injected = await audit.publishIngestEvent(closeEvent);
+  let injected = false;
+  try {
+    await reader.enqueueEvent(closeEvent, { waitReplicas: cfg.waitReplicas });
+    injected = true;
+  } catch (err) {
+    log.warn('stream append failed — closing by direct write instead', {
+      id: closeEvent.id, err: String(err),
+    });
+  }
 
   if (!injected) {
     // ---- 2b. Fallback: retire the record directly.
     //
-    // Only reached when the broker is unavailable or the ingest path is not
-    // configured. The UI still has to be able to close an alert during a broker
-    // outage — the alternative is an operator unable to end an incident — so the
-    // direct write stays. It is the OLD path, kept narrow on purpose, and it is
-    // logged so a close that produced no event is never silent.
+    // Only reached when the stream append failed. The UI still has to be able to
+    // close an alert while Valkey refuses stream writes — the alternative is an
+    // operator unable to end an incident — so the direct write stays. It is the
+    // OLD path, kept narrow on purpose, and it is logged so a close that produced
+    // no event is never silent.
     log.warn('closing by direct write: no event could be injected', {
       key: bareKey, by: verdict.by,
     });
@@ -550,7 +548,7 @@ async function handleClose(conn, frame, send) {
 
   // ---- 3. Confirm immediately, then fan out.
   //
-  // The event is durable in the broker at this point but the worker has not folded
+  // The event is durable in the stream at this point but the worker has not folded
   // it yet, so the row would linger for a round trip. The local frame settles the
   // originator now; the worker's own `applied: 3` fan-out arrives moments later and
   // is idempotent (applyAlert deletes a row it already removed).
@@ -588,7 +586,7 @@ async function broadcastClose(bareKey) {
  * Permanently delete one event record.
  *
  * The only DESTRUCTIVE client operation in this service, and the only one that is
- * not recoverable from anything: no AOF, no audit copy for operator deletes.
+ * not recoverable from anything: the AOF replays the DEL, and nothing else keeps a copy.
  * docs/acknowledge.md §8.2 explains why it exists despite the project's "no data
  * loss" rule, and why it is the one place that rule is knowingly bent.
  *
@@ -1014,10 +1012,8 @@ async function handleAllEventsQuery(conn, frame, send) {
  * is a LOG, where the earlier entries are the value. So this uses RPUSH and never a
  * SET, and two operators annotating the same incident both keep their text.
  *
- * The note is stored first and replicated second. If the audit publish fails the
- * operator still gets their entry — an annotation is not worth failing over a
- * broker hiccup — but the failure is logged at `warn` rather than swallowed, because
- * it silently weakens a durability promise the operator may be relying on.
+ * The note is stored in Valkey, which is AOF-persisted on every pod and
+ * replicated; there is no second copy.
  */
 async function handleJournalAppend(conn, frame, send) {
   const verdict = validateJournalAppend(frame);
@@ -1050,9 +1046,6 @@ async function handleJournalAppend(conn, frame, send) {
     }));
     return;
   }
-
-  // Replication is awaited but never fails the request: see audit.js.
-  await audit.publishJournal({ key: verdict.key, entry });
 
   // Echo to the writer, then fan out to everyone else. The echo carries the entry
   // (with the server-assigned id and timestamp) so this client can render it
@@ -1163,7 +1156,7 @@ function handleEventMessage(raw) {
   // Two different situations both carry the same event id and they must not be
   // conflated:
   //
-  //   1. A redelivery — Kafka/Rabbit redelivered the same message, so the worker
+  //   1. A redelivery — the stream redelivered the same entry, so the worker
   //      published the same frame twice. Re-sending it would double-render.
   //   2. A REPEAT — the same event content sent again later. The worker absorbed
   //      it (no new record) and republished it with a FRESH `brokerTs` so the

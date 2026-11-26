@@ -110,7 +110,7 @@ jobs:
             type=raw,value=latest,enable=${{ inputs.push_latest }}
           labels: |
             org.opencontainers.image.title=fire-watch http-ingress
-            org.opencontainers.image.description=fire-watch event server — HTTP to AMQP ingress
+            org.opencontainers.image.description=fire-watch event server — HTTP to Valkey stream ingress
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 

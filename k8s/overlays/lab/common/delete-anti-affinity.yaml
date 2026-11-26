@@ -7,17 +7,6 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: rabbitmq
-spec:
-  template:
-    spec:
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution: []
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
   name: valkey
 spec:
   template:

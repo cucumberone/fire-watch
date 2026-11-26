@@ -12,7 +12,7 @@ import {
   ValidationError,
   compressPayload,
   decompressPayload,
-  brokerTsMs,
+  entryTsMs,
   isGzip,
   isRetirement,
 } from './event.js';
@@ -136,23 +136,16 @@ test('isGzip rejects plain JSON and short buffers', () => {
 });
 
 // ------------------------------------------------------------------- timestamps
-test('brokerTsMs prefers x-original-ts over the broker header', () => {
-  // A republished message must keep the original ordering position
-  // (event-lifecycle.md §6).
-  assert.equal(
-    brokerTsMs({ properties: { headers: { 'x-original-ts': 1500, timestamp_in_ms: 9999 } } }),
-    1500,
-  );
+test('entryTsMs reads the millisecond part of a stream entry ID', () => {
+  assert.equal(entryTsMs('1764079564311-0'), 1764079564311);
+  assert.equal(entryTsMs('1764079564311-17'), 1764079564311);
 });
 
-test('brokerTsMs falls back to timestamp_in_ms, then to seconds', () => {
-  assert.equal(brokerTsMs({ properties: { headers: { timestamp_in_ms: 2000 } } }), 2000);
-  assert.equal(brokerTsMs({ properties: { timestamp: 3 } }), 3000);
-});
-
-test('brokerTsMs returns null when no timestamp exists at all', () => {
-  assert.equal(brokerTsMs({ properties: {} }), null);
-  assert.equal(brokerTsMs({}), null);
+test('entryTsMs returns null for anything that is not an entry ID', () => {
+  assert.equal(entryTsMs(undefined), null);
+  assert.equal(entryTsMs(''), null);
+  assert.equal(entryTsMs('*'), null);
+  assert.equal(entryTsMs('1764079564311'), null);
 });
 
 // ------------------------------------------------------------------ event keys

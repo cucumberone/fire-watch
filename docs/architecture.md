@@ -12,7 +12,7 @@ workers persist them; a WebSocket gateway streams them to a React front end.
 | R1 | No data loss | Every accepted event must survive the loss of any single pod, node, or Valkey role change. See [persistence-and-durability.md](persistence-and-durability.md). |
 | R2 | OpenShift target | Routes (not Ingress), SCC-aware security contexts, no privileged containers. |
 | R3 | 100% H/A, 3 replicas per component, pods on different nodes | StatefulSets/Deployments with **required** pod anti-affinity, PodDisruptionBudgets on every component, readiness gates. Audited in [fault-tolerance.md](fault-tolerance.md). |
-| R4 | Split-brain handling per component | RabbitMQ: quorum queues + `pause_minority`. Valkey: write guard + Service routing + Sentinel quorum. Gateway/workers: stateless. One residual gap documented in [fault-tolerance.md](fault-tolerance.md) §4. |
+| R4 | Split-brain handling per component | Valkey (records **and** the ingest stream): `min-replicas-to-write 1` + `WAIT 1` + write guard + Service routing + Sentinel quorum 2/3. Gateway/workers/ingress: stateless. The residual window that `min-replicas-to-write 1` accepts is documented in [fault-tolerance.md](fault-tolerance.md) §4. |
 | R5 | Valkey manifests only (no Valkey operator) | Raw StatefulSet + Services + ConfigMap + Secret; role management via Redis Sentinel (see [redis-sentinel.md](redis-sentinel.md)). |
 | R6 | WebSocket gateway scales horizontally | Stateless pods behind a Service, HPA on connection count. |
 
@@ -21,8 +21,7 @@ workers persist them; a WebSocket gateway streams them to a React front end.
 | Component | Kind | Replicas | Stateful | Doc |
 |-----------|------|----------|----------|-----|
 | http-ingress | Deployment, NodePort 30900 | 3 | No | [http-ingress.md](http-ingress.md) |
-| RabbitMQ | StatefulSet, quorum queues | 3 | Yes (PVC) | [rabbitmq.md](rabbitmq.md) |
-| Valkey | StatefulSet, 1 master + 2 replicas | 3 | Yes (PVC) | [valkey.md](valkey.md) |
+| Valkey | StatefulSet, 1 master + 2 replicas; holds the records **and** the ingest stream `fw:stream:ingest` | 3 | Yes (PVC, AOF on every pod) | [valkey.md](valkey.md) |
 | Redis Sentinel | StatefulSet | 3 | No | [redis-sentinel.md](redis-sentinel.md) |
 | Workers | Deployment | 3 | No | [workers.md](workers.md) |
 | WebSocket gateway | Deployment + HPA | 3..N | No | [websocket-server.md](websocket-server.md) |
@@ -36,20 +35,17 @@ Namespace: `fire-watch`.
 flowchart LR
   EXT[External producers] -->|HTTP| NGX[external nginx]
   NGX -->|HTTP POST /events| ING[http-ingress x3]
-  ING -->|AMQP + confirms| RMQ[(RabbitMQ<br/>3 nodes<br/>quorum queues)]
-  P[Internal producers] -->|AMQP publish + publisher confirm| RMQ
-  RMQ -->|consume q.event.ingest| W1[worker-0]
-  RMQ -->|consume q.event.ingest| W2[worker-1]
-  RMQ -->|consume q.event.ingest| W3[worker-2]
-  W1 -->|write + publish| DF
+  ING -->|XADD fw:stream:ingest + WAIT 1| DF
+  G1 -->|operator close: XADD + WAIT 1| DF
+  DF -->|XREADGROUP workers| W1[worker-0]
+  DF -->|XREADGROUP workers| W2[worker-1]
+  DF -->|XREADGROUP workers| W3[worker-2]
+  W1 -->|fold write, publish, XACK+XDEL| DF
   W2 --> DF
   W3 --> DF
-  W1 -->|audit copy before ack| AUD[(q.audit.events<br/>WAL)]
-  W2 --> AUD
-  W3 --> AUD
-  AUD -.->|replay after restore| DF
-  DF[(Valkey<br/>master + 2 replicas)]
-  S[(Sentinel x3)] -.->|master discovery| W1
+  DF[(Valkey<br/>master + 2 replicas<br/>records + ingest stream)]
+  S[(Sentinel x3)] -.->|master discovery| ING
+  S -.->|master discovery| W1
   S -.->|master discovery| G1
   DF -->|pub/sub| G1[gateway-0]
   DF -->|pub/sub| G2[gateway-1]
@@ -59,30 +55,29 @@ flowchart LR
   GN -->|WSS| FE
 ```
 
-Three independent paths exist by design:
+Two paths exist by design:
 
-1. **Durability path:** producer → RabbitMQ (quorum, on disk) → worker → Valkey → ack.
-2. **Recovery path:** worker → `q.audit.events` → `replay-gap` Job → Valkey.
-3. **Visualization path:** Valkey pub/sub → gateway → browser.
+1. **Durability path:** producer → nginx → http-ingress → `XADD fw:stream:ingest` + `WAIT 1` → 202 → worker (`XREADGROUP`) → fold write → `XACK`+`XDEL`.
+2. **Visualization path:** Valkey pub/sub → gateway → browser.
 
-The HTTP ingress is a producer, not a consumer: it converts HTTP to AMQP and does not answer 202 until the broker has confirmed. Both producer paths end at the same exchange and routing key, so nothing downstream can tell them apart.
+The HTTP ingress is a producer, not a consumer: it appends the batch to the ingest stream in one `MULTI/EXEC` and does not answer 202 until the master accepted it (`min-replicas-to-write 1` satisfied) and `WAIT` saw a replica acknowledge it. The gateway's operator close appends to the same stream (`src operator`), so nothing downstream can tell the two producer paths apart except by that field.
 
-The gateway never touches RabbitMQ, and the durability path never depends on a browser being connected.
+The stream and the records live in the same Valkey, so there is no second stateful system to make H/A: the stream inherits Valkey's replication, AOF and Sentinel failover. The durability path never depends on a browser being connected.
+
+> **History.** Up to 2026-11 the transport was a 3-node RabbitMQ cluster with quorum queues and an audit queue used as a write-ahead log. RabbitMQ was replaced by a Valkey stream and the audit copies were dropped; see [roadmap.md](roadmap.md) §4.
 
 ## 5. Message contract
 
-Queue and routing keys are fixed so that the producer, worker, and gateway can be developed independently.
+Stream and group names are fixed so that the producers, worker, and gateway can be developed independently.
 
 | Item | Value |
 |------|-------|
-| Exchange | `fx.events` (direct, durable) |
-| Queue | `q.event.ingest` (quorum, durable) |
-| Routing key | `event.ingest` |
-| Dead letter exchange | `fx.events.dlx` (fanout, durable) |
-| Dead letter queue | `q.event.ingest.dlq` (quorum) |
-| Audit exchange | `fx.audit` (direct, durable) |
-| Audit queue (WAL) | `q.audit.events` (quorum, 7-day TTL, `x-overflow: reject-publish`) |
-| Envelope | JSON, see below |
+| Ingest stream | `fw:stream:ingest` (`FW_STREAM_KEY`), never trimmed — its length is the backlog |
+| Consumer group | `workers` (`FW_STREAM_GROUP`), created from ID `0` with `MKSTREAM` |
+| Consumer name | the pod name (`POD_NAME`, downward API) |
+| Dead-letter stream | `fw:stream:dlq` (`FW_STREAM_DLQ_KEY`), never trimmed |
+| Entry fields | `evt` = the JSON envelope below; `src` = `http` \| `operator`; `cid` = the request's `x-request-id` (optional) |
+| Entry ID | `<ms>-<seq>`, assigned by the master at `XADD`; its ms part is the event's `brokerTs` |
 
 ```json
 {
@@ -104,20 +99,21 @@ Rules:
 - `severity` ∈ `FATAL | CRITICAL | WARNING | HARMLESS | CLOSE`. `HARMLESS` and `CLOSE` retire open alerts instead of opening one. Full semantics in [event-lifecycle.md](event-lifecycle.md).
 - `payload.msg` is the **short** text; `payload.msgc` is the **complete** string (stack trace, device report). `msgc` is the field that drives memory cost and the one that gets compressed ([payload-and-compression.md](payload-and-compression.md)).
 - `ts` is **producer-clock time**, used for display and producer correlation only — never for ordering inside the cluster.
-- **Ordering uses the RabbitMQ-assigned arrival timestamp** (`headers.timestamp_in_ms`, set by `message_interceptors.incoming.set_header_timestamp.overwrite = true`). Producer clocks are not trusted for ordering. See [event-lifecycle.md](event-lifecycle.md) §2–3.
-- Workers reject (and DLQ) messages that fail schema validation, with `x-error` header set.
-- Every accepted event is also copied to `q.audit.events` before the worker acks, so Valkey can be rebuilt without AOF ([persistence-and-durability.md](persistence-and-durability.md) §4).
+- **Ordering uses the arrival timestamp from the stream entry ID** (`<ms>-<seq>`, assigned by the master at `XADD`, monotonic). It is stored as `brokerTs`. Producer clocks are not trusted for ordering. See [event-lifecycle.md](event-lifecycle.md) §2–3.
+- Workers move entries that can never succeed (unparseable `evt`, invalid envelope, malformed ID) to `fw:stream:dlq` with `origId` and `reason` fields, in the same `MULTI` that removes them from the ingest stream.
 
 ## 6. Valkey storage layout
 
 | Key / channel | Type | Purpose | TTL |
 |---|---|---|---|
 | `event:<32 hex>` | hash | ONE record per CONDITION: payload fields, `state`, `severity`, `count`, `firstSeen`, `lastSeen`, `lastId`, ack and closure fields, `watermark` | `FW_EVENT_TTL` = 604800 s (7 days, see [sizing.md](sizing.md) §1) |
-| `idx:event:all` | sorted set, score = **broker ts** ms, member = bare key | Global timeline. Backs All events, which cannot be answered from `idx:source:*` without a SCAN | pruned by the worker ([workers.md](workers.md) §4) |
+| `idx:event:all` | sorted set, score = **arrival ts** (`brokerTs`) ms, member = bare key | Global timeline. Backs All events, which cannot be answered from `idx:source:*` without a SCAN | pruned by the worker ([workers.md](workers.md) §4) |
 | `idx:event:open` | sorted set, score = last activity ms | The open set, so a client can be given a snapshot without `SCAN event:*` ([websocket-server.md](websocket-server.md) §3.1) | members removed by the fold on retirement |
 | `idx:event:closed` | sorted set, score = `closedAt` ms | The retired set, written by the same fold call that removes the key from the open index, so a key is in at most one of the two | 7d, via the worker's index prune |
-| `idx:source:{device}` | sorted set, score = **broker ts** ms, member = bare key | Per-device timeline for the filtered tail | pruned to the same 7-day window |
+| `idx:source:{device}` | sorted set, score = **arrival ts** (`brokerTs`) ms, member = bare key | Per-device timeline for the filtered tail | pruned to the same 7-day window |
 | `journal:<32 hex>` | list | Operator notes, append-only | 7d, refreshed on append |
+| `fw:stream:ingest` | stream + group `workers` | Ingest queue: entries in flight between XADD and the worker's XACK+XDEL | none; entries are deleted after the fold write, never trimmed |
+| `fw:stream:dlq` | stream | Entries that can never succeed | none; operator inspects and deletes |
 | `fw:ch:events` | pub/sub channel | Live event fan-out to gateways | n/a |
 | `fw:ch:alerts` | pub/sub channel | Live **state** fan-out (occurrence, close, ack, journal, delete) | n/a |
 
@@ -216,7 +212,7 @@ At 500 sources B costs 84 000 keys — fine for Valkey, but it makes every backf
 
 #### C. Or drop the index entirely
 
-If the UI only ever shows a live feed plus "last N minutes", the gateway can backfill from the audit queue instead and the payload keys can be written with no index at all. That saves the 150 B/event (~7% at 2 KiB) and removes §6.2 completely — but every historical query becomes a RabbitMQ replay, which is a different latency class. Not recommended while `since`-based backfill is a product requirement.
+If the UI only ever showed a live feed, the payload keys could be written with no index at all. That saves the 150 B/event (~7% at 2 KiB) and removes §6.2 completely — but every historical query would become a `SCAN`. Not acceptable while `since`-based backfill is a product requirement.
 
 #### How to verify it is working
 
@@ -230,27 +226,29 @@ ZRANGE idx:source:sensor-a 0 0 WITHSCORES
 
 ## 7. Failure matrix
 
-| Failure | RabbitMQ | Valkey | Gateway | Result |
+| Failure | Ingest stream | Valkey | Gateway | Result |
 |---|---|---|---|---|
-| 1 worker pod lost | Unacked message redelivered | Unaffected | Unaffected | No loss, delayed processing |
+| 1 worker pod lost | Its pending entries are taken over by another worker with `XAUTOCLAIM` after 60 s idle | Unaffected | Unaffected | No loss, delayed processing |
+| 1 ingress pod lost | In-flight request gets no 202; nginx retries on another pod | Unaffected | Unaffected | No loss |
 | 1 gateway pod lost | n/a | Unaffected | Client reconnects to another pod | Client-side reconnect required |
-| 1 Valkey replica lost | Unaffected | Master keeps writing; `connected_slaves` drops to 1 | Reads/writes continue | Degraded redundancy; alert at 1 |
-| Valkey master lost | Unaffected | Sentinel promotes a replica (quorum 2/3) | Clients re-resolve master via Sentinel | Seconds of write stalls, no loss |
-| 1 node lost (1 pod of each component) | Cluster stays quorate (2/3) | 1 replica gone, master still has 2 peers unless it was the master | Pod rescheduled onto a surviving node | Survives, degraded until reschedule |
-| Network partition, Valkey master isolated | Unaffected | Master sees 0 replicas → write guard pulls it out of the Service; Sentinel promotes majority-side replica | Clients follow the new master | Split brain prevented, see [redis-sentinel.md](redis-sentinel.md) §6 |
-| Full cluster power loss | Quorum queues recover from journal | The AOF loads (snapshot base + <= 32 MB tail); anything older is replayed from `q.audit.events` | Reconnect | RPO 0 for accepted events, see [persistence-and-durability.md](persistence-and-durability.md) |
-| Valkey PVC wiped on all 3 pods | Unaffected | Empty on start; `replay-gap` Job refills the **full 7 days** from `q.audit.events` | Clients see a temporary gap | RPO 0 — the WAL and the retention window now match |
+| 1 Valkey replica lost | XADD keeps succeeding (`min-replicas-to-write 1`, `WAIT 1` met by the other replica) | Master keeps writing; `connected_slaves` drops to 1 | Reads/writes continue | Degraded redundancy; `ValkeyReplicaDown` warning |
+| Valkey master lost | Replicated entries survive on the promoted replica; ingress answers 503 until the new master is resolved | Sentinel promotes a replica (quorum 2/3) | Clients re-resolve master via Sentinel | Seconds of 503s / write stalls, nginx retries, no loss of 202'd events |
+| 1 node lost (1 pod of each component) | As above for the pods that were on it | 1 Valkey pod gone; writes continue with the 2 left | Pod rescheduled onto a surviving node | Survives, degraded until reschedule |
+| Network partition, Valkey master isolated | XADD refused with `NOREPLICAS` → ingress 503 → nginx buffers | Master sees 0 replicas → refuses writes, write guard pulls it out of the Service; Sentinel promotes a majority-side replica | Clients follow the new master | Split brain prevented, see [redis-sentinel.md](redis-sentinel.md) §6 |
+| Partition leaving old master with 1 replica while the majority sentinels promote the third pod | Writes to the old master are still accepted until clients re-resolve / the bridge withdraws its endpoint | Old master's writes discarded when it is demoted | Clients follow the new master | The accepted residual window of `min-replicas-to-write 1`, bounded by `WAIT 1` + bridge + nginx retry; see [fault-tolerance.md](fault-tolerance.md) §4 |
+| Full cluster power loss | Stream entries are in the AOF like any other key | Each pod loads its own AOF (RDB base + <= 32 MB tail, `everysec`) | Reconnect | Every 202'd event was on 2 pods; see [persistence-and-durability.md](persistence-and-durability.md) §3 |
+| Valkey PVC wiped on all 3 pods | Lost | Lost | Clients see empty tables | Data loss — no copy outside Valkey exists since the audit queue was dropped; restore from a volume backup |
 
 ## 8. Cross-cutting rules
 
 - **One writer per key path.** Only the Valkey master is written to; replicas are read-only and reject writes (`READONLY`).
-- **Ack last.** Workers acknowledge an AMQP message only after (a) Valkey confirms the write, (b) the audit copy is confirmed, and (c) the write guard is not tripped.
+- **Ack last.** Workers `XACK`+`XDEL` a stream entry (one `MULTI`) only after Valkey confirmed the `hist:` fork and the fold write. Producers get 202 only after `XADD` succeeded and `WAIT 1` returned.
 - **No in-pod state.** Gateway and workers hold no authoritative state; anything they cache is reconstructible from Valkey.
 - **Everything pinned.** Image digests, chart versions, and config are pinned in git. No `:latest` in any manifest.
 
 ## 9. Open decisions
 
-Tracked in [roadmap.md](roadmap.md) §3. The two that block implementation:
+Tracked in [roadmap.md](roadmap.md) §3. Settled:
 
-1. **Valkey durability.** Valkey has no AOF implementation. R1 therefore depends on RabbitMQ acting as the write-ahead log. This must be accepted explicitly before manifests are written.
-2. **Valkey role management.** Sentinel plus a small in-cluster bridge controller that applies roles and maintains the Service endpoint. Sentinel is the plan of record.
+1. **Valkey durability.** AOF (`appendonly yes`, `appendfsync everysec`) on every pod, replication, `min-replicas-to-write 1`, and writers that `WAIT 1` before acknowledging. There is no copy of the data outside Valkey.
+2. **Valkey role management.** Sentinel plus a small in-cluster bridge controller that applies roles and maintains the Service endpoint.

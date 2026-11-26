@@ -82,38 +82,21 @@ export function loadConfig() {
     // lose notes about incidents still on the board.
     journalTtlMs: int('FW_JOURNAL_TTL', 604800) * 1000,
 
-    // Publishing each entry to the audit exchange is what makes a note survive a
-    // Dragonfly loss. Without it the note lives only in Dragonfly, so a snapshot
-    // restore takes it with it — unlike events, which are recoverable from
-    // q.audit.events. Optional so the gateway still starts in a dev harness that has
-    // no broker; when unset, notes are stored but not replicated and the gateway
-    // logs that once at startup rather than pretending they are durable.
+    // The INGEST stream, used only by an operator close.
     //
-    // Assembled from parts rather than a single URL, matching the worker: the
-    // RabbitMQ secret carries a password and the user lives in a ConfigMap, so there
-    // is no one connection string to reference.
-    amqpHost: optional('AMQP_HOST', ''),
-    amqpPort: int('AMQP_PORT', 5672),
-    amqpUser: optional('AMQP_USER', ''),
-    amqpPass: optional('AMQP_PASS', ''),
-    amqpAuditExchange: optional('AMQP_AUDIT_EXCHANGE', ''),
-    amqpAuditKey: optional('AMQP_AUDIT_KEY', ''),
-
-    // The INGEST path, used only by an operator close.
-    //
-    // A manual close injects a real event into the same exchange the producers
-    // use, rather than writing the hash directly. That way it is processed by the
+    // A manual close appends a real event to the same stream http-ingress writes,
+    // rather than writing the hash directly. That way it is processed by the
     // ordinary worker pipeline — validated, compressed, folded, forked into the
     // audit trail — and correlates onto the SAME condition key as the alert it
     // closes. Writing the hash from the gateway would create a second code path
     // that can drift from the fold, which is how a "closed" row ends up looking
     // different depending on who closed it (docs/event-lifecycle.md §11).
     //
-    // Optional, like the audit pair: without a broker the close still retires the
-    // record (the direct write remains the fallback), it just does not produce an
-    // event.
-    amqpExchange: optional('AMQP_EXCHANGE', ''),
-    amqpRoutingKey: optional('AMQP_ROUTING_KEY', ''),
+    // If the append fails the close still retires the record by the direct-write
+    // fallback; it just does not produce an event.
+    streamKey: optional('FW_STREAM_KEY', 'fw:stream:ingest'),
+    // Replicas that must acknowledge the XADD (WAIT). 1 in production, 0 in the lab.
+    waitReplicas: int('FW_WAIT_REPLICAS', 1),
 
     // Retention for the per-delivery audit trail. MUST match the worker's
     // `FW_HISTORY_TTL`, or the two writers would age out of the same index at

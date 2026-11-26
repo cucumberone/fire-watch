@@ -1,3 +1,5 @@
+import { hostname } from 'node:os';
+
 function required(name) {
   const v = process.env[name];
   if (!v || v.trim() === '') throw new Error(`missing required environment variable ${name}`);
@@ -16,15 +18,25 @@ function int(name, fallback) {
 
 export function loadConfig() {
   return {
-    // ---- AMQP
-    amqpHost: required('AMQP_HOST'),
-    amqpPort: int('AMQP_PORT', 5672),
-    amqpUser: required('AMQP_USER'),
-    amqpPass: required('AMQP_PASS'),
-    amqpQueue: required('AMQP_QUEUE'),
-    amqpAuditExchange: required('AMQP_AUDIT_EXCHANGE'),
-    amqpAuditKey: required('AMQP_AUDIT_KEY'),
-    prefetch: int('AMQP_PREFETCH', 32),
+    // ---- the ingest stream (written by http-ingress and the gateway's operator close)
+    streamKey: optional('FW_STREAM_KEY', 'fw:stream:ingest'),
+    streamGroup: optional('FW_STREAM_GROUP', 'workers'),
+    // Entries that can never succeed (not JSON, invalid envelope). Never trimmed.
+    streamDlqKey: optional('FW_STREAM_DLQ_KEY', 'fw:stream:dlq'),
+    // Unique per pod. The pod name (hostname in k8s) is stable for the pod's life,
+    // which is what XREADGROUP needs to find its own pending entries again.
+    consumerName: optional('POD_NAME', hostname()),
+    // Entries per XREADGROUP; they are processed concurrently.
+    streamBatch: int('FW_STREAM_BATCH', 32),
+    streamBlockMs: int('FW_STREAM_BLOCK_MS', 5000),
+    // How soon a failed entry is retried from this consumer's pending list.
+    retryMs: int('FW_RETRY_MS', 5000),
+    // An entry pending this long belongs to a dead (or wedged) consumer and is
+    // claimed. Must be far above the time one entry takes to process.
+    claimIdleMs: int('FW_CLAIM_IDLE_MS', 60000),
+    claimIntervalMs: int('FW_CLAIM_INTERVAL_MS', 30000),
+    // Consumers with nothing pending and idle this long are removed from the group.
+    consumerGcIdleMs: int('FW_CONSUMER_GC_IDLE_MS', 3600000),
 
     // ---- Valkey, discovered through Sentinel. Never a pod IP.
     sentinels: required('SENTINELS')

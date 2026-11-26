@@ -9,7 +9,7 @@ Two plain-text payload fields, what each means, and whether they can be compress
 | `msg` | the short / current message text — a summary, a single line | ~64–256 B | changes on every occurrence |
 | `msgc` | the **c**omplete string — the full body, e.g. a stack trace, a multi-line log excerpt, a device-reported detail block | ~1–8 KiB, sometimes much more | usually the same for every occurrence of a condition |
 
-> **Naming:** these are wire names. The web UI labels them **Summary** and **MsgCompleteString**; the rename happens once at the frontend boundary and does not affect the wire, Valkey keys or the audit WAL ([frontend.md](frontend.md) §4.1).
+> **Naming:** these are wire names. The web UI labels them **Summary** and **MsgCompleteString**; the rename happens once at the frontend boundary and does not affect the wire, Valkey keys or the ingest stream ([frontend.md](frontend.md) §4.1).
 
 `msgc` is the long one. At 2 048 B minimum event size that is already the baseline, and it is the field that dominates memory, network and browser rendering cost.
 
@@ -48,7 +48,7 @@ So compressing `msgc` is a **~3x reduction in RAM, PV and snapshot size**, and i
 | Risk | Verdict |
 |---|---|
 | Loss of exact bytes | **No** — gzip is lossless. The original string is recovered byte-for-byte. |
-| Data loss if Valkey is rebuilt | **No** — the audit queue stores the *original* message, so the replay path does not depend on the compression scheme (§4). |
+| Data loss through the codec | **No** — the ingest stream holds the *original* plain envelope until the record is written, and the stored form is self-describing (§4), so no reader depends on a codec version. |
 | Decompression failure in the browser | Handled explicitly — a corrupt/unknown blob must degrade to a visible marker, never to a blank alert (§5). |
 | Searchability | **Yes, genuinely lost** — see §6. This is the real trade-off. |
 
@@ -56,8 +56,8 @@ So compressing `msgc` is a **~3x reduction in RAM, PV and snapshot size**, and i
 
 ```mermaid
 flowchart LR
-  P[Producer] -->|plain msg + msgc| RMQ[(RabbitMQ<br/>ingest + audit)]
-  RMQ --> W[worker]
+  P[http-ingress] -->|plain msg + msgc| ST[(fw:stream:ingest<br/>plain evt)]
+  ST --> W[worker]
   W -->|gzip msgc above threshold| DF[(Valkey<br/>stored value)]
   DF --> G[gateway]
   G -->|pass through unchanged| FE[browser]
@@ -67,24 +67,25 @@ flowchart LR
 | Layer | Responsibility |
 |---|---|
 | Producer | sends **plain** text. Never compresses. |
-| RabbitMQ | stores **plain** — the queue is the WAL and must be readable/replayable without app code ([persistence-and-durability.md](persistence-and-durability.md) §4). |
-| Worker | compresses on write when the field exceeds `FW_COMPRESS_MIN`; **never modifies the audit copy** |
+| Ingest stream | stores the **plain** envelope in the `evt` field — readable with `XRANGE` and in the DLQ without app code |
+| Worker | compresses on write when the field exceeds `FW_COMPRESS_MIN`; **never modifies the stream entry** (it is deleted after the write) |
 | Valkey | stores the compressed bytes as the value |
 | Gateway | does **not** decompress — it has no write access and no reason to pay the CPU; it forwards bytes |
 | Browser | decompresses with the native `DecompressionStream` API |
 
-Compressing at the worker is the right place: it is the only component that already touches every byte on the write path, and doing it there keeps the audit/WAL copy plain (§3.1).
+Compressing at the worker is the right place: it is the only component that already touches every byte on the write path, and doing it there keeps the stream entry plain (§3.1).
 
-### 3.1 The audit copy stays uncompressed — deliberately
+### 3.1 The stream entry stays uncompressed — deliberately
 
-The audit queue is the recovery source of truth. If it stored compressed blobs:
+The ingest stream and the dead-letter stream hold what the producer sent. Keeping them plain means:
 
-- a replay would depend on the compression format being stable across releases;
-- an operator inspecting the queue with `rabbitmqadmin get` would see binary junk;
-- a future component (export, SIEM feed) would need the same codec.
+- an operator inspecting a backlog or `fw:stream:dlq` with `XRANGE` reads JSON, not binary;
+- a dead-lettered entry can be diagnosed — and, after a fix, re-injected — without the worker's codec;
+- the ingress needs no codec at all.
 
-Storage cost of keeping it plain: ≈19.3 GiB for 7 days ([sizing.md](sizing.md) §3.6). Compression would save maybe 13 GiB of that. Not worth coupling the WAL to an application codec.
+The cost is small because the stream holds only in-flight entries: an entry is deleted as soon as it is folded, so the plain bytes exist for milliseconds in steady state, longer only during a backlog ([sizing.md](sizing.md) §3.6).
 
+There used to be an uncompressed audit copy of every event as well (the message-broker WAL); it was dropped ([persistence-and-durability.md](persistence-and-durability.md) §3.1).
 ## 4. On-disk format
 
 The value must be self-describing, because a rolling upgrade can mix compressed and plain rows in the same keyspace.
@@ -115,7 +116,7 @@ Why magic bytes and not a metadata field:
   hashtable overhead, [architecture.md](architecture.md) §6.1);
 - it is the same rule every gzip reader on earth uses, so the browser needs no custom framing.
 
-The JSON envelope itself (`id`, `source`, `type`, `severity`, broker ts) is **never** compressed — only the `msg`/`msgc` strings inside `payload`. Keeping the envelope plain means the gateway can filter and the index can be built without decompressing anything.
+The JSON envelope itself (`id`, `source`, `type`, `severity`, `brokerTs`) is **never** compressed — only the `msg`/`msgc` strings inside `payload`. Keeping the envelope plain means the gateway can filter and the index can be built without decompressing anything.
 
 ### 4.1 Per-field or whole-payload?
 
@@ -186,9 +187,9 @@ This is the only genuine loss and it must be stated plainly:
 | Search for a string across events | `SCAN` + substring test | impossible without decompressing every value |
 | Ad-hoc ops debugging | easy | needs a helper script |
 | UI render | direct | decompress (transparent) |
-| Replay correctness | exact | exact |
+| Re-fold correctness | exact | exact |
 
-Mitigation: the **audit queue stays plain** (§3.1), so any search across history is a RabbitMQ consume + grep, not a Valkey scan. A helper `fw-inspect` script (decompress one id or a range) covers the ops case. No search feature is lost that the design actually promised — Valkey was never a search engine here.
+Mitigation: a helper `fw-inspect` script (decompress one id or a range) covers the ops case. No search feature is lost that the design actually promised — Valkey was never a search engine here.
 
 If substring search over the payload is a requirement, it must be raised as a separate feature (an inverted index, or an external search store). Compressing `msgc` does not remove a capability the architecture had; it removes one that would have worked by accident on small data.
 
@@ -232,8 +233,8 @@ kubectl -n fire-watch exec valkey-0 -- sh -c \
   'valkey-cli -p 6379 --raw HGET event:<key> payload' \
   | jq -r '.msgc.__gz' | base64 -d | gunzip | head -3
 
-# 3. the audit copy is still plain
-kubectl -n fire-watch exec rabbitmq-0 -- rabbitmqadmin get queue=q.audit.events count=1 \
+# 3. the stream entry is still plain (only visible while a backlog or DLQ entry exists)
+kubectl -n fire-watch exec valkey-0 -- valkey-cli -p 6379 --raw XRANGE fw:stream:dlq - + COUNT 1 \
   | grep -A2 msgc
 
 # 4. threshold behaves: a short msg stays plain, a long msgc is compressed

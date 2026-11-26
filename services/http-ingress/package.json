@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Accepts HTTP from an external nginx, publishes to RabbitMQ as AMQP 0-9-1 with publisher confirms",
+  "description": "Accepts HTTP from an external nginx, appends to a Valkey stream and waits for replica acknowledgement",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -13,6 +13,6 @@
     "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
-    "amqplib": "^0.10.5"
+    "ioredis": "^5.11.1"
   }
 }

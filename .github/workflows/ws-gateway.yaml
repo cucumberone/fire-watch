@@ -1,24 +1,53 @@
 name: ws-gateway image
 
-# Builds and pushes ONLY the worker image.
+# Builds and pushes ONLY the ws-gateway image.
 #
 #   ghcr.io/cucumberone/fire-watch/ws-gateway:<tag>
 #
-# MANUAL ONLY — `workflow_dispatch`, no push and no pull_request trigger.
-# Nothing publishes as a side effect of a merge; an image moves only when a
-# human asks for it. One workflow per service, so a build here never touches
-# another service's image.
+# TWO TRIGGERS, ONE JOB.
 #
-# Tags are derived from the dispatch, because there is no push/PR ref to name
-# the build after:
+#   1. `push` to main, when anything this build can OBSERVE changed — the service,
+#      its tests' inputs, or its own workflow file. The path filter is the point: a
+#      docs-only commit, a change to another service or a k8s change must not
+#      rebuild and publish this image, because every publish is a new `latest` and
+#      a pod that may restart.
+#   2. `workflow_dispatch`, for a rebuild with no code change at all — a base image
+#      CVE, a dependency bump that landed elsewhere, or re-tagging a commit.
+#
+# The image workflow is NOT the deploy workflow. Publishing here moves a tag in
+# GHCR; nothing talks to a cluster. `deploy.yaml` stays manual for exactly that
+# reason (docs/images.md §9.3), so a merge can never re-apply a cluster by itself.
+#
+# WHAT THE PATH FILTER MUST INCLUDE. Anything the build or its TESTS read, not
+# just this directory:
+#
+#   services/ws-gateway/**              the service
+#   .github/workflows/ws-gateway.yaml   this file — a trigger edit must be testable
+#   schemas/**                          NOT in the image, but its TESTS read it
+#
+# This Dockerfile copies only `services/ws-gateway`, so the image does not contain
+# the schema file. The TEST SUITE does: `columns.test.js` and `ingestSchema.test.js`
+# read `schemas/event-ingest.schema.json` to assert this service's key list and its
+# validator still match the published contract. A schema-only commit has to run
+# those assertions — a key added to the contract without the corresponding code
+# change must fail here, not in production. The build context stays
+# `services/ws-gateway`; only the trigger is wider.
+#
+# Tags:
 #   `sha-<short>`             always — the commit the image was built from
-#   `manual-<yyyyMMdd-HHmmss>` always — distinguishes two runs of the same commit
-#   `latest`                  opt-in via the input
+#   `manual-<yyyyMMdd-HHmmss>` on a manual run — distinguishes two runs of one commit
+#   `latest`                  always on push; opt-in on dispatch (see below)
 #
 # No `pull_request_target` exists here at all, so a PR can never reach the
 # registry credential.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/ws-gateway/**'
+      - '.github/workflows/ws-gateway.yaml'
+      - 'schemas/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -33,16 +62,20 @@ on:
       push_latest:
         description: Also tag this build `latest`
         type: boolean
-        # Opt-in rather than automatic. "latest" is a claim that this is the
-        # current good build, and a manual run is not automatically that. The
-        # sha and timestamp tags are always produced, so every run stays
-        # addressable either way.
+        # Opt-in rather than automatic for a dispatch. "latest" is a claim that
+        # this is the current good build, and a hand-started run is not
+        # automatically that. A PUSH run moves `latest` without asking, because a
+        # merge to main is exactly that claim — see docs/images.md §1.1.
         default: true
 
 # Scoped per service, not per ref. A shared group would make the worker build
-# cancel the frontend build.
+# cancel the frontend build — and it is NOT keyed by ref either, because a push
+# run (refs/heads/main) and a dispatch run (refs/heads/main too) of the same
+# service must not publish two different images at once. The newer one wins, and
+# `latest` follows it; the alternative is two pushes racing and the older commit
+# ending up as `latest`.
 concurrency:
-  group: image-ws-gateway-${{ github.ref }}
+  group: image-ws-gateway
   cancel-in-progress: true
 
 permissions:
@@ -65,7 +98,12 @@ jobs:
     # Binds the run to the chosen Environment, which is what makes `vars.*`
     # resolve against it instead of the repository defaults. If the environment
     # does not exist, GitHub creates it with no protection — create it first.
-    environment: ${{ inputs.environment }}
+    # A PUSH run has no input, so it falls back to `lab`. That is deliberate and
+    # it changes NOTHING about the image: the path is hard-coded and the two
+    # environments publish to the same GHCR package. The binding exists only so a
+    # human dispatch can target an environment's variables, and an image build
+    # reads none of them.
+    environment: ${{ inputs.environment || 'lab' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -101,13 +139,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # No type=ref,event=pr / event=branch / type=semver: those only fire on
-          # push and pull_request events, which this workflow no longer has.
-          # Leaving them in would be dead configuration that reads as working.
           tags: |
+            # The commit, always, for both triggers.
             type=sha,prefix=sha-,format=short
-            type=raw,value=manual-{{date 'yyyyMMdd-HHmmss'}}
-            type=raw,value=latest,enable=${{ inputs.push_latest }}
+            # Dispatch only: two runs of one commit need telling apart, and a
+            # push run is already uniquely identified by its commit.
+            type=raw,value=manual-{{date 'yyyyMMdd-HHmmss'}},enable=${{ github.event_name == 'workflow_dispatch' }}
+            # `latest` moves on a PUSH to main (that is what a merge means) and
+            # only on request for a dispatch. On a push the input does not exist,
+            # so `inputs.push_latest` is empty and falsy — the explicit
+            # event_name test is what keeps a merge from silently publishing
+            # without `latest`.
+            type=raw,value=latest,enable=${{ github.event_name == 'push' || inputs.push_latest }}
           labels: |
             org.opencontainers.image.title=fire-watch ws-gateway
             org.opencontainers.image.description=fire-watch event server — WebSocket gateway
@@ -132,8 +175,8 @@ jobs:
           sbom: true
           pull: true
 
-      # A manual run has no PR page to look at, so the tag just produced is the
-      # only record of what to deploy. Put it where a human will see it.
+      # The image has no PR page to look at, so the tag just produced is the only
+      # record of what to deploy. Put it where a human will see it.
       - name: Summary
         run: |
           {
@@ -141,9 +184,9 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Environment | \`${{ inputs.environment || 'lab (default on push)' }}\` |"
             echo "| Image | \`${{ env.IMAGE }}\` |"
-            echo "| Tags | \`${{ steps.meta.outputs.version }}\` |"
+            echo "| Tags | \`${{ steps.meta.outputs.tags }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
-            echo "| latest moved | \`${{ inputs.push_latest }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

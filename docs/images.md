@@ -4,52 +4,89 @@ How the five service images are built and published, and how the manifests consu
 
 ## 1. What CI does
 
-**Every workflow is manual — `workflow_dispatch` only.** No `push`, no
-`pull_request`. Nothing publishes as a side effect of a merge; an image moves only
-when a human asks for it.
+**The five image workflows run on a `push` to `main`, filtered by path.** A commit
+that touches `services/worker/**` rebuilds and publishes the worker image; a
+commit that touches only `docs/` or `k8s/` publishes nothing. Each also keeps
+`workflow_dispatch`, for a rebuild with no code change at all (a base-image CVE, a
+re-tag) and for choosing an environment explicitly.
 
-| Workflow | Builds | Trigger |
-|---|---|---|
-| `worker.yaml` | `worker` | manual |
-| `ws-gateway.yaml` | `ws-gateway` | manual |
-| `frontend.yaml` | `frontend` | manual |
-| `http-ingress.yaml` | `http-ingress` | manual |
-| `sentinel-bridge.yaml` | `sentinel-bridge` | manual |
-| `deploy.yaml` | — | manual |
+**`deploy.yaml` stays manual.** Publishing an image and mutating a cluster are
+different decisions, and a merge is the wrong trigger for the second one — see
+§9.3.
 
-Every one of them takes an **`environment` input** (`lab` or `prod`) and binds the
-job to it with `environment: ${{ inputs.environment }}`. That is what makes
-`vars.*` and `secrets.*` resolve against the chosen Environment instead of the
-repository defaults — one workflow, either target, no branching (§1.2).
+| Workflow | Builds | Trigger | Path filter |
+|---|---|---|---|
+| `worker.yaml` | `worker` | push + dispatch | `services/worker/**` |
+| `ws-gateway.yaml` | `ws-gateway` | push + dispatch | `services/ws-gateway/**`, **`schemas/**`** |
+| `frontend.yaml` | `frontend` | push + dispatch | `services/frontend/**`, **`schemas/**`** |
+| `http-ingress.yaml` | `http-ingress` | push + dispatch | `services/http-ingress/**`, **`schemas/**`** |
+| `sentinel-bridge.yaml` | `sentinel-bridge` | push + dispatch | `services/sentinel-bridge/**` |
+| `deploy.yaml` | — | dispatch only | — |
+
+Every filter also lists its own workflow file, so editing a trigger is testable in
+the same PR that changes it.
+
+**The filter must cover everything the build OR its tests read.** That is why
+`schemas/**` appears in three filters although only one image contains it:
+
+| Workflow | Reads `schemas/` how |
+|---|---|
+| `http-ingress` | `COPY schemas /schemas` — the image needs it, and the service refuses to start without it |
+| `ws-gateway` | only in tests: `columns.test.js` and `ingestSchema.test.js` assert this service's key list and validator match the contract |
+| `frontend` | only in tests: `lib.test.js` asserts the client's key list and fallback document match the contract |
+
+A schema-only commit therefore runs three workflows. That is deliberate: those two
+test suites are the guards that fail when a key is added to the contract without
+the corresponding code change, so skipping them for a schema commit would disable
+exactly the check the commit needs. `worker` and `sentinel-bridge` do not list it,
+because neither their image nor their tests can observe it.
+
+Every workflow takes an **`environment` input** (`lab` or `prod`) and binds the
+job to it with `environment: ${{ inputs.environment || 'lab' }}`. That is what
+makes `vars.*` and `secrets.*` resolve against the chosen Environment instead of
+the repository defaults — one workflow, either target, no branching (§1.2). The
+`|| 'lab'` is only there because a push run has no inputs; it changes nothing about
+the image (§1.3).
 
 ```mermaid
 flowchart LR
-  H[human clicks Run workflow] --> W[<service>.yaml]
+  A[push to main<br/>touching this service] --> W[&lt;service&gt;.yaml]
+  H[human clicks Run workflow] --> W
   W --> T[test]
   T -->|pass| P[push ghcr.io/.../&lt;service&gt;]
   T -->|fail| X[nothing published]
-  P --> S[Summary: the tag to deploy]
+  P --> S[Summary: the tags to deploy]
 ```
 
 One workflow per service so a build touches exactly one image. Test and build are
 steps in the **same job** — with one service per workflow there is nothing to gate
 across services, and a `needs:` would just add a second runner start-up. The test
-step still runs before the build step, so a failing test still blocks the push.
+step still runs before the build step, so a failing test still blocks the push. A
+path-filtered workflow that no commit matches simply does not run; a workflow that
+runs and fails stops before publishing.
 
 ### 1.1 Tags
 
-Manual dispatch has no branch, PR or tag ref, so the tags cannot come from the
-event:
+| Tag | push | dispatch | Purpose |
+|---|---|---|---|
+| `sha-<short>` | yes | yes | the commit the image was built from |
+| `manual-<yyyyMMdd-HHmmss>` | no | yes | distinguishes two runs of the same commit |
+| `latest` | **yes** | **opt-in** (`push_latest`, default `true`) | the "current good build" claim |
 
-| Tag | Always? | Purpose |
-|---|---|---|
-| `sha-<short>` | yes | the commit the image was built from |
-| `manual-<yyyyMMdd-HHmmss>` | yes | distinguishes two runs of the same commit |
-| `latest` | **opt-in** (`push_latest` input, default `true`) | the "current good build" claim |
+`latest` is automatic on a push because a merge to `main` is already the claim that
+the commit is the good one, and a path filter has already established that this
+image actually changed. On a dispatch it stays opt-in: a hand-started run is not
+automatically that, and a rebuild of an old commit for a CVE should not silently
+become what new pods pull.
 
-`latest` is opt-in rather than automatic because it is a promise that this build
-is the one to run, and a manual run is not automatically that. The other two tags
-are always produced, so every run stays addressable regardless.
+The `manual-<timestamp>` tag is dispatch-only: on a push the commit already
+identifies the build uniquely.
+
+Implementation detail worth keeping: on a push, `inputs.push_latest` does not
+exist, so it is falsy. The `latest` rule is therefore written as
+`enable=${{ github.event_name == 'push' || inputs.push_latest }}` rather than
+relying on the input — otherwise a merge would publish silently without `latest`,
+which is precisely the failure mode the old `flavor: latest=auto` had.
 
 **This replaced a silently broken configuration.** The previous version used
 `type=ref,event=branch`, `type=ref,event=pr`, `type=semver`, plus
@@ -95,15 +132,44 @@ a variable that looks useful and breaks deploys.
 before the first run. If you pick a name that does not exist yet, GitHub creates
 it with no protection.
 
-### 1.3 Why no push trigger
+### 1.3 Why push triggers are safe here, and why deploy still is not
 
-Deploying or publishing on every push makes an image tag and a cluster mutation
-the same event. A merge that only fixes a typo in the docs would rebuild and
-re-tag images nobody changed. Manual dispatch keeps that decision explicit.
+The rule is that **a merge may publish, but a merge may not mutate a cluster.**
+Those are now separate workflows, so the two decisions are separable:
 
-The cost is that a stale image is possible if someone forgets to run the build.
-The mitigation is that `deploy.yaml` is manual too, and the image tag it deploys
-is printed in the step summary — so what is running is always a tag a human chose.
+| Decision | Trigger | Consequence of a mistake |
+|---|---|---|
+| publish a new image | push, path-filtered | a tag nobody pulls yet; reversible by pushing again |
+| apply manifests to a cluster | dispatch only | pods restart, config changes; not reversible by a merge |
+
+Publishing on a merge is only safe because of the path filter. Without it, every
+docs typo would re-tag five images with a new sha and move `latest`, so the tag
+would stop meaning "the code changed" — and `latest` is what the lab overlay
+pulls. With it, a commit changes only the images it actually affects.
+
+`deploy.yaml` deliberately keeps its manual trigger: see §9.3 for the full
+argument and the shape a real CD trigger should take.
+
+There is still a window where a published image is not deployed. That is
+intended — the deploy step is where a human confirms — and the tags produced are
+printed in the run's step summary so the value to deploy is never guessed.
+
+### 1.4 What a push run does about `environment`
+
+A push run has no `inputs`, so `environment: ${{ inputs.environment }}` would
+resolve to an empty string. GitHub accepts that (the job runs unbound), but it
+silently changes which `vars.*`/`secrets.*` scope applies, so the workflows now
+say:
+
+```yaml
+environment: ${{ inputs.environment || 'lab' }}
+```
+
+`lab` is the stand-in because it is the least privileged of the two environments.
+The image path is hard-coded (§1.2), so no image output depends on this choice.
+If an image build ever needs an environment variable, `lab` is the one whose
+values will be used on a push — which is the right default for a build that
+nobody explicitly routed.
 
 ## 2. Images and contexts
 
@@ -149,7 +215,13 @@ its probes, and then rejects every `EVT_*` request with
 bad payload rather than a packaging bug. The ingress now validates the schema
 before it starts listening and exits non-zero, so the mistake surfaces as a crash
 loop instead.
-
+**This is also why `schemas/**` is in this workflow's push filter (§1) and in no
+other workflow's.** The file is a live input: Configuration → Ingest schema
+overrides it at runtime ([configuration.md](configuration.md) §10), but the copy
+in the image is the default and the fallback when the stored contract is
+unreadable. A commit that edits the schema therefore changes this image and only
+this image, so its filter has to name the directory or the change would never be
+built.
 ### 2.2 The frontend exception
 
 `dist/` is git-ignored, so it never exists on a fresh checkout — the Dockerfile's `COPY dist/` would fail. The frontend workflow therefore builds it inside the run:
@@ -298,10 +370,11 @@ because an unencoded slash 404s and reads as "package does not exist".
 
 | Omitted | Why |
 |---|---|
-| any `push` / `pull_request` trigger | makes publishing a side effect of a merge; see §1.2 |
+| `pull_request` trigger | would publish from unreviewed code. A push to `main` has passed review; a PR has not. Path filters would not help, because the risk is the code, not its location |
+| an unfiltered `push` trigger | one merge would re-tag all five images and move `latest` for code that did not change; see §1 |
 | a single matrix workflow | one build would touch all five images for a one-service change; see §1 |
 | `pull_request_target` | runs with secrets on unreviewed code. Not reachable here, but the rule stands if a PR trigger is ever added |
-| `flavor: latest=auto` | produces no `latest` under `workflow_dispatch`; `latest` is an explicit `type=raw` input instead, see §1.1 |
+| `flavor: latest=auto` | produces no `latest` under `workflow_dispatch`; `latest` is an explicit `type=raw` rule instead, see §1.1 |
 | `arm64` | the target is x86 OpenShift; a second platform doubles build time for an image nothing runs. Add it in the `platforms:` field when there is an arm64 cluster |
 | Trivy / SCA scan | worth adding, but it needs a policy decision on what fails a build. Not invented here |
 | Auto-commit of new digests back to the overlay | turns every build into a commit and a rebuild loop; pin by hand per environment |
